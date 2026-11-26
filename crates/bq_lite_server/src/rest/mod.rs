@@ -8,13 +8,13 @@ mod routines;
 mod tabledata;
 mod tables;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
-use tower_http::cors::CorsLayer;
 
 use crate::state::ServerState;
 
@@ -41,8 +41,34 @@ pub fn build_router(state: ServerState) -> Router {
         .route("/healthz", get(healthz))
         .route("/health", get(healthz))
         .route("/_bqlite/reset", post(reset_state))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(cors_middleware))
         .with_state(state)
+}
+
+async fn cors_middleware(req: Request, next: Next) -> Response {
+    let mut resp = if req.method() == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("*"),
+    );
+    resp
 }
 
 fn build_project_routes() -> Router<ServerState> {

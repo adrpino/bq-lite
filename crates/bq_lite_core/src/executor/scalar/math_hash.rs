@@ -72,7 +72,7 @@ pub(super) fn eval_math_hash_fn(name: &str, args: Vec<BqValue>) -> BqResult<Opti
         "SAFE_NEGATE" => eval_safe_negate(args).map(Some),
         "GREATEST" => eval_extremum(args, true).map(Some),
         "LEAST" => eval_extremum(args, false).map(Some),
-        "RAND" => Ok(Some(BqValue::Float64(rand::random::<f64>()))),
+        "RAND" => Ok(Some(BqValue::Float64(random_unit_f64()))),
         "RANGE_BUCKET" => eval_range_bucket(args).map(Some),
         "MD5" => eval_hash(args, |b| Md5::digest(b).to_vec()).map(Some),
         "SHA1" => eval_hash(args, |b| Sha1::digest(b).to_vec()).map(Some),
@@ -417,6 +417,19 @@ fn eval_hash(args: Vec<BqValue>, hasher: impl FnOnce(&[u8]) -> Vec<u8>) -> BqRes
             other.infer_type()?
         ))),
     }
+}
+
+fn random_unit_f64() -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "53-bit masked mantissa fits losslessly in IEEE-754 f64"
+    )]
+    let val = {
+        let bits =
+            u64::try_from(uuid::Uuid::new_v4().as_u128() & ((1_u128 << 53) - 1)).unwrap_or(0);
+        (bits as f64) / ((1_u64 << 53) as f64)
+    };
+    val
 }
 
 #[expect(

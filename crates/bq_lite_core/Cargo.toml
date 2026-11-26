@@ -23,13 +23,11 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 csv = "1"
 digest = "0.11"
-hex = "0.4"
 md-5 = "0.11"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-integer = "0.1"
 num-traits = "0.2"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
-rand = "0.10"
 redb = { version = "2.6", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }

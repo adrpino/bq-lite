@@ -83,6 +83,46 @@ pub(super) fn eval_from_base64(args: Vec<BqValue>) -> BqResult<BqValue> {
     }
 }
 
+fn encode_hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0f);
+        if let (Some(&c1), Some(&c2)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(char::from(c1));
+            out.push(char::from(c2));
+        }
+    }
+    out
+}
+
+fn decode_hex_str(s: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err("odd number of digits");
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let (Some(&hi_b), Some(&lo_b)) = (pair.first(), pair.get(1)) else {
+            return Err("invalid hex length");
+        };
+        let hi = hex_nibble(hi_b).ok_or("invalid hex character")?;
+        let lo = hex_nibble(lo_b).ok_or("invalid hex character")?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "TO_HEX expects BYTES or NULL"
@@ -93,7 +133,7 @@ pub(super) fn eval_to_hex(args: Vec<BqValue>) -> BqResult<BqValue> {
         .map_err(|_| BqError::query("TO_HEX expects 1 argument"))?;
     match arg {
         BqValue::Null => Ok(BqValue::Null),
-        BqValue::Bytes(b) => Ok(BqValue::String(hex::encode(b))),
+        BqValue::Bytes(b) => Ok(BqValue::String(encode_hex_lower(&b))),
         other => Err(BqError::query(format!(
             "TO_HEX expects BYTES, got {}",
             other.infer_type()?
@@ -111,7 +151,7 @@ pub(super) fn eval_from_hex(args: Vec<BqValue>) -> BqResult<BqValue> {
         .map_err(|_| BqError::query("FROM_HEX expects 1 argument"))?;
     match arg {
         BqValue::Null => Ok(BqValue::Null),
-        BqValue::String(s) => hex::decode(s.trim())
+        BqValue::String(s) => decode_hex_str(s.trim())
             .map(BqValue::Bytes)
             .map_err(|e| BqError::semantic(format!("Invalid hex string: {e}"))),
         other => Err(BqError::query(format!(

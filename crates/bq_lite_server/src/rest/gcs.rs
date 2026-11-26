@@ -5,6 +5,8 @@ use bq_lite_core::io::parquet_codec::export_parquet;
 use bq_lite_core::{BqError, BqResult, QueryColumn, QueryResult};
 use chrono::Utc;
 use serde_json::{json, Value as JsonValue};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::state::{JobRecord, JobStatus, ServerState};
 
@@ -31,23 +33,86 @@ pub(super) fn resolve_uri_path(state: &ServerState, uri: &str) -> BqResult<PathB
     Ok(base.join(rel))
 }
 
+async fn emulator_http_request(
+    emu_host: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let trimmed = emu_host.trim().trim_end_matches('/');
+    let host_and_prefix = if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else if trimmed.contains("://") {
+        return None;
+    } else {
+        trimmed
+    };
+    let (authority, prefix) = match host_and_prefix.split_once('/') {
+        Some((auth, p)) => (auth, format!("/{}", p.trim_matches('/'))),
+        None => (host_and_prefix, String::new()),
+    };
+    let full_path = if prefix.is_empty() || prefix == "/" {
+        path_and_query.to_owned()
+    } else {
+        format!("{prefix}{path_and_query}")
+    };
+    let mut stream = TcpStream::connect(authority).await.ok()?;
+    let payload = body.unwrap_or(&[]);
+    let mut req =
+        format!("{method} {full_path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    if !payload.is_empty() || method == "POST" {
+        use std::fmt::Write as _;
+        let _ = write!(req, "Content-Length: {}\r\n", payload.len());
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await.ok()?;
+    if !payload.is_empty() {
+        stream.write_all(payload).await.ok()?;
+    }
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.ok()?;
+    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(raw.get(..header_end)?).ok()?;
+    let status_line = head.lines().next()?;
+    let code: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    if !(200..300).contains(&code) {
+        return None;
+    }
+    let body_bytes = raw.get(header_end + 4..)?;
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_body(body_bytes)
+    } else {
+        Some(body_bytes.to_vec())
+    }
+}
+
+fn decode_chunked_body(mut bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let crlf = bytes.windows(2).position(|w| w == b"\r\n")?;
+        let size_line = std::str::from_utf8(bytes.get(..crlf)?).ok()?;
+        let hex_part = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(hex_part, 16).ok()?;
+        bytes = bytes.get(crlf + 2..)?;
+        if size == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(bytes.get(..size)?);
+        bytes = bytes.get(size + 2..)?;
+    }
+}
+
 async fn read_uri_bytes(state: &ServerState, uri: &str) -> BqResult<Vec<u8>> {
     if let Some(rel) = uri.strip_prefix("gs://") {
         if let Some(ref emu_host) = state.storage_emulator_host {
             if let Some((bucket, obj)) = rel.split_once('/') {
-                let base = emu_host.trim_end_matches('/');
-                let base_url = if base.starts_with("http://") || base.starts_with("https://") {
-                    base.to_owned()
-                } else {
-                    format!("http://{base}")
-                };
-                let url = format!("{base_url}/download/storage/v1/b/{bucket}/o/{obj}?alt=media");
-                if let Ok(resp) = reqwest::Client::new().get(&url).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(bytes) = resp.bytes().await {
-                            return Ok(bytes.to_vec());
-                        }
-                    }
+                let path = format!("/download/storage/v1/b/{bucket}/o/{obj}?alt=media");
+                if let Some(bytes) = emulator_http_request(emu_host, "GET", &path, None).await {
+                    return Ok(bytes);
                 }
             }
         }
@@ -61,24 +126,12 @@ async fn write_uri_bytes(state: &ServerState, uri: &str, payload: &[u8]) -> BqRe
     if let Some(rel) = uri.strip_prefix("gs://") {
         if let Some(ref emu_host) = state.storage_emulator_host {
             if let Some((bucket, obj)) = rel.split_once('/') {
-                let base = emu_host.trim_end_matches('/');
-                let base_url = if base.starts_with("http://") || base.starts_with("https://") {
-                    base.to_owned()
-                } else {
-                    format!("http://{base}")
-                };
-                let url = format!(
-                    "{base_url}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={obj}"
-                );
-                if let Ok(resp) = reqwest::Client::new()
-                    .post(&url)
-                    .body(payload.to_vec())
-                    .send()
+                let path = format!("/upload/storage/v1/b/{bucket}/o?uploadType=media&name={obj}");
+                if emulator_http_request(emu_host, "POST", &path, Some(payload))
                     .await
+                    .is_some()
                 {
-                    if resp.status().is_success() {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
             }
         }
