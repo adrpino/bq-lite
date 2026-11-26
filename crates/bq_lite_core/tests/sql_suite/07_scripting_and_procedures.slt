@@ -1,0 +1,17 @@
+# Scripting and Procedures Golden Suite
+
+script ok
+CREATE SCHEMA sds;
+CREATE TABLE sds.log (n INT64);
+DECLARE i INT64 DEFAULT 1;
+WHILE i <= 3 DO
+  INSERT INTO sds.log VALUES (i);
+  SET i = i + 1;
+END WHILE;
+
+query I
+SELECT n FROM sds.log ORDER BY n
+----
+1
+2
+3

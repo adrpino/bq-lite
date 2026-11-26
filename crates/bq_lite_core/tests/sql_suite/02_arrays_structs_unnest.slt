@@ -1,0 +1,30 @@
+# Arrays, Structs, and UNNEST Golden Suite
+
+query I
+SELECT ARRAY_LENGTH([10, 20, 30])
+----
+3
+
+query I
+SELECT [10, 20, 30][SAFE_OFFSET(5)]
+----
+NULL
+
+query I
+SELECT [10, 20, 30][ORDINAL(2)]
+----
+20
+
+query T
+SELECT STRUCT(1 AS id, 'ok' AS label).label
+----
+ok
+
+query II
+SELECT x, off FROM UNNEST([100, 200]) AS x WITH OFFSET AS off ORDER BY off
+----
+100 0
+200 1
+
+statement error
+SELECT [1, 2][OFFSET(5)]

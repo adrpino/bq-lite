@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+*.redb
+*.db
+.DS_Store
+.env
+.env.*
+*.log
+tmp/
+.pytest_cache/
+__pycache__/
+*.pyc
+node_modules/

@@ -1,0 +1,37 @@
+[package]
+name = "bq-lite-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Standalone BigQuery REST v2 and gRPC Storage API emulator server"
+
+[features]
+default = []
+js-udf = ["bq-lite-core/js-udf"]
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+bq-lite-core = { path = "../bq_lite_core" }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+prost = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

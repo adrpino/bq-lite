@@ -1,0 +1,36 @@
+# Joins, CTEs, and Subqueries Golden Suite
+
+statement ok
+CREATE SCHEMA jds
+
+statement ok
+CREATE TABLE jds.users (id INT64, name STRING)
+
+statement ok
+CREATE TABLE jds.orders (id INT64, user_id INT64, total INT64)
+
+statement ok
+INSERT INTO jds.users VALUES (1, 'ada'), (2, 'grace')
+
+statement ok
+INSERT INTO jds.orders VALUES (10, 1, 50), (11, 1, 25)
+
+query TI
+SELECT u.name, o.total FROM jds.users u LEFT JOIN jds.orders o ON u.id = o.user_id ORDER BY u.id, o.id
+----
+ada 50
+ada 25
+grace NULL
+
+query T
+SELECT name FROM jds.users u WHERE EXISTS (SELECT 1 FROM jds.orders o WHERE o.user_id = u.id)
+----
+ada
+
+query I
+WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 4) SELECT n FROM seq ORDER BY n
+----
+1
+2
+3
+4

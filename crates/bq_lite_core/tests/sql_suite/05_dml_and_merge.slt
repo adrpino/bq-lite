@@ -1,0 +1,34 @@
+# DML and MERGE Golden Suite
+
+statement ok
+CREATE SCHEMA mds
+
+statement ok
+CREATE TABLE mds.tgt (id INT64, val STRING)
+
+statement ok
+INSERT INTO mds.tgt VALUES (1, 'old'), (2, 'keep')
+
+statement ok
+CREATE TABLE mds.src (id INT64, val STRING)
+
+statement ok
+INSERT INTO mds.src VALUES (1, 'new'), (3, 'added')
+
+statement ok
+MERGE mds.tgt t USING mds.src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET val = s.val WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)
+
+query IT
+SELECT id, val FROM mds.tgt ORDER BY id
+----
+1 new
+2 keep
+3 added
+
+statement ok
+DELETE FROM mds.tgt WHERE id = 2
+
+query I
+SELECT COUNT(*) FROM mds.tgt
+----
+2

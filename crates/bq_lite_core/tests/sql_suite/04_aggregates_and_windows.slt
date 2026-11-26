@@ -1,0 +1,22 @@
+# Aggregates, Window Functions, and QUALIFY Golden Suite
+
+statement ok
+CREATE SCHEMA wds
+
+statement ok
+CREATE TABLE wds.sales (dept STRING, amt INT64)
+
+statement ok
+INSERT INTO wds.sales VALUES ('eng', 100), ('eng', 200), ('ops', 50)
+
+query TII
+SELECT dept, COUNT(*), SUM(amt) FROM wds.sales GROUP BY ALL ORDER BY dept
+----
+eng 2 300
+ops 1 50
+
+query TII
+SELECT dept, amt, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY amt DESC) AS rn FROM wds.sales QUALIFY rn = 1 ORDER BY dept
+----
+eng 200 1
+ops 50 1

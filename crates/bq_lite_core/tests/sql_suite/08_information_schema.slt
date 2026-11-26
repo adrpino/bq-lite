@@ -1,0 +1,18 @@
+# INFORMATION_SCHEMA Golden Suite
+
+statement ok
+CREATE SCHEMA ids
+
+statement ok
+CREATE TABLE ids.items (id INT64 NOT NULL, title STRING)
+
+query TT
+SELECT table_name, table_type FROM ids.INFORMATION_SCHEMA.TABLES
+----
+items BASE TABLE
+
+query TT
+SELECT column_name, data_type FROM ids.INFORMATION_SCHEMA.COLUMNS ORDER BY ordinal_position
+----
+id INT64
+title STRING

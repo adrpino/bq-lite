@@ -1,0 +1,26 @@
+# DDL, Views, and Snapshots Golden Suite
+
+statement ok
+CREATE SCHEMA dds
+
+statement ok
+CREATE TABLE dds.base (id INT64, v STRING)
+
+statement ok
+INSERT INTO dds.base VALUES (1, 'v1')
+
+statement ok
+CREATE VIEW dds.base_v AS SELECT id, UPPER(v) AS uv FROM dds.base
+
+query IT
+SELECT id, uv FROM dds.base_v
+----
+1 V1
+
+statement ok
+CREATE TABLE dds.copied COPY dds.base
+
+query IT
+SELECT id, v FROM dds.copied
+----
+1 v1

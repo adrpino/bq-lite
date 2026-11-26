@@ -1,0 +1,25 @@
+# Core GoogleSQL Golden Suite
+
+statement ok
+CREATE SCHEMA suite_ds
+
+statement ok
+CREATE TABLE suite_ds.nums (id INT64, label STRING)
+
+statement ok
+INSERT INTO suite_ds.nums VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+query IT
+SELECT id, UPPER(label) FROM suite_ds.nums ORDER BY id
+----
+1 ONE
+2 TWO
+3 THREE
+
+query I
+SELECT SUM(id) FROM suite_ds.nums
+----
+6
+
+statement error
+SELECT CAST('bad' AS INT64)
