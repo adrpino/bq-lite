@@ -217,15 +217,18 @@ pub(super) fn write_rows_with_dispositions(
     }
 }
 
+use super::tabledata::split_partition_decorator;
+
 pub(super) fn parse_table_ref(val: &JsonValue, default_proj: &str) -> BqResult<TableRef> {
     let ds = val
         .get("datasetId")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| BqError::invalid_argument("Missing tableReference.datasetId"))?;
-    let tbl = val
+    let tbl_raw = val
         .get("tableId")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| BqError::invalid_argument("Missing tableReference.tableId"))?;
+    let (tbl, _) = split_partition_decorator(tbl_raw);
     let proj = val
         .get("projectId")
         .and_then(JsonValue::as_str)

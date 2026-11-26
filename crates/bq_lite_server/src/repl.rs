@@ -4,7 +4,7 @@ use std::path::Path;
 use bq_lite_core::catalog::ColumnSchema;
 use bq_lite_core::io::csv_json::export_csv;
 use bq_lite_core::parser::parse_script;
-use bq_lite_core::{Engine, QueryResult};
+use bq_lite_core::{BqValue, Engine, QueryResult};
 use serde_json::{json, Value as JsonValue};
 
 /// Output format for one-shot `exec` queries.
@@ -43,12 +43,7 @@ pub fn run_exec(
                 .map(|r| {
                     let mut map = serde_json::Map::new();
                     for (c, v) in qr.columns.iter().zip(r.iter()) {
-                        let jv = if v.is_null() {
-                            JsonValue::Null
-                        } else {
-                            json!(v.to_string())
-                        };
-                        map.insert(c.name.clone(), jv);
+                        map.insert(c.name.clone(), bq_value_to_cli_json(v));
                     }
                     JsonValue::Object(map)
                 })
@@ -66,6 +61,38 @@ pub fn run_exec(
         }
     }
     Ok(())
+}
+
+fn bq_value_to_cli_json(val: &BqValue) -> JsonValue {
+    match val {
+        BqValue::Null => JsonValue::Null,
+        BqValue::Bool(b) => JsonValue::Bool(*b),
+        BqValue::Int64(n) => json!(*n),
+        BqValue::Float64(f) => {
+            serde_json::Number::from_f64(*f).map_or_else(|| json!(f.to_string()), JsonValue::Number)
+        }
+        BqValue::Json(j) => (**j).clone(),
+        BqValue::Array(items) => JsonValue::Array(items.iter().map(bq_value_to_cli_json).collect()),
+        BqValue::Struct(fields) => {
+            let mut obj = serde_json::Map::new();
+            for (idx, field) in fields.iter().enumerate() {
+                let key = field.name.clone().unwrap_or_else(|| format!("f{idx}"));
+                obj.insert(key, bq_value_to_cli_json(&field.value));
+            }
+            JsonValue::Object(obj)
+        }
+        BqValue::Numeric(_)
+        | BqValue::BigNumeric(_)
+        | BqValue::String(_)
+        | BqValue::Bytes(_)
+        | BqValue::Date(_)
+        | BqValue::Datetime(_)
+        | BqValue::Time(_)
+        | BqValue::Timestamp(_)
+        | BqValue::Interval(_)
+        | BqValue::Geography(_)
+        | BqValue::Range(_) => json!(val.to_string()),
+    }
 }
 
 pub fn run_repl(project: &str, data_dir: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {

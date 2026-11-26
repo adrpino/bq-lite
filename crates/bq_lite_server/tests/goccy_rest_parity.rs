@@ -16,7 +16,7 @@ async fn spawn_server() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn goccy_509_511_query_parameters_numeric_array_struct_and_dml() {
+async fn rest_query_parameters_numeric_array_struct_and_dml() {
     let base = spawn_server().await.unwrap();
     let client = reqwest::Client::new();
 
@@ -60,7 +60,7 @@ async fn goccy_509_511_query_parameters_numeric_array_struct_and_dml() {
 }
 
 #[tokio::test]
-async fn goccy_514_513_484_status_codes_empty_delete_and_terraform_fields() {
+async fn rest_status_codes_empty_delete_and_terraform_fields() {
     let base = spawn_server().await.unwrap();
     let client = reqwest::Client::new();
 
@@ -106,7 +106,7 @@ async fn goccy_514_513_484_status_codes_empty_delete_and_terraform_fields() {
 }
 
 #[tokio::test]
-async fn goccy_532_470_482_498_isolation_insert_all_nested_ts_and_bytes() {
+async fn rest_isolation_insert_all_nested_ts_and_bytes() {
     let base = spawn_server().await.unwrap();
     let client = reqwest::Client::new();
 
@@ -183,7 +183,7 @@ async fn goccy_532_470_482_498_isolation_insert_all_nested_ts_and_bytes() {
 }
 
 #[tokio::test]
-async fn goccy_353_510_resumable_ndjson_copy_and_dry_run() {
+async fn rest_resumable_ndjson_copy_and_dry_run() {
     let base = spawn_server().await.unwrap();
     let client = reqwest::Client::new();
 
@@ -258,7 +258,7 @@ async fn goccy_353_510_resumable_ndjson_copy_and_dry_run() {
 }
 
 #[tokio::test]
-async fn goccy_523_failed_script_sync_and_routines() {
+async fn rest_failed_script_sync_and_routines() {
     let base = spawn_server().await.unwrap();
     let client = reqwest::Client::new();
 
@@ -316,4 +316,96 @@ async fn goccy_523_failed_script_sync_and_routines() {
         .await
         .unwrap();
     assert_eq!(r_del.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn rest_partition_decorator_insert_all_and_list() {
+    let base = spawn_server().await.unwrap();
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/bigquery/v2/projects/test-proj/datasets"))
+        .json(&json!({ "datasetReference": { "datasetId": "pds" } }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!(
+            "{base}/bigquery/v2/projects/test-proj/datasets/pds/tables"
+        ))
+        .json(&json!({
+            "tableReference": { "tableId": "events" },
+            "timePartitioning": { "type": "DAY" },
+            "schema": { "fields": [{ "name": "id", "type": "INT64" }] }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // #317: insertAll to partition decorator events$20240517
+    let ins = client
+        .post(format!(
+            "{base}/bigquery/v2/projects/test-proj/datasets/pds/tables/events$20240517/insertAll"
+        ))
+        .json(&json!({ "rows": [{ "json": { "id": 10 } }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ins.status(), StatusCode::OK);
+
+    let ins2 = client
+        .post(format!(
+            "{base}/bigquery/v2/projects/test-proj/datasets/pds/tables/events$20240518/insertAll"
+        ))
+        .json(&json!({ "rows": [{ "json": { "id": 20 } }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ins2.status(), StatusCode::OK);
+
+    let list_p1: JsonValue = client
+        .get(format!(
+            "{base}/bigquery/v2/projects/test-proj/datasets/pds/tables/events$20240517/data"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list_p1["rows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(list_p1["rows"][0]["f"][0]["v"], "10");
+
+    let q_res: JsonValue = client
+        .post(format!("{base}/bigquery/v2/projects/test-proj/queries"))
+        .json(&json!({
+            "query": "SELECT id, _PARTITIONDATE FROM pds.events ORDER BY id",
+            "useLegacySql": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(q_res["rows"][0]["f"][1]["v"], "2024-05-17");
+    assert_eq!(q_res["rows"][1]["f"][1]["v"], "2024-05-18");
+}
+
+#[test]
+fn cli_exec_json_does_not_double_escape_json_columns() {
+    let mut out = Vec::new();
+    bq_lite_server::repl::run_exec(
+        "local",
+        None,
+        "SELECT JSON '{\"a\":1}' AS j, [1, 2] AS arr, STRUCT('x' AS k) AS st, TRUE AS flag",
+        bq_lite_server::repl::OutputFormat::Json,
+        &mut out,
+    )
+    .unwrap();
+    let parsed: JsonValue = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed[0]["j"]["a"], 1);
+    assert_eq!(parsed[0]["arr"][1], 2);
+    assert_eq!(parsed[0]["st"]["k"], "x");
+    assert_eq!(parsed[0]["flag"], true);
 }

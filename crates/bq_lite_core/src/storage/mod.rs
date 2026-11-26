@@ -50,13 +50,16 @@ impl TableStorage {
     }
 
     pub fn append(&mut self, new_rows: Vec<Row>) {
+        self.append_at(new_rows, Utc::now());
+    }
+
+    pub fn append_at(&mut self, new_rows: Vec<Row>, at: DateTime<Utc>) {
         if new_rows.is_empty() {
             return;
         }
-        let now = Utc::now();
         let count = new_rows.len();
         Arc::make_mut(&mut self.current).extend(new_rows);
-        Arc::make_mut(&mut self.ingestion_times).extend(std::iter::repeat_n(now, count));
+        Arc::make_mut(&mut self.ingestion_times).extend(std::iter::repeat_n(at, count));
         self.record_version();
     }
 
@@ -107,11 +110,20 @@ impl StorageEngine {
     }
 
     pub fn insert_rows(&mut self, tref: &TableRef, rows: Vec<Row>) -> BqResult<()> {
+        self.insert_rows_at(tref, rows, Utc::now())
+    }
+
+    pub fn insert_rows_at(
+        &mut self,
+        tref: &TableRef,
+        rows: Vec<Row>,
+        at: DateTime<Utc>,
+    ) -> BqResult<()> {
         let storage_arc = self
             .tables
             .entry(tref.storage_key())
             .or_insert_with(|| Arc::new(TableStorage::new()));
-        Arc::make_mut(storage_arc).append(rows);
+        Arc::make_mut(storage_arc).append_at(rows, at);
         Ok(())
     }
 

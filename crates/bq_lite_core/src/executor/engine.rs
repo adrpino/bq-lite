@@ -147,6 +147,17 @@ impl Engine {
         self.storage.insert_rows(&canonical, rows)
     }
 
+    pub fn insert_rows_at(
+        &mut self,
+        tref: &TableRef,
+        rows: Vec<Row>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> BqResult<()> {
+        let canonical = self.catalog.canonical_table_ref(tref);
+        let _ = self.catalog.get_table(&canonical)?;
+        self.storage.insert_rows_at(&canonical, rows, at)
+    }
+
     /// Projects and filters an in-memory [`QueryResult`] using `GoogleSQL` column names and `WHERE` predicate.
     pub fn project_and_filter_result(
         &self,

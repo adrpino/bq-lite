@@ -251,7 +251,8 @@ fn execute_load_job(
         .and_then(JsonValue::as_str)
         .unwrap_or("CREATE_IF_NEEDED");
 
-    let tref = TableRef::new(dest_proj, ds_id, tbl_id);
+    let (base_tbl, _) = super::tabledata::split_partition_decorator(tbl_id);
+    let tref = TableRef::new(dest_proj, ds_id, base_tbl);
     let mut eng = state.engine.write();
     let (columns, rows) = decode_load_payload(&eng, &tref, load_cfg, format, payload)?;
     let loaded_count = rows.len();

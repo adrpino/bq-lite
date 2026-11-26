@@ -4,7 +4,7 @@ use bq_lite_core::{BqErrorKind, BqStructFieldValue, BqType, BqValue, Engine, Str
 use chrono::Utc;
 
 #[test]
-fn goccy_500_501_timestamp_utc_and_microsecond_limit() {
+fn bq_timestamp_utc_and_microsecond_limit() {
     let eng = Engine::new();
     let qr = eng
         .query("SELECT CAST(TIMESTAMP '2024-06-15 12:30:45.123456 UTC' AS STRING) AS s")
@@ -26,7 +26,7 @@ fn goccy_500_501_timestamp_utc_and_microsecond_limit() {
 }
 
 #[test]
-fn goccy_487_distinct_and_group_by_reject_array_and_json() {
+fn bq_distinct_and_group_by_reject_array_and_json() {
     let eng = Engine::new();
     let err_distinct = eng
         .query("SELECT DISTINCT [1, 2] AS arr FROM UNNEST([1, 2]) AS x")
@@ -45,7 +45,7 @@ fn goccy_487_distinct_and_group_by_reject_array_and_json() {
 }
 
 #[test]
-fn goccy_483_repeated_record_field_access_is_exact() {
+fn bq_repeated_record_field_access_is_exact() {
     let eng = Engine::new();
     let qr = eng
         .query(
@@ -62,7 +62,7 @@ fn goccy_483_repeated_record_field_access_is_exact() {
 }
 
 #[test]
-fn goccy_510_435_ndjson_repeated_record_and_csv_null_marker() {
+fn bq_ndjson_repeated_record_and_csv_null_marker() {
     let cols = vec![
         ColumnSchema::new("id", BqType::Int64),
         ColumnSchema::new("tags", BqType::array(BqType::String).unwrap()),
@@ -122,7 +122,7 @@ fn goccy_510_435_ndjson_repeated_record_and_csv_null_marker() {
 }
 
 #[test]
-fn goccy_530_export_data_json_serializes_array_struct_as_json_array() {
+fn bq_export_data_json_serializes_array_struct_as_json_array() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("export_*.json");
     let mut eng = Engine::new();
@@ -143,7 +143,7 @@ fn goccy_530_export_data_json_serializes_array_struct_as_json_array() {
 }
 
 #[test]
-fn goccy_517_313_481_502_436_reserved_names_drop_memory_alter_qualify_and_joins() {
+fn bq_reserved_names_drop_memory_alter_qualify_and_joins() {
     let mut eng = Engine::new();
     for ds in ["ai", "ml", "obj", "mysql"] {
         eng.exec(&format!("CREATE SCHEMA {ds}")).unwrap();
