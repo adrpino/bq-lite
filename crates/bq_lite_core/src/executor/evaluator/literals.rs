@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
 use crate::ast::Literal;
 use crate::error::{BqError, BqResult};
-use crate::types::{BqBigNumeric, BqNumeric, BqValue};
+use crate::types::{check_max_6_frac_digits, BqBigNumeric, BqNumeric, BqValue};
 
 pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
     match lit {
@@ -20,10 +20,14 @@ pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
             .map(BqValue::Date)
             .map_err(|_| BqError::query(format!("Invalid DATE literal: '{s}'"))),
         Literal::Datetime(s) => parse_datetime_lit(s).map(BqValue::Datetime),
-        Literal::Time(s) => NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f")
-            .or_else(|_| NaiveTime::parse_from_str(s.trim(), "%H:%M:%S"))
-            .map(BqValue::Time)
-            .map_err(|_| BqError::query(format!("Invalid TIME literal: '{s}'"))),
+        Literal::Time(s) => {
+            let trimmed = s.trim();
+            check_max_6_frac_digits(trimmed)?;
+            NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f")
+                .or_else(|_| NaiveTime::parse_from_str(trimmed, "%H:%M:%S"))
+                .map(BqValue::Time)
+                .map_err(|_| BqError::query(format!("Invalid TIME literal: '{s}'")))
+        }
         Literal::Timestamp(s) => parse_timestamp_lit(s).map(BqValue::Timestamp),
         Literal::Json(s) => serde_json::from_str::<serde_json::Value>(s)
             .map(|v| BqValue::Json(Box::new(v)))
@@ -33,6 +37,7 @@ pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
 
 fn parse_datetime_lit(s: &str) -> BqResult<NaiveDateTime> {
     let trimmed = s.trim();
+    check_max_6_frac_digits(trimmed)?;
     for fmt in [
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S%.f",
@@ -48,6 +53,7 @@ fn parse_datetime_lit(s: &str) -> BqResult<NaiveDateTime> {
 
 fn parse_timestamp_lit(s: &str) -> BqResult<DateTime<Utc>> {
     let trimmed = s.trim();
+    check_max_6_frac_digits(trimmed)?;
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         return Ok(dt.with_timezone(&Utc));
     }

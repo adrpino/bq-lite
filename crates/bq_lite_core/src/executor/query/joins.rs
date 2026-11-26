@@ -5,6 +5,7 @@ use crate::executor::evaluator::{eval_expr, values_equal};
 use crate::types::BqValue;
 
 use super::from::{eval_correlated_cross_or_factor, eval_table_factor};
+use super::joins_hash::try_hash_join;
 use super::schema::{infer_table_factor_schema, null_out_eval_row};
 
 pub(super) fn eval_join_with_schema(
@@ -28,6 +29,16 @@ pub(super) fn eval_join_with_schema(
 
     if join.kind == JoinKind::Cross {
         let rows = eval_correlated_cross_or_factor(left_rows, &join.relation, ctx)?;
+        return Ok((rows, out_schema));
+    }
+    if let Some(rows) = try_hash_join(
+        left_rows,
+        left_schema,
+        &right_rows,
+        &right_schema,
+        join,
+        ctx,
+    )? {
         return Ok((rows, out_schema));
     }
     let left_null = null_out_eval_row(left_schema);
@@ -103,7 +114,7 @@ fn eval_correlated_unnest_join(
     Ok(out)
 }
 
-fn try_join_pair(
+pub(super) fn try_join_pair(
     lrow: &EvalRow,
     rrow: &EvalRow,
     constraint: &JoinConstraint,

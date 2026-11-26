@@ -4,6 +4,7 @@ mod agg_eval;
 mod from;
 mod governance;
 mod joins;
+mod joins_hash;
 mod pipe;
 mod pivot;
 mod project;
@@ -33,7 +34,7 @@ pub(in crate::executor) use from::{
 use agg::{execute_grouped_select, select_uses_grouping};
 use from::eval_from_clause_with_schema;
 use pipe::apply_pipe_ops;
-use project::project_eval_rows;
+use project::{has_untyped_null, project_eval_rows};
 use schema::infer_select_columns;
 use set_ops::{dedup_rows, execute_set_op, is_union_set_expr, rows_equal};
 use sort::{apply_limit_offset, apply_order_by, apply_order_by_with_source, merge_proj_and_source};
@@ -378,7 +379,7 @@ fn build_select_result(
             Ok(QueryResult::new(vec![QueryColumn::new("f0_", ty)], rows))
         }
         None => {
-            let cols = projected
+            let mut cols: Vec<QueryColumn> = projected
                 .first()
                 .map(|r| {
                     r.cols
@@ -387,6 +388,17 @@ fn build_select_result(
                         .collect()
                 })
                 .unwrap_or_default();
+            for (idx, col) in cols.iter_mut().enumerate() {
+                if has_untyped_null(&col.ty) {
+                    if let Some(found) = projected
+                        .iter()
+                        .filter_map(|r| r.cols.get(idx))
+                        .find(|c| !has_untyped_null(&c.ty))
+                    {
+                        col.ty = found.ty.clone();
+                    }
+                }
+            }
             let rows = projected
                 .into_iter()
                 .map(|r| r.cols.into_iter().map(|c| c.value).collect())

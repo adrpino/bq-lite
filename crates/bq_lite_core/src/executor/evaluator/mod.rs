@@ -10,8 +10,8 @@ use crate::executor::query::execute_query;
 use crate::types::coercion::cast_value;
 use crate::types::BqValue;
 
-pub(super) use calls::infer_expr_col_name;
 use calls::{eval_array_literal, eval_function_expr, eval_struct_literal};
+pub(super) use calls::{infer_expr_col_name, lookup_udf_return_type};
 pub(super) use ops::{
     combine_logical, compare_values, eval_binary, eval_is_test, eval_unary, to_opt_bool,
     values_distinct_eq, values_equal,

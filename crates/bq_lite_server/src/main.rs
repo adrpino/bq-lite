@@ -24,35 +24,35 @@ struct Cli {
     command: Option<Command>,
 
     /// Bind host address for HTTP REST and gRPC listeners (env: `BQ_LITE_HOST`)
-    #[arg(long)]
+    #[arg(long, global = true)]
     host: Option<IpAddr>,
 
     /// Port for the HTTP REST v2 API (env: `BQ_LITE_PORT`, default: 9050)
-    #[arg(long)]
+    #[arg(long, global = true)]
     port: Option<u16>,
 
     /// Port for the gRPC Storage Read/Write API (env: `BQ_LITE_GRPC_PORT`, default: 9060)
-    #[arg(long)]
+    #[arg(long, global = true)]
     grpc_port: Option<u16>,
 
     /// Default GCP project ID (env: `BQ_LITE_PROJECT`, default: local)
-    #[arg(long)]
+    #[arg(long, global = true)]
     project: Option<String>,
 
     /// Directory for redb persistence across restarts (env: `BQ_LITE_DATA_DIR`)
-    #[arg(long)]
+    #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
     /// Run completely in memory without disk persistence
-    #[arg(long)]
+    #[arg(long, global = true)]
     memory: bool,
 
     /// Execute a SQL seed file on server startup before serving requests
-    #[arg(long)]
+    #[arg(long, global = true)]
     seed: Option<PathBuf>,
 
     /// Suppress startup logs (useful for CI and agent harnesses)
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, global = true)]
     quiet: bool,
 }
 

@@ -1,6 +1,6 @@
 use crate::ast::{BinaryOp, Expr, Literal, ObjectName, UnaryOp};
 use crate::executor::context::ExecContext;
-use crate::executor::evaluator::infer_expr_col_name;
+use crate::executor::evaluator::{infer_expr_col_name, lookup_udf_return_type};
 use crate::types::coercion::common_supertype;
 use crate::types::{BqType, RangeElementType, StructField};
 
@@ -268,10 +268,33 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
         }
         "ST_GEOGPOINT" | "ST_GEOGFROMTEXT" => BqType::Geography,
         "SUM" | "MIN" | "MAX" | "ANY_VALUE" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
-        | "LAG" | "LEAD" | "IFNULL" | "NULLIF" => call
+        | "LAG" | "LEAD" => call
             .args
             .first()
             .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx)),
+        "IFNULL" | "NULLIF" | "IF" | "COALESCE" | "ARRAY_AGG" => {
+            infer_polymorphic_fn_type(&upper, call, row, ctx)
+        }
+        _ => lookup_udf_return_type(&call.name, ctx).unwrap_or(BqType::String),
+    }
+}
+
+fn infer_polymorphic_fn_type(
+    upper: &str,
+    call: &crate::ast::FunctionCall,
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqType {
+    match upper {
+        "IFNULL" | "NULLIF" => {
+            let tys: Vec<BqType> = call
+                .args
+                .iter()
+                .take(2)
+                .map(|a| infer_expr_type(&a.expr, row, ctx))
+                .collect();
+            common_supertype(&tys).unwrap_or(BqType::UntypedNull)
+        }
         "IF" => {
             let t = call
                 .args
@@ -298,6 +321,6 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
                 .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx));
             BqType::array(el).unwrap_or(BqType::UntypedNull)
         }
-        _ => BqType::String,
+        _ => BqType::UntypedNull,
     }
 }

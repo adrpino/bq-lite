@@ -172,42 +172,54 @@ fn eval_array_lambda(
     Ok(BqValue::Array(out))
 }
 
+pub(in crate::executor) fn lookup_udf_return_type(
+    name: &crate::ast::ObjectName,
+    ctx: &ExecContext<'_>,
+) -> Option<BqType> {
+    let routine = resolve_routine_meta(name, ctx)?;
+    let crate::catalog::RoutineMeta::Function(cf) = routine.as_ref() else {
+        return None;
+    };
+    cf.returns.as_ref().and_then(|rt| rt.to_bq_type().ok())
+}
+
+fn resolve_routine_meta(
+    name: &crate::ast::ObjectName,
+    ctx: &ExecContext<'_>,
+) -> Option<std::sync::Arc<crate::catalog::RoutineMeta>> {
+    let parts = name.normalized_parts();
+    if let [single] = parts.as_slice() {
+        let temp_ref =
+            crate::catalog::TableRef::new(ctx.catalog.default_project(), "__temp", single);
+        ctx.catalog
+            .get_dataset(&temp_ref.project, &temp_ref.dataset)
+            .ok()
+            .and_then(|ds| ds.routines.get(&temp_ref.table).cloned())
+            .or_else(|| {
+                ctx.catalog.resolve_table_name(name).ok().and_then(|tr| {
+                    ctx.catalog
+                        .get_dataset(&tr.project, &tr.dataset)
+                        .ok()
+                        .and_then(|ds| ds.routines.get(&tr.table).cloned())
+                })
+            })
+    } else {
+        ctx.catalog.resolve_table_name(name).ok().and_then(|tr| {
+            ctx.catalog
+                .get_dataset(&tr.project, &tr.dataset)
+                .ok()
+                .and_then(|ds| ds.routines.get(&tr.table).cloned())
+        })
+    }
+}
+
 fn eval_user_scalar_udf(
     call: &FunctionCall,
     args: &[BqValue],
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let fn_name = call.name.normalized_parts().join(".");
-    let parts = call.name.normalized_parts();
-    let routine = if let [single] = parts.as_slice() {
-        let temp_ref =
-            crate::catalog::TableRef::new(ctx.catalog.default_project(), "__temp", single);
-        ctx.catalog
-            .get_dataset(&temp_ref.project, &temp_ref.dataset)
-            .ok()
-            .and_then(|ds| ds.routines.get(&temp_ref.table))
-            .or_else(|| {
-                ctx.catalog
-                    .resolve_table_name(&call.name)
-                    .ok()
-                    .and_then(|tr| {
-                        ctx.catalog
-                            .get_dataset(&tr.project, &tr.dataset)
-                            .ok()
-                            .and_then(|ds| ds.routines.get(&tr.table))
-                    })
-            })
-    } else {
-        ctx.catalog
-            .resolve_table_name(&call.name)
-            .ok()
-            .and_then(|tr| {
-                ctx.catalog
-                    .get_dataset(&tr.project, &tr.dataset)
-                    .ok()
-                    .and_then(|ds| ds.routines.get(&tr.table))
-            })
-    };
+    let routine = resolve_routine_meta(&call.name, ctx);
 
     let Some(r) = routine else {
         return Err(BqError::unimplemented(format!(

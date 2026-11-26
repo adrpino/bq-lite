@@ -1,10 +1,11 @@
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use boa_engine::object::builtins::{JsArray, JsDate, JsTypedArray, JsUint8Array};
 use boa_engine::object::ObjectInitializer;
-use boa_engine::property::Attribute;
+use boa_engine::property::{Attribute, PropertyKey};
 use boa_engine::{js_string, Context, JsObject, JsString, JsValue, Source};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
@@ -17,17 +18,35 @@ const MAX_SAFE_JS_INT: i64 = 9_007_199_254_740_991;
 const MAX_SAFE_JS_INT_F64: f64 = 9_007_199_254_740_991.0;
 const LOOP_ITERATION_LIMIT: u64 = 1_000_000;
 const RECURSION_LIMIT: usize = 128;
+const MAX_CACHED_JS_FNS: usize = 256;
 
-thread_local! {
-    static JS_CTX: RefCell<Context> = RefCell::new(new_sandboxed_context());
+struct JsRuntime {
+    ctx: Context,
+    initial_global_keys: HashSet<String>,
+    compiled_fns: HashMap<(String, String), JsObject>,
 }
 
-fn new_sandboxed_context() -> Context {
+thread_local! {
+    static JS_RUNTIME: RefCell<JsRuntime> = RefCell::new(new_sandboxed_runtime());
+}
+
+fn new_sandboxed_runtime() -> JsRuntime {
     let mut ctx = Context::default();
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
     limits.set_recursion_limit(RECURSION_LIMIT);
-    ctx
+    let global = ctx.global_object();
+    let initial_global_keys = global
+        .own_property_keys(&mut ctx)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|k| k.to_string())
+        .collect();
+    JsRuntime {
+        ctx,
+        initial_global_keys,
+        compiled_fns: HashMap::new(),
+    }
 }
 
 /// Evaluates a `BigQuery` JavaScript UDF body in a sandboxed `boa_engine` runtime.
@@ -38,16 +57,51 @@ pub(super) fn eval_js_udf(
     returns: Option<&DataTypeAst>,
 ) -> BqResult<BqValue> {
     let target_ty = returns.map(DataTypeAst::to_bq_type).transpose()?;
-    JS_CTX.with(|cell| {
+    JS_RUNTIME.with(|cell| {
         let mut guard = cell.try_borrow_mut().map_err(|_| {
             BqError::semantic("Re-entrant JavaScript UDF invocation is not supported")
         })?;
-        eval_in_context(&mut guard, params, args, code, target_ty.as_ref())
+        eval_in_runtime(&mut guard, params, args, code, target_ty.as_ref())
     })
 }
 
-fn eval_in_context(
-    ctx: &mut Context,
+fn get_or_compile_js_fn(rt: &mut JsRuntime, param_list: &str, code: &str) -> BqResult<JsObject> {
+    let cache_key = (param_list.to_owned(), code.to_owned());
+    if let Some(cached) = rt.compiled_fns.get(&cache_key) {
+        return Ok(cached.clone());
+    }
+    let wrapped = format!("(function({param_list}) {{\n{code}\n}})");
+    let fn_val = rt
+        .ctx
+        .eval(Source::from_bytes(wrapped.as_bytes()))
+        .map_err(|e| BqError::semantic(format!("JavaScript UDF compilation error: {e}")))?;
+    let fn_obj = fn_val
+        .as_object()
+        .ok_or_else(|| BqError::semantic("JavaScript UDF did not compile to a function"))?
+        .clone();
+    if rt.compiled_fns.len() >= MAX_CACHED_JS_FNS {
+        rt.compiled_fns.clear();
+    }
+    rt.compiled_fns.insert(cache_key, fn_obj.clone());
+    Ok(fn_obj)
+}
+
+fn cleanup_global_props(rt: &mut JsRuntime) {
+    let global = rt.ctx.global_object();
+    let Ok(keys) = global.own_property_keys(&mut rt.ctx) else {
+        return;
+    };
+    for key in keys {
+        if !rt.initial_global_keys.contains(&key.to_string()) {
+            if let PropertyKey::String(_) | PropertyKey::Index(_) = key {
+                let _ = global.delete_property_or_throw(key, &mut rt.ctx);
+            }
+        }
+    }
+}
+
+fn eval_in_runtime(
+    rt: &mut JsRuntime,
     params: &[RoutineParam],
     args: &[BqValue],
     code: &str,
@@ -58,25 +112,23 @@ fn eval_in_context(
         .map(|p| p.name.value.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let wrapped = format!("(function({param_list}) {{\n{code}\n}})");
-    let fn_val = ctx
-        .eval(Source::from_bytes(wrapped.as_bytes()))
-        .map_err(|e| BqError::semantic(format!("JavaScript UDF compilation error: {e}")))?;
-    let fn_obj = fn_val
-        .as_object()
-        .ok_or_else(|| BqError::semantic("JavaScript UDF did not compile to a function"))?;
+    let fn_obj = get_or_compile_js_fn(rt, &param_list, code)?;
 
     let mut js_args = Vec::with_capacity(params.len());
     for (idx, _) in params.iter().enumerate() {
         let val = args.get(idx).unwrap_or(&BqValue::Null);
-        js_args.push(bq_to_js(val, ctx)?);
+        js_args.push(bq_to_js(val, &mut rt.ctx)?);
     }
 
-    let result = fn_obj
-        .call(&JsValue::undefined(), &js_args, ctx)
-        .map_err(|e| BqError::semantic(format!("JavaScript UDF runtime error: {e}")))?;
-
-    js_to_bq(&result, target_ty, ctx)
+    let call_res = fn_obj
+        .call(&JsValue::undefined(), &js_args, &mut rt.ctx)
+        .map_err(|e| BqError::semantic(format!("JavaScript UDF runtime error: {e}")));
+    let out = match call_res {
+        Ok(val) => js_to_bq(&val, target_ty, &mut rt.ctx),
+        Err(err) => Err(err),
+    };
+    cleanup_global_props(rt);
+    out
 }
 
 fn js_err<T>(prefix: &str, res: boa_engine::JsResult<T>) -> BqResult<T> {

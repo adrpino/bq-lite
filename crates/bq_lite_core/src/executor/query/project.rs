@@ -5,6 +5,7 @@ use crate::executor::evaluator::{eval_expr, infer_expr_col_name};
 use crate::types::{BqType, BqValue};
 
 use super::schema::resolve_struct_type_for_name;
+use super::type_infer::infer_expr_type;
 
 pub(in crate::executor) fn project_eval_rows(
     select: &Select,
@@ -19,7 +20,12 @@ pub(in crate::executor) fn project_eval_rows(
             match item {
                 SelectItem::Expr { expr, alias } => {
                     let val = eval_expr(expr, row, ctx)?;
-                    let ty = val.infer_type()?;
+                    let raw_ty = val.infer_type()?;
+                    let ty = if has_untyped_null(&raw_ty) {
+                        merge_inferred_type(raw_ty, infer_expr_type(expr, row, ctx))
+                    } else {
+                        raw_ty
+                    };
                     let name = alias
                         .as_ref()
                         .map(|a| a.value.clone())
@@ -48,6 +54,43 @@ pub(in crate::executor) fn project_eval_rows(
         out.push(EvalRow::new(cols));
     }
     Ok(out)
+}
+
+pub(super) fn has_untyped_null(ty: &BqType) -> bool {
+    match ty {
+        BqType::UntypedNull => true,
+        BqType::Array(inner) => has_untyped_null(inner),
+        BqType::Struct(fields) => fields.iter().any(|f| has_untyped_null(&f.ty)),
+        BqType::Bool
+        | BqType::Int64
+        | BqType::Float64
+        | BqType::Numeric
+        | BqType::BigNumeric
+        | BqType::String
+        | BqType::Bytes
+        | BqType::Date
+        | BqType::Datetime
+        | BqType::Time
+        | BqType::Timestamp
+        | BqType::Interval
+        | BqType::Json
+        | BqType::Geography
+        | BqType::Range(_) => false,
+    }
+}
+
+fn merge_inferred_type(raw: BqType, inferred: BqType) -> BqType {
+    if matches!(raw, BqType::UntypedNull) {
+        return inferred;
+    }
+    if let (BqType::Array(r_el), BqType::Array(i_el)) = (&raw, &inferred) {
+        return BqType::array(merge_inferred_type(
+            r_el.as_ref().clone(),
+            i_el.as_ref().clone(),
+        ))
+        .unwrap_or(raw);
+    }
+    raw
 }
 
 fn expand_wildcard(
