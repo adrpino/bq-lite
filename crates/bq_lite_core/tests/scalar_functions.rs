@@ -106,3 +106,101 @@ fn json_and_array_functions() {
         ]
     );
 }
+
+#[test]
+fn array_null_arguments_propagate_and_validate_types() {
+    let engine = Engine::new();
+    let res = engine
+        .query(
+            "SELECT \
+             ARRAY_TO_STRING(CAST(NULL AS ARRAY<STRING>), ','), \
+             ARRAY_TO_STRING(CAST(NULL AS ARRAY<STRING>), ',', '?'), \
+             ARRAY_TO_STRING(['a', 'b'], CAST(NULL AS STRING)), \
+             ARRAY_TO_STRING(['a', NULL, 'b'], ',', CAST(NULL AS STRING)), \
+             ARRAY_TO_STRING(['a', NULL, 'b'], ',', '?'), \
+             ARRAY_REVERSE(CAST(NULL AS ARRAY<INT64>)), \
+             ARRAY_CONCAT(CAST(NULL AS ARRAY<INT64>), [1, 2]), \
+             ARRAY_CONCAT([1, 2], CAST(NULL AS ARRAY<INT64>))",
+        )
+        .unwrap();
+    assert_eq!(
+        res.rows[0],
+        vec![
+            BqValue::Null,
+            BqValue::Null,
+            BqValue::Null,
+            BqValue::Null,
+            BqValue::String("a,?,b".to_owned()),
+            BqValue::Null,
+            BqValue::Null,
+            BqValue::Null,
+        ]
+    );
+
+    let err = engine
+        .query("SELECT ARRAY_TO_STRING(['a', 'b'], ',', 123)")
+        .unwrap_err();
+    assert_eq!(err.kind, BqErrorKind::Query);
+}
+
+#[test]
+fn instr_like_escape_and_format_specifiers() {
+    let engine = Engine::new();
+    let res = engine
+        .query(
+            "SELECT \
+             INSTR('banana', 'a'), \
+             INSTR('banana', 'a', 3), \
+             INSTR('banana', 'a', 3, 2), \
+             INSTR('banana', 'a', -1), \
+             INSTR('banana', 'a', -2), \
+             INSTR('banana', 'a', -1, 2), \
+             INSTR('banana', 'a', 100), \
+             INSTR('banana', 'a', -100), \
+             INSTR('banana', 'a', CAST(NULL AS INT64)), \
+             'a%b' LIKE 'a\\\\%b', \
+             'axb' LIKE r'a\\%b', \
+             'a_b' LIKE 'a\\\\_b', \
+             'axb' LIKE r'a\\_b', \
+             'a\\\\b' LIKE 'a\\\\\\\\b', \
+             FORMAT('%t|%T|%T|%T|%.2f|%04d|%s', 'hi', 'hi', NUMERIC '1.25', JSON '{\"k\":1}', 3.14159, 7, CAST(NULL AS INT64))",
+        )
+        .unwrap();
+    assert_eq!(
+        res.rows[0],
+        vec![
+            BqValue::Int64(2),
+            BqValue::Int64(4),
+            BqValue::Int64(6),
+            BqValue::Int64(6),
+            BqValue::Int64(4),
+            BqValue::Int64(4),
+            BqValue::Int64(0),
+            BqValue::Int64(0),
+            BqValue::Null,
+            BqValue::Bool(true),
+            BqValue::Bool(false),
+            BqValue::Bool(true),
+            BqValue::Bool(false),
+            BqValue::Bool(true),
+            BqValue::String(
+                "hi|\"hi\"|NUMERIC \"1.25\"|JSON '{\"k\":1}'|3.14|0007|NULL".to_owned()
+            ),
+        ]
+    );
+
+    assert_eq!(
+        engine
+            .query("SELECT SAFE.INSTR('abc', 'a', 0)")
+            .unwrap()
+            .rows[0][0],
+        BqValue::Null
+    );
+    assert_eq!(
+        engine
+            .query("SELECT SAFE.INSTR('abc', 'a', 1, 0)")
+            .unwrap()
+            .rows[0][0],
+        BqValue::Null
+    );
+}

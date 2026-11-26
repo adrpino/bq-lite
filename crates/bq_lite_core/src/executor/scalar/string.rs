@@ -6,6 +6,7 @@ use crate::types::BqValue;
 use super::string_fmt::{
     eval_format, eval_from_base64, eval_from_hex, eval_to_base64, eval_to_hex,
 };
+use super::string_instr::eval_instr;
 
 pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "BYTE_LENGTH",
@@ -218,25 +219,6 @@ fn eval_strpos(args: Vec<BqValue>) -> BqResult<BqValue> {
     }
     let (BqValue::String(h), BqValue::String(n)) = (hay, needle) else {
         return Err(BqError::query("STRPOS expects STRING arguments"));
-    };
-    let pos = h.find(&n).map_or(0, |byte_idx| {
-        i64::try_from(h.get(..byte_idx).unwrap_or("").chars().count() + 1).unwrap_or(i64::MAX)
-    });
-    Ok(BqValue::Int64(pos))
-}
-
-fn eval_instr(args: Vec<BqValue>) -> BqResult<BqValue> {
-    if args.len() < 2 || args.len() > 4 {
-        return Err(BqError::query("INSTR expects 2 to 4 arguments"));
-    }
-    let mut it = args.into_iter();
-    let hay = it.next().unwrap_or(BqValue::Null);
-    let needle = it.next().unwrap_or(BqValue::Null);
-    if hay.is_null() || needle.is_null() {
-        return Ok(BqValue::Null);
-    }
-    let (BqValue::String(h), BqValue::String(n)) = (hay, needle) else {
-        return Err(BqError::query("INSTR expects STRING"));
     };
     let pos = h.find(&n).map_or(0, |byte_idx| {
         i64::try_from(h.get(..byte_idx).unwrap_or("").chars().count() + 1).unwrap_or(i64::MAX)

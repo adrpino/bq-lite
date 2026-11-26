@@ -301,3 +301,70 @@ fn fork_isolated_keeps_parent_and_sibling_clean() {
         BqValue::Int64(4)
     );
 }
+
+#[test]
+fn executes_range_window_frames_with_numeric_and_interval_offsets() {
+    let engine = Engine::new();
+    let res = engine
+        .query(
+            "WITH t AS (
+               SELECT 1 AS x, 10 AS v UNION ALL
+               SELECT 2, 20 UNION ALL
+               SELECT 5, 50 UNION ALL
+               SELECT 6, 60
+             )
+             SELECT
+               x,
+               SUM(v) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS win_sum,
+               COUNT(*) OVER (ORDER BY x RANGE BETWEEN 10 PRECEDING AND 5 PRECEDING) AS empty_cnt,
+               SUM(v) OVER (ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS desc_sum
+             FROM t
+             ORDER BY x",
+        )
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![
+            vec![
+                BqValue::Int64(1),
+                BqValue::Int64(30),
+                BqValue::Int64(0),
+                BqValue::Int64(30),
+            ],
+            vec![
+                BqValue::Int64(2),
+                BqValue::Int64(30),
+                BqValue::Int64(0),
+                BqValue::Int64(20),
+            ],
+            vec![
+                BqValue::Int64(5),
+                BqValue::Int64(110),
+                BqValue::Int64(0),
+                BqValue::Int64(110),
+            ],
+            vec![
+                BqValue::Int64(6),
+                BqValue::Int64(110),
+                BqValue::Int64(1),
+                BqValue::Int64(60),
+            ],
+        ]
+    );
+
+    let ts_res = engine
+        .query(
+            "WITH events AS (
+               SELECT DATE '2026-01-01' AS d, 1 AS n UNION ALL
+               SELECT DATE '2026-01-02', 2 UNION ALL
+               SELECT DATE '2026-01-05', 5
+             )
+             SELECT d, SUM(n) OVER (ORDER BY d RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW) AS s
+             FROM events
+             ORDER BY d",
+        )
+        .unwrap();
+    assert_eq!(ts_res.rows[0][1], BqValue::Int64(1));
+    assert_eq!(ts_res.rows[1][1], BqValue::Int64(3));
+    assert_eq!(ts_res.rows[2][1], BqValue::Int64(5));
+}

@@ -10,6 +10,7 @@ mod range_geo_net;
 mod regex_fn;
 mod string;
 mod string_fmt;
+mod string_instr;
 
 use crate::error::BqResult;
 use crate::executor::context::ExecContext;

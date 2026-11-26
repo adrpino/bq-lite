@@ -13,6 +13,7 @@ mod sort;
 mod type_infer;
 mod window;
 mod window_fns;
+mod window_frames;
 
 use crate::ast::{
     Expr, OrderByExpr, Query, Select, SelectAsKind, SetExpr, SetQuantifier, WithClause,

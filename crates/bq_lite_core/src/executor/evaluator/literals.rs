@@ -61,3 +61,53 @@ fn parse_timestamp_lit(s: &str) -> BqResult<DateTime<Utc>> {
     }
     Err(BqError::query(format!("Invalid TIMESTAMP literal: '{s}'")))
 }
+
+/// Evaluates `LIKE` with `%`, `_`, and `\` backslash escape support.
+pub(super) fn eval_like(text: &str, pattern: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Pat {
+        Any,
+        One,
+        Lit(char),
+    }
+    let mut p = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => p.push(Pat::Lit(chars.next().unwrap_or('\\'))),
+            '%' => p.push(Pat::Any),
+            '_' => p.push(Pat::One),
+            other => p.push(Pat::Lit(other)),
+        }
+    }
+    let mut dp = vec![false; p.len() + 1];
+    if let Some(first) = dp.first_mut() {
+        *first = true;
+    }
+    for j in 1..=p.len() {
+        if matches!(p.get(j - 1), Some(Pat::Any)) {
+            let prev = dp.get(j - 1).copied().unwrap_or(false);
+            if let Some(slot) = dp.get_mut(j) {
+                *slot = prev;
+            }
+        }
+    }
+    for tc in text.chars() {
+        let mut next = vec![false; p.len() + 1];
+        for j in 1..=p.len() {
+            let matched = match p.get(j - 1) {
+                Some(Pat::Any) => {
+                    next.get(j - 1).copied().unwrap_or(false) || dp.get(j).copied().unwrap_or(false)
+                }
+                Some(Pat::One) => dp.get(j - 1).copied().unwrap_or(false),
+                Some(Pat::Lit(pc)) => dp.get(j - 1).copied().unwrap_or(false) && tc == *pc,
+                None => false,
+            };
+            if let Some(slot) = next.get_mut(j) {
+                *slot = matched;
+            }
+        }
+        dp = next;
+    }
+    dp.get(p.len()).copied().unwrap_or(false)
+}

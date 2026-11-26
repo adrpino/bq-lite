@@ -453,39 +453,3 @@ pub(in crate::executor) fn compare_values(a: &BqValue, b: &BqValue) -> BqResult<
     };
     Ok(ord)
 }
-
-/// Evaluates `LIKE` with `%` and `_` wildcards.
-pub(super) fn eval_like(text: &str, pattern: &str) -> bool {
-    let t: Vec<char> = text.chars().collect();
-    let p: Vec<char> = pattern.chars().collect();
-    let mut dp = vec![false; p.len() + 1];
-    if let Some(first) = dp.first_mut() {
-        *first = true;
-    }
-    for j in 1..=p.len() {
-        if p.get(j - 1) == Some(&'%') {
-            let prev = dp.get(j - 1).copied().unwrap_or(false);
-            if let Some(slot) = dp.get_mut(j) {
-                *slot = prev;
-            }
-        }
-    }
-    for &tc in &t {
-        let mut next = vec![false; p.len() + 1];
-        for j in 1..=p.len() {
-            let matched = match p.get(j - 1) {
-                Some('%') => {
-                    next.get(j - 1).copied().unwrap_or(false) || dp.get(j).copied().unwrap_or(false)
-                }
-                Some('_') => dp.get(j - 1).copied().unwrap_or(false),
-                Some(&pc) => dp.get(j - 1).copied().unwrap_or(false) && tc == pc,
-                None => false,
-            };
-            if let Some(slot) = next.get_mut(j) {
-                *slot = matched;
-            }
-        }
-        dp = next;
-    }
-    dp.get(p.len()).copied().unwrap_or(false)
-}

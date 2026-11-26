@@ -103,14 +103,19 @@ fn milestone_k_scalar_format_json_array_datetime_geo_and_net() {
                FROM_HEX('6162')",
         )
         .unwrap();
-    assert!(qr.rows[0][0]
-        .to_string()
-        .starts_with("42|-7|9|3.14|1.5|hi|"));
+    assert_eq!(
+        qr.rows[0][0],
+        BqValue::String("42|-7|9|3.140000|1.5|hi|[1, 2]|\"q\"|1|%".to_owned())
+    );
     assert_eq!(qr.rows[0][18], BqValue::String("YWJj".to_owned()));
     assert_eq!(qr.rows[0][19], BqValue::Bytes(b"abc".to_vec()));
     assert_eq!(qr.rows[0][20], BqValue::String("6162".to_owned()));
     assert_eq!(qr.rows[0][21], BqValue::Bytes(b"ab".to_vec()));
-    assert!(eng.query("SELECT FORMAT('%o', 8)").is_err());
+    assert_eq!(
+        eng.query("SELECT FORMAT('%o', 8)").unwrap().rows[0][0],
+        BqValue::String("10".to_owned())
+    );
+    assert!(eng.query("SELECT FORMAT('%Z', 8)").is_err());
     assert!(eng.query("SELECT FORMAT('%', 8)").is_err());
     assert!(eng.query("SELECT FROM_BASE64('!!!')").is_err());
     assert!(eng.query("SELECT FROM_HEX('zz')").is_err());

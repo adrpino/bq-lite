@@ -353,7 +353,7 @@ fn eval_like_expr(
     let (BqValue::String(s), BqValue::String(p)) = (val, pat) else {
         return Err(BqError::query("LIKE requires STRING operands"));
     };
-    let matched = ops::eval_like(&s, &p);
+    let matched = literals::eval_like(&s, &p);
     Ok(BqValue::Bool(if negated { !matched } else { matched }))
 }
 

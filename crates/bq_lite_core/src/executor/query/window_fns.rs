@@ -1,12 +1,11 @@
-use crate::ast::{
-    FunctionCall, NullHandling, WindowFrame, WindowFrameBound, WindowFrameUnit, WindowSpec,
-};
+use crate::ast::{FunctionCall, NullHandling, WindowSpec};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
-use crate::executor::evaluator::{eval_expr, values_distinct_eq};
+use crate::executor::evaluator::eval_expr;
 use crate::types::BqValue;
 
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
+use super::window_frames::{eval_offset_int, frame_bounds, keys_equal, order_keys};
 
 pub(super) fn eval_window_partition(
     call: &FunctionCall,
@@ -312,132 +311,10 @@ fn eval_window_agg(
             .iter()
             .filter_map(|&idx| rows.get(idx).cloned())
             .collect();
-        let val = if slice_rows.is_empty() {
-            BqValue::Null
-        } else {
-            eval_aggregate_call(call, &slice_rows, ctx)?
-        };
+        let val = eval_aggregate_call(call, &slice_rows, ctx)?;
         set_out(out, row_idx, val);
     }
     Ok(())
-}
-
-fn frame_bounds(
-    spec: &WindowSpec,
-    pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-) -> BqResult<(usize, usize)> {
-    let last = part.len().saturating_sub(1);
-    let Some(ref frame) = spec.frame else {
-        if spec.order_by.is_empty() {
-            return Ok((0, last));
-        }
-        let peer_end = find_peer_end(spec, pos, part, rows, ctx)?;
-        return Ok((0, peer_end));
-    };
-    if frame.unit == WindowFrameUnit::Range && frame_has_numeric_offsets(frame) {
-        return Ok((0, pos.min(last)));
-    }
-    let start = resolve_row_bound(&frame.start, pos, last, true, ctx)?;
-    let end = match &frame.end {
-        Some(b) => resolve_row_bound(b, pos, last, false, ctx)?,
-        None => pos,
-    };
-    Ok((start, end))
-}
-
-const fn frame_has_numeric_offsets(frame: &WindowFrame) -> bool {
-    matches!(
-        frame.start,
-        WindowFrameBound::Preceding(Some(_)) | WindowFrameBound::Following(Some(_))
-    ) || matches!(
-        frame.end,
-        Some(WindowFrameBound::Preceding(Some(_)) | WindowFrameBound::Following(Some(_)))
-    )
-}
-
-fn resolve_row_bound(
-    bound: &WindowFrameBound,
-    pos: usize,
-    last: usize,
-    is_start: bool,
-    ctx: &ExecContext<'_>,
-) -> BqResult<usize> {
-    match bound {
-        WindowFrameBound::CurrentRow => Ok(pos),
-        WindowFrameBound::Preceding(None) => Ok(0),
-        WindowFrameBound::Following(None) => Ok(last),
-        WindowFrameBound::Preceding(Some(e)) => {
-            let n = eval_offset_int(e, ctx)?;
-            Ok(if is_start {
-                pos.saturating_sub(n)
-            } else {
-                pos.saturating_sub(n).min(last)
-            })
-        }
-        WindowFrameBound::Following(Some(e)) => {
-            let n = eval_offset_int(e, ctx)?;
-            Ok(pos.saturating_add(n).min(last))
-        }
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Window frame offset must be INT64"
-)]
-fn eval_offset_int(expr: &crate::ast::Expr, ctx: &ExecContext<'_>) -> BqResult<usize> {
-    match eval_expr(expr, &EvalRow::default(), ctx)? {
-        BqValue::Int64(n) if n >= 0 => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
-        _ => Err(BqError::query(
-            "Window frame offset must be non-negative INT64",
-        )),
-    }
-}
-
-fn find_peer_end(
-    spec: &WindowSpec,
-    pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-) -> BqResult<usize> {
-    let cur_row = rows
-        .get(*part.get(pos).unwrap_or(&0))
-        .ok_or_else(|| BqError::internal("row"))?;
-    let cur_keys = order_keys(spec, cur_row, ctx)?;
-    let mut end = pos;
-    while let Some(&next_idx) = part.get(end + 1) {
-        let next_row = rows.get(next_idx).ok_or_else(|| BqError::internal("row"))?;
-        let next_keys = order_keys(spec, next_row, ctx)?;
-        if keys_equal(&cur_keys, &next_keys)? {
-            end += 1;
-        } else {
-            break;
-        }
-    }
-    Ok(end)
-}
-
-fn order_keys(spec: &WindowSpec, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<Vec<BqValue>> {
-    spec.order_by
-        .iter()
-        .map(|ob| eval_expr(&ob.expr, row, ctx))
-        .collect()
-}
-
-fn keys_equal(a: &[BqValue], b: &[BqValue]) -> BqResult<bool> {
-    if a.len() != b.len() {
-        return Ok(false);
-    }
-    for (va, vb) in a.iter().zip(b.iter()) {
-        if !values_distinct_eq(va, vb)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn set_out(out: &mut [BqValue], idx: usize, val: BqValue) {

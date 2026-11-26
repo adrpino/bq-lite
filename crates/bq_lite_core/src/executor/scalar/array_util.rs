@@ -127,7 +127,17 @@ fn eval_array_to_string(args: Vec<BqValue>) -> BqResult<BqValue> {
     let mut it = args.into_iter();
     let arr_v = it.next().unwrap_or(BqValue::Null);
     let delim_v = it.next().unwrap_or(BqValue::Null);
-    let null_rep = it.next();
+    let null_rep = match it.next() {
+        None => None,
+        Some(BqValue::Null) => return Ok(BqValue::Null),
+        Some(BqValue::String(s)) => Some(s),
+        Some(other) => {
+            return Err(BqError::query(format!(
+                "ARRAY_TO_STRING null_text expects STRING, got {}",
+                other.infer_type()?
+            )))
+        }
+    };
     if arr_v.is_null() || delim_v.is_null() {
         return Ok(BqValue::Null);
     }
@@ -137,7 +147,7 @@ fn eval_array_to_string(args: Vec<BqValue>) -> BqResult<BqValue> {
     let mut parts = Vec::new();
     for item in items {
         if item.is_null() {
-            if let Some(BqValue::String(ref rep)) = null_rep {
+            if let Some(ref rep) = null_rep {
                 parts.push(rep.clone());
             }
         } else {
