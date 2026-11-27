@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.26"
+version = "0.2.27"
 edition = "2021"
 license = "MIT"
 rust-version = "1.82"
@@ -62,7 +62,7 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 
 [profile.release]
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true
 
