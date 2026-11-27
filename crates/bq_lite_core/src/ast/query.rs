@@ -38,6 +38,13 @@ pub enum SetQuantifier {
     Distinct,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetCorrespondence {
+    Positional,
+    ByName,
+    Corresponding,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SetExpr {
     Select(Box<Select>),
@@ -45,7 +52,7 @@ pub enum SetExpr {
     SetOperation {
         op: SetOpKind,
         quantifier: SetQuantifier,
-        by_name: bool,
+        correspondence: SetCorrespondence,
         left: Box<Self>,
         right: Box<Self>,
     },
@@ -184,22 +191,73 @@ pub struct Join {
     pub constraint: JoinConstraint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipeOrderDir {
+    pub asc: bool,
+    pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipeOrderedItem {
+    pub item: SelectItem,
+    pub order: Option<PipeOrderDir>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipeGroupByItem {
+    pub item: GroupByItem,
+    pub alias: Option<Ident>,
+    pub order: Option<PipeOrderDir>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PipeOp {
     Where(Box<Expr>),
-    Select(Vec<SelectItem>),
-    Extend(Vec<SelectItem>),
+    Select {
+        items: Vec<SelectItem>,
+        window: Vec<NamedWindowDef>,
+    },
+    Extend {
+        items: Vec<SelectItem>,
+        window: Vec<NamedWindowDef>,
+    },
+    Window {
+        items: Vec<SelectItem>,
+        window: Vec<NamedWindowDef>,
+    },
     Set(Vec<(Ident, Expr)>),
     Drop(Vec<Ident>),
     Rename(Vec<(Ident, Ident)>),
     Aggregate {
-        aggs: Vec<SelectItem>,
-        group_by: Vec<GroupByItem>,
+        aggs: Vec<PipeOrderedItem>,
+        group_by: Vec<PipeGroupByItem>,
+        group_and_order_by: bool,
     },
     OrderBy(Vec<OrderByExpr>),
     Limit {
-        limit: Box<Expr>,
+        limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
     },
     As(Ident),
+    Distinct,
+    Join(Box<Join>),
+    SetOp {
+        op: SetOpKind,
+        quantifier: SetQuantifier,
+        correspondence: SetCorrespondence,
+        queries: Vec<Query>,
+    },
+    Pivot {
+        spec: PivotSpec,
+        alias: Option<Ident>,
+    },
+    Unpivot {
+        spec: UnpivotSpec,
+        alias: Option<Ident>,
+    },
+    TableSample {
+        amount: Box<Expr>,
+        is_rows: bool,
+    },
+    With(Vec<Cte>),
 }

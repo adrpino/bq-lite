@@ -5,7 +5,7 @@ use crate::executor::scalar::eval_scalar_builtin;
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqStructFieldValue, BqType, BqValue};
 
-use super::eval_expr;
+use super::{coerce_to_expr_supertype, eval_expr};
 
 pub(super) fn eval_function_expr(
     call: &FunctionCall,
@@ -24,6 +24,7 @@ pub(super) fn eval_function_expr(
         "IF" => Some(eval_if_short_circuit(call, row, ctx)),
         "COALESCE" => Some(eval_coalesce_short_circuit(call, row, ctx)),
         "IFNULL" => Some(eval_ifnull_short_circuit(call, row, ctx)),
+        "NULLIF" => Some(eval_nullif_typed(call, row, ctx)),
         _ => None,
     };
     if let Some(res) = short_res {
@@ -113,14 +114,17 @@ fn eval_if_short_circuit(
         return Err(BqError::query("IF expects 3 arguments"));
     };
     let cond = eval_expr(&cond_arg.expr, row, ctx)?;
-    match cond {
-        BqValue::Bool(true) => eval_expr(&t_arg.expr, row, ctx),
-        BqValue::Bool(false) | BqValue::Null => eval_expr(&f_arg.expr, row, ctx),
-        other => Err(BqError::query(format!(
-            "IF condition must be BOOL, got {}",
-            other.infer_type()?
-        ))),
-    }
+    let val = match cond {
+        BqValue::Bool(true) => eval_expr(&t_arg.expr, row, ctx)?,
+        BqValue::Bool(false) | BqValue::Null => eval_expr(&f_arg.expr, row, ctx)?,
+        other => {
+            return Err(BqError::query(format!(
+                "IF condition must be BOOL, got {}",
+                other.infer_type()?
+            )))
+        }
+    };
+    coerce_to_expr_supertype(val, &[&t_arg.expr, &f_arg.expr], row, ctx)
 }
 
 fn eval_coalesce_short_circuit(
@@ -128,10 +132,11 @@ fn eval_coalesce_short_circuit(
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
+    let branch_exprs: Vec<&Expr> = call.args.iter().map(|a| &a.expr).collect();
     for arg in &call.args {
         let val = eval_expr(&arg.expr, row, ctx)?;
         if !val.is_null() {
-            return Ok(val);
+            return coerce_to_expr_supertype(val, &branch_exprs, row, ctx);
         }
     }
     Ok(BqValue::Null)
@@ -146,11 +151,32 @@ fn eval_ifnull_short_circuit(
         return Err(BqError::query("IFNULL expects 2 arguments"));
     };
     let a = eval_expr(&a_arg.expr, row, ctx)?;
-    if a.is_null() {
-        eval_expr(&b_arg.expr, row, ctx)
+    let val = if a.is_null() {
+        eval_expr(&b_arg.expr, row, ctx)?
     } else {
-        Ok(a)
-    }
+        a
+    };
+    coerce_to_expr_supertype(val, &[&a_arg.expr, &b_arg.expr], row, ctx)
+}
+
+fn eval_nullif_typed(
+    call: &FunctionCall,
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let [a_arg, b_arg] = call.args.as_slice() else {
+        return Err(BqError::query("NULLIF expects 2 arguments"));
+    };
+    let a = eval_expr(&a_arg.expr, row, ctx)?;
+    let b = eval_expr(&b_arg.expr, row, ctx)?;
+    let val = if a.is_null() || b.is_null() {
+        a
+    } else if super::values_equal(&a, &b)? {
+        BqValue::Null
+    } else {
+        a
+    };
+    coerce_to_expr_supertype(val, &[&a_arg.expr, &b_arg.expr], row, ctx)
 }
 
 fn eval_array_lambda(

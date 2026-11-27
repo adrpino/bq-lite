@@ -26,9 +26,10 @@ pub use expr::{
     Literal, NullHandling, StructFieldExpr, UnaryOp, WhenBranch,
 };
 pub use query::{
-    Cte, GroupByClause, GroupByItem, Join, JoinConstraint, JoinKind, PipeOp, PivotSpec, Query,
-    ReplaceItem, Select, SelectAsKind, SelectItem, SetExpr, SetOpKind, SetQuantifier, TableFactor,
-    TableWithJoins, UnpivotSpec, WithClause,
+    Cte, GroupByClause, GroupByItem, Join, JoinConstraint, JoinKind, PipeGroupByItem, PipeOp,
+    PipeOrderDir, PipeOrderedItem, PivotSpec, Query, ReplaceItem, Select, SelectAsKind, SelectItem,
+    SetCorrespondence, SetExpr, SetOpKind, SetQuantifier, TableFactor, TableWithJoins, UnpivotSpec,
+    WithClause,
 };
 pub use script::{
     AssertStmt, BeginEndBlock, CallStmt, CaseStmt, CaseStmtBranch, DeclareStmt,

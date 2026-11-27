@@ -10,6 +10,7 @@ mod governance;
 mod joins;
 mod joins_hash;
 mod pipe;
+mod pipe_ops;
 mod pivot;
 mod project;
 mod schema;
@@ -29,6 +30,7 @@ use crate::executor::result::{QueryColumn, QueryResult};
 use crate::types::{BqType, BqValue};
 
 pub(in crate::executor) use self::project::project_eval_rows as project_eval_rows_public;
+pub(in crate::executor) use self::type_infer::infer_expr_type as infer_expr_type_public;
 pub(in crate::executor) use from::{
     eval_from_clause as eval_from_clause_public,
     eval_table_factor_standalone as eval_table_factor_public,
@@ -37,7 +39,7 @@ pub(in crate::executor) use from::{
 use agg::{execute_grouped_select_with_order, select_uses_grouping};
 use cte::eval_with_clause;
 use from::eval_from_clause_with_schema;
-use pipe::apply_pipe_ops;
+use pipe::execute_query_with_pipes;
 use project::{has_untyped_null, project_eval_rows};
 use schema::infer_select_columns;
 use set_ops::execute_set_op;
@@ -61,14 +63,18 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
         eval_with_clause(with, &mut local_ctx)?;
     }
 
-    let mut result = if let SetExpr::Select(ref sel) = query.body {
+    if !query.pipe_ops.is_empty() {
+        return execute_query_with_pipes(query, &mut local_ctx);
+    }
+
+    if let SetExpr::Select(ref sel) = query.body {
         execute_select_full(
             sel,
             &query.order_by,
             query.limit.as_ref(),
             query.offset.as_ref(),
             &local_ctx,
-        )?
+        )
     } else {
         let mut res = execute_set_expr(&query.body, &local_ctx)?;
         if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
@@ -87,13 +93,8 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
                 .map(|r| r.cols.into_iter().map(|c| c.value).collect())
                 .collect();
         }
-        res
-    };
-
-    if !query.pipe_ops.is_empty() {
-        result = apply_pipe_ops(result, &query.pipe_ops, &local_ctx)?;
+        Ok(res)
     }
-    Ok(result)
 }
 
 pub(super) fn execute_set_expr(expr: &SetExpr, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
@@ -103,13 +104,13 @@ pub(super) fn execute_set_expr(expr: &SetExpr, ctx: &ExecContext<'_>) -> BqResul
         SetExpr::SetOperation {
             op,
             quantifier,
-            by_name,
+            correspondence,
             left,
             right,
         } => {
             let l = execute_set_expr(left, ctx)?;
             let r = execute_set_expr(right, ctx)?;
-            execute_set_op(*op, *quantifier, *by_name, l, r)
+            execute_set_op(*op, *quantifier, *correspondence, l, r)
         }
         SetExpr::Values(rows_expr) => eval_values_expr(rows_expr, ctx),
     }
@@ -319,32 +320,57 @@ fn build_select_result(
                 .map_or(Ok(BqType::UntypedNull), BqValue::infer_type)?;
             Ok(QueryResult::new(vec![QueryColumn::new("f0_", ty)], rows))
         }
-        None => {
-            let mut cols: Vec<QueryColumn> = projected
-                .first()
-                .map(|r| {
-                    r.cols
-                        .iter()
-                        .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (idx, col) in cols.iter_mut().enumerate() {
-                if has_untyped_null(&col.ty) {
-                    if let Some(found) = projected
-                        .iter()
-                        .filter_map(|r| r.cols.get(idx))
-                        .find(|c| !has_untyped_null(&c.ty))
+        None => build_tabular_result(projected),
+    }
+}
+
+fn build_tabular_result(projected: Vec<EvalRow>) -> BqResult<QueryResult> {
+    let mut cols: Vec<QueryColumn> = projected
+        .first()
+        .map(|r| {
+            r.cols
+                .iter()
+                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (idx, col) in cols.iter_mut().enumerate() {
+        for r in &projected {
+            if let Some(cell) = r.cols.get(idx) {
+                if cell.ty != col.ty {
+                    if let Ok(sup) =
+                        crate::types::coercion::common_supertype(&[col.ty.clone(), cell.ty.clone()])
                     {
-                        col.ty = found.ty.clone();
+                        col.ty = sup;
                     }
                 }
             }
-            let rows = projected
-                .into_iter()
-                .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-                .collect();
-            Ok(QueryResult::new(cols, rows))
+        }
+        if has_untyped_null(&col.ty) {
+            if let Some(found) = projected
+                .iter()
+                .filter_map(|r| r.cols.get(idx))
+                .find(|c| !has_untyped_null(&c.ty))
+            {
+                col.ty = found.ty.clone();
+            }
         }
     }
+    let mut rows = Vec::with_capacity(projected.len());
+    for r in projected {
+        let mut out_row = Vec::with_capacity(r.cols.len());
+        for (c, target_col) in r.cols.into_iter().zip(&cols) {
+            let coerced = if !c.value.is_null()
+                && c.ty != target_col.ty
+                && crate::types::coercion::can_implicitly_coerce(&c.ty, &target_col.ty)
+            {
+                crate::types::coercion::coerce_value(c.value, &target_col.ty)?
+            } else {
+                c.value
+            };
+            out_row.push(coerced);
+        }
+        rows.push(out_row);
+    }
+    Ok(QueryResult::new(cols, rows))
 }

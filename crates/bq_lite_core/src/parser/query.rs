@@ -1,12 +1,13 @@
 use crate::ast::{
-    Cte, Expr, GroupByClause, GroupByItem, Ident, NamedWindowDef, PipeOp, Query, ReplaceItem,
-    Select, SelectAsKind, SelectItem, SetExpr, SetOpKind, SetQuantifier, WithClause,
+    Cte, Expr, GroupByClause, GroupByItem, Ident, NamedWindowDef, Query, ReplaceItem, Select,
+    SelectAsKind, SelectItem, SetCorrespondence, SetExpr, SetOpKind, SetQuantifier, WithClause,
 };
 use crate::error::{BqError, BqResult};
 
 use super::cursor::Parser;
 use super::expr::parse_expr;
 use super::expr_postfix::{parse_order_by_expr, parse_window_spec};
+use super::pipe::parse_pipe_op;
 use super::query_from::parse_from_list;
 use super::token::TokenKind;
 
@@ -49,7 +50,7 @@ fn parse_with_clause(p: &mut Parser) -> BqResult<WithClause> {
     Ok(WithClause { recursive, ctes })
 }
 
-fn parse_cte(p: &mut Parser) -> BqResult<Cte> {
+pub(super) fn parse_cte(p: &mut Parser) -> BqResult<Cte> {
     let name = p.parse_ident()?;
     let columns = if p.eat(&TokenKind::LParen) {
         let cols = p.parse_comma_list(Parser::parse_ident)?;
@@ -79,12 +80,12 @@ fn parse_set_expr(p: &mut Parser) -> BqResult<SetExpr> {
             SetOpKind::Except
         };
         let quantifier = parse_set_quantifier(p)?;
-        let by_name = parse_optional_by_name(p)?;
+        let correspondence = parse_optional_correspondence(p)?;
         let right = parse_set_term(p)?;
         left = SetExpr::SetOperation {
             op,
             quantifier,
-            by_name,
+            correspondence,
             left: Box::new(left),
             right: Box::new(right),
         };
@@ -96,12 +97,12 @@ fn parse_set_term(p: &mut Parser) -> BqResult<SetExpr> {
     let mut left = parse_set_factor(p)?;
     while p.eat_kw("INTERSECT") {
         let quantifier = parse_set_quantifier(p)?;
-        let by_name = parse_optional_by_name(p)?;
+        let correspondence = parse_optional_correspondence(p)?;
         let right = parse_set_factor(p)?;
         left = SetExpr::SetOperation {
             op: SetOpKind::Intersect,
             quantifier,
-            by_name,
+            correspondence,
             left: Box::new(left),
             right: Box::new(right),
         };
@@ -109,7 +110,7 @@ fn parse_set_term(p: &mut Parser) -> BqResult<SetExpr> {
     Ok(left)
 }
 
-fn parse_set_quantifier(p: &mut Parser) -> BqResult<SetQuantifier> {
+pub(super) fn parse_set_quantifier(p: &mut Parser) -> BqResult<SetQuantifier> {
     if p.eat_kw("ALL") {
         Ok(SetQuantifier::All)
     } else if p.eat_kw("DISTINCT") {
@@ -122,20 +123,20 @@ fn parse_set_quantifier(p: &mut Parser) -> BqResult<SetQuantifier> {
     }
 }
 
-fn parse_optional_by_name(p: &mut Parser) -> BqResult<bool> {
+pub(super) fn parse_optional_correspondence(p: &mut Parser) -> BqResult<SetCorrespondence> {
     if p.eat_kw("BY") {
         p.expect_kw("NAME")?;
-        Ok(true)
+        Ok(SetCorrespondence::ByName)
     } else if p.eat_kw("CORRESPONDING") {
-        Ok(true)
+        Ok(SetCorrespondence::Corresponding)
     } else if p.is_kw("STRICT")
         && matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("CORRESPONDING"))
     {
         p.advance();
         p.advance();
-        Ok(true)
+        Ok(SetCorrespondence::ByName)
     } else {
-        Ok(false)
+        Ok(SetCorrespondence::Positional)
     }
 }
 
@@ -363,7 +364,7 @@ fn parse_gb_tuple_or_expr(p: &mut Parser) -> BqResult<Vec<Expr>> {
     Ok(vec![parse_expr(p)?])
 }
 
-fn parse_group_by_item(p: &mut Parser) -> BqResult<GroupByItem> {
+pub(super) fn parse_group_by_item(p: &mut Parser) -> BqResult<GroupByItem> {
     if p.eat_kw("ROLLUP") {
         p.expect(&TokenKind::LParen, "'('")?;
         let groups = p.parse_comma_list(parse_gb_tuple_or_expr)?;
@@ -395,7 +396,7 @@ fn parse_group_by_item(p: &mut Parser) -> BqResult<GroupByItem> {
     Ok(GroupByItem::Expr(Box::new(parse_expr(p)?)))
 }
 
-fn parse_optional_window_clause(p: &mut Parser) -> BqResult<Vec<NamedWindowDef>> {
+pub(super) fn parse_optional_window_clause(p: &mut Parser) -> BqResult<Vec<NamedWindowDef>> {
     if !p.eat_kw("WINDOW") {
         return Ok(Vec::new());
     }
@@ -411,74 +412,15 @@ fn parse_limit_offset(p: &mut Parser) -> BqResult<(Option<Expr>, Option<Expr>)> 
     if !p.eat_kw("LIMIT") {
         return Ok((None, None));
     }
-    let limit = parse_expr(p)?;
+    let limit = if p.eat_kw("ALL") {
+        None
+    } else {
+        Some(parse_expr(p)?)
+    };
     let offset = if p.eat_kw("OFFSET") {
         Some(parse_expr(p)?)
     } else {
         None
     };
-    Ok((Some(limit), offset))
-}
-
-fn parse_pipe_op(p: &mut Parser) -> BqResult<PipeOp> {
-    if p.eat_kw("WHERE") {
-        return Ok(PipeOp::Where(Box::new(parse_expr(p)?)));
-    }
-    if p.eat_kw("SELECT") {
-        return Ok(PipeOp::Select(p.parse_comma_list(parse_select_item)?));
-    }
-    if p.eat_kw("EXTEND") {
-        return Ok(PipeOp::Extend(p.parse_comma_list(parse_select_item)?));
-    }
-    if p.eat_kw("SET") {
-        let items = p.parse_comma_list(|p| {
-            let col = p.parse_ident()?;
-            p.expect(&TokenKind::Eq, "'='")?;
-            let val = parse_expr(p)?;
-            Ok((col, val))
-        })?;
-        return Ok(PipeOp::Set(items));
-    }
-    if p.eat_kw("DROP") {
-        return Ok(PipeOp::Drop(p.parse_comma_list(Parser::parse_ident)?));
-    }
-    if p.eat_kw("RENAME") {
-        let items = p.parse_comma_list(|p| {
-            let old = p.parse_ident()?;
-            p.eat_kw("AS");
-            let new = p.parse_ident()?;
-            Ok((old, new))
-        })?;
-        return Ok(PipeOp::Rename(items));
-    }
-    if p.eat_kw("AGGREGATE") {
-        let aggs = p.parse_comma_list(parse_select_item)?;
-        let group_by = if p.eat_kw("GROUP") {
-            p.expect_kw("BY")?;
-            p.parse_comma_list(parse_group_by_item)?
-        } else {
-            Vec::new()
-        };
-        return Ok(PipeOp::Aggregate { aggs, group_by });
-    }
-    if p.eat_kw("ORDER") {
-        p.expect_kw("BY")?;
-        return Ok(PipeOp::OrderBy(p.parse_comma_list(parse_order_by_expr)?));
-    }
-    if p.eat_kw("LIMIT") {
-        let limit = Box::new(parse_expr(p)?);
-        let offset = if p.eat_kw("OFFSET") {
-            Some(Box::new(parse_expr(p)?))
-        } else {
-            None
-        };
-        return Ok(PipeOp::Limit { limit, offset });
-    }
-    if p.eat_kw("AS") {
-        return Ok(PipeOp::As(p.parse_ident()?));
-    }
-    Err(BqError::syntax(
-        "Unsupported pipe operator",
-        p.current_span(),
-    ))
+    Ok((limit, offset))
 }

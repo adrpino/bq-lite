@@ -118,16 +118,6 @@ pub(super) fn eval_aggregate_expr(
     eval_grouped_expr(expr, bucket, &GroupedKeys::default(), ctx)
 }
 
-pub(super) fn execute_grouped_select(
-    select: &Select,
-    rows: &[EvalRow],
-    schema_row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<Vec<EvalRow>> {
-    let (proj, _, _) = execute_grouped_select_with_order(select, &[], rows, schema_row, ctx)?;
-    Ok(proj)
-}
-
 pub(super) fn execute_grouped_select_with_order(
     select: &Select,
     order_by: &[OrderByExpr],

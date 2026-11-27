@@ -113,6 +113,32 @@ pub(super) fn apply_windows(
     Ok((rewritten, rows))
 }
 
+pub(super) fn apply_windows_to_exprs(
+    exprs: &mut [Expr],
+    named_windows: &[NamedWindowDef],
+    rows: &mut [EvalRow],
+    ctx: &ExecContext<'_>,
+) -> BqResult<()> {
+    let mut calls: Vec<FunctionCall> = Vec::new();
+    for expr in exprs {
+        rewrite_expr_windows(expr, &mut calls);
+    }
+    for (idx, call) in calls.iter().enumerate() {
+        let vals = eval_window_call(call, rows, named_windows, ctx)?;
+        let col_name: std::sync::Arc<str> = std::sync::Arc::from(format!("__win_{idx}"));
+        for (row, val) in rows.iter_mut().zip(vals) {
+            let ty = val.infer_type()?;
+            row.cols.push(RowBinding {
+                qualifier: None,
+                name: col_name.clone(),
+                ty,
+                value: val,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn execute_grouped_with_windows(
     select: &Select,
     order_by: &[OrderByExpr],

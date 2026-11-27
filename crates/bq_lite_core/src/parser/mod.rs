@@ -7,6 +7,7 @@ mod expr_postfix;
 mod expr_primary;
 mod lexer;
 mod lexer_strings;
+mod pipe;
 mod query;
 mod query_from;
 mod script;

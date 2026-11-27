@@ -1,4 +1,4 @@
-use crate::ast::{SetOpKind, SetQuantifier};
+use crate::ast::{SetCorrespondence, SetOpKind, SetQuantifier};
 use crate::error::{BqError, BqResult};
 use crate::executor::evaluator::values_distinct_eq;
 use crate::executor::result::{QueryColumn, QueryResult};
@@ -10,14 +10,14 @@ type AlignedSetInputs = (Vec<QueryColumn>, Vec<Vec<BqValue>>, Vec<Vec<BqValue>>)
 pub(super) fn execute_set_op(
     op: SetOpKind,
     quantifier: SetQuantifier,
-    by_name: bool,
+    correspondence: SetCorrespondence,
     left: QueryResult,
     right: QueryResult,
 ) -> BqResult<QueryResult> {
-    let (l_cols, l_rows, r_rows) = if by_name {
-        align_by_name(left, right)?
-    } else {
-        align_positional(left, right)?
+    let (l_cols, l_rows, r_rows) = match correspondence {
+        SetCorrespondence::Positional => align_positional(left, right)?,
+        SetCorrespondence::ByName => align_by_name(left, right)?,
+        SetCorrespondence::Corresponding => align_corresponding(left, right)?,
     };
     let rows = match op {
         SetOpKind::Union => eval_union(l_rows, r_rows, quantifier)?,
@@ -80,6 +80,52 @@ fn align_by_name(left: QueryResult, right: QueryResult) -> BqResult<AlignedSetIn
         .collect();
     let l_rows = coerce_rows(left.rows, &cols)?;
     let r_rows = coerce_rows(reordered_r, &cols)?;
+    Ok((cols, l_rows, r_rows))
+}
+
+fn align_corresponding(left: QueryResult, right: QueryResult) -> BqResult<AlignedSetInputs> {
+    let mut l_indices = Vec::new();
+    let mut r_indices = Vec::new();
+    let mut cols = Vec::new();
+    for (li, lc) in left.columns.iter().enumerate() {
+        let Some(ri) = right.column_index(&lc.name) else {
+            continue;
+        };
+        let Some(rc) = right.columns.get(ri) else {
+            continue;
+        };
+        let ty = common_supertype(&[lc.ty.clone(), rc.ty.clone()])?;
+        cols.push(QueryColumn::new(lc.name.clone(), ty));
+        l_indices.push(li);
+        r_indices.push(ri);
+    }
+    if cols.is_empty() {
+        return Err(BqError::query(
+            "CORRESPONDING set operation has no matching column names",
+        ));
+    }
+    let proj_l: Vec<Vec<BqValue>> = left
+        .rows
+        .into_iter()
+        .map(|row| {
+            l_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(BqValue::Null))
+                .collect()
+        })
+        .collect();
+    let proj_r: Vec<Vec<BqValue>> = right
+        .rows
+        .into_iter()
+        .map(|row| {
+            r_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(BqValue::Null))
+                .collect()
+        })
+        .collect();
+    let l_rows = coerce_rows(proj_l, &cols)?;
+    let r_rows = coerce_rows(proj_r, &cols)?;
     Ok((cols, l_rows, r_rows))
 }
 

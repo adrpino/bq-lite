@@ -11,8 +11,8 @@ use crate::executor::query::execute_query;
 use crate::types::{BqType, BqValue};
 
 use super::governance::{
-    apply_tablesample, mask_row_columns, policy_matches_session, unpack_null_struct_unnest,
-    unpack_struct_unnest,
+    apply_tablesample, derived_query_to_eval_rows, mask_row_columns, policy_matches_session,
+    unpack_null_struct_unnest, unpack_struct_unnest,
 };
 use super::joins::{combine_rows, eval_join_with_schema};
 use super::pivot::{apply_pivot, apply_unpivot};
@@ -168,7 +168,8 @@ pub(super) fn eval_table_factor(
         }
         TableFactor::Derived { query, alias } => {
             let qr = execute_query(query, ctx)?;
-            Ok(EvalRow::from_query_result(
+            Ok(derived_query_to_eval_rows(
+                query,
                 alias.as_ref().map(|a| a.value.as_str()),
                 &qr,
             ))

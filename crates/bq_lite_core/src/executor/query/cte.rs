@@ -143,12 +143,15 @@ fn split_recursive_union<'a>(
         SetExpr::SetOperation {
             op: SetOpKind::Union,
             quantifier,
-            by_name,
+            correspondence,
             left,
             right,
-        } if set_expr_references_table(right, cte_key) => {
-            Some((*quantifier, *by_name, left.as_ref(), right.as_ref()))
-        }
+        } if set_expr_references_table(right, cte_key) => Some((
+            *quantifier,
+            !matches!(correspondence, crate::ast::SetCorrespondence::Positional),
+            left.as_ref(),
+            right.as_ref(),
+        )),
         SetExpr::Query(q) => split_recursive_union(&q.body, cte_key),
         SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::SetOperation { .. } => None,
     }

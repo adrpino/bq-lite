@@ -181,3 +181,49 @@ pub(super) fn unnest_schema_row(
     }
     EvalRow::with_pseudo(cols, pseudo)
 }
+
+pub(super) fn derived_query_to_eval_rows(
+    query: &crate::ast::Query,
+    alias: Option<&str>,
+    qr: &crate::executor::result::QueryResult,
+) -> Vec<EvalRow> {
+    let is_struct_vt = matches!(
+        &query.body,
+        crate::ast::SetExpr::Select(sel)
+            if matches!(sel.as_kind, Some(crate::ast::SelectAsKind::Struct))
+                && query.pipe_ops.is_empty()
+    );
+    if is_struct_vt && qr.columns.len() == 1 {
+        if let Some(BqType::Struct(field_defs)) = qr.columns.first().map(|c| &c.ty) {
+            let qual: Option<Arc<str>> = alias.map(Arc::from);
+            let names: Vec<Arc<str>> = field_defs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| Arc::from(f.name.clone().unwrap_or_else(|| format!("f{i}_"))))
+                .collect();
+            return qr
+                .rows
+                .iter()
+                .map(|row| {
+                    let vals = match row.first() {
+                        Some(BqValue::Struct(sf)) => sf.iter().map(|f| f.value.clone()).collect(),
+                        _ => vec![BqValue::Null; field_defs.len()],
+                    };
+                    let cols = field_defs
+                        .iter()
+                        .zip(names.iter())
+                        .zip(vals)
+                        .map(|((fd, nm), val)| RowBinding {
+                            qualifier: qual.clone(),
+                            name: nm.clone(),
+                            ty: fd.ty.clone(),
+                            value: val,
+                        })
+                        .collect();
+                    EvalRow::new(cols)
+                })
+                .collect();
+        }
+    }
+    EvalRow::from_query_result(alias, qr)
+}

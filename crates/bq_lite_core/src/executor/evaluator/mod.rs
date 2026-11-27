@@ -417,6 +417,10 @@ fn eval_case_expr(
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let op_val = operand.map(|e| eval_expr(e, row, ctx)).transpose()?;
+    let mut result_exprs: Vec<&Expr> = whens.iter().map(|w| &w.result).collect();
+    if let Some(e) = else_result {
+        result_exprs.push(e);
+    }
     for branch in whens {
         let cond = eval_expr(&branch.condition, row, ctx)?;
         let matched = match &op_val {
@@ -424,8 +428,36 @@ fn eval_case_expr(
             None => matches!(cond, BqValue::Bool(true)),
         };
         if matched {
-            return eval_expr(&branch.result, row, ctx);
+            let val = eval_expr(&branch.result, row, ctx)?;
+            return coerce_to_expr_supertype(val, &result_exprs, row, ctx);
         }
     }
-    else_result.map_or(Ok(BqValue::Null), |e| eval_expr(e, row, ctx))
+    let val = else_result.map_or(Ok(BqValue::Null), |e| eval_expr(e, row, ctx))?;
+    coerce_to_expr_supertype(val, &result_exprs, row, ctx)
+}
+
+pub(in crate::executor) fn coerce_to_expr_supertype(
+    val: BqValue,
+    exprs: &[&Expr],
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    if val.is_null() {
+        return Ok(val);
+    }
+    let tys: Vec<crate::types::BqType> = exprs
+        .iter()
+        .map(|e| crate::executor::query::infer_expr_type_public(e, row, ctx))
+        .collect();
+    let Ok(super_ty) = crate::types::coercion::common_supertype(&tys) else {
+        return Ok(val);
+    };
+    let val_ty = val.infer_type()?;
+    if !matches!(super_ty, crate::types::BqType::UntypedNull)
+        && val_ty != super_ty
+        && crate::types::coercion::can_implicitly_coerce(&val_ty, &super_ty)
+    {
+        return crate::types::coercion::coerce_value(val, &super_ty);
+    }
+    Ok(val)
 }

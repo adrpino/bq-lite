@@ -220,8 +220,8 @@
     "skipped": 14
   },
   "case_statement_queries.test": {
-    "passed": 40,
-    "failed": 6,
+    "passed": 43,
+    "failed": 3,
     "skipped": 19
   },
   "cast_function.test": {
@@ -290,8 +290,8 @@
     "skipped": 6
   },
   "except_intersect_queries.test": {
-    "passed": 76,
-    "failed": 10,
+    "passed": 78,
+    "failed": 8,
     "skipped": 58
   },
   "generate_uuid.test": {
@@ -355,8 +355,8 @@
     "skipped": 63
   },
   "limit_queries.test": {
-    "passed": 31,
-    "failed": 3,
+    "passed": 32,
+    "failed": 2,
     "skipped": 50
   },
   "logical_functions.test": {
@@ -390,13 +390,13 @@
     "skipped": 86
   },
   "pipe_operators.test": {
-    "passed": 16,
-    "failed": 47,
+    "passed": 63,
+    "failed": 0,
     "skipped": 2
   },
   "pipe_syntax.test": {
-    "passed": 12,
-    "failed": 2,
+    "passed": 14,
+    "failed": 0,
     "skipped": 0
   },
   "pivot.test": {
@@ -465,8 +465,8 @@
     "skipped": 12
   },
   "struct_queries.test": {
-    "passed": 18,
-    "failed": 5,
+    "passed": 22,
+    "failed": 1,
     "skipped": 11
   },
   "subquery_expression_queries.test": {
@@ -485,13 +485,13 @@
     "skipped": 0
   },
   "union_distinct_queries.test": {
-    "passed": 5,
-    "failed": 2,
+    "passed": 6,
+    "failed": 1,
     "skipped": 15
   },
   "unionall_queries.test": {
-    "passed": 12,
-    "failed": 5,
+    "passed": 16,
+    "failed": 1,
     "skipped": 17
   },
   "unnest_queries.test": {
@@ -510,8 +510,8 @@
     "skipped": 0
   },
   "with_recursive.test": {
-    "passed": 25,
-    "failed": 10,
+    "passed": 26,
+    "failed": 9,
     "skipped": 8
   }
 }

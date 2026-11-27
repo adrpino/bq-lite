@@ -32,7 +32,7 @@ pub(super) fn parse_table_with_joins(p: &mut Parser) -> BqResult<TableWithJoins>
     Ok(TableWithJoins { relation, joins })
 }
 
-fn try_eat_join_kind(p: &mut Parser) -> BqResult<Option<JoinKind>> {
+pub(super) fn try_eat_join_kind(p: &mut Parser) -> BqResult<Option<JoinKind>> {
     if p.eat_kw("JOIN") {
         return Ok(Some(JoinKind::Inner));
     }
@@ -62,7 +62,7 @@ fn try_eat_join_kind(p: &mut Parser) -> BqResult<Option<JoinKind>> {
     Ok(None)
 }
 
-fn parse_join_constraint(p: &mut Parser, kind: JoinKind) -> BqResult<JoinConstraint> {
+pub(super) fn parse_join_constraint(p: &mut Parser, kind: JoinKind) -> BqResult<JoinConstraint> {
     if kind == JoinKind::Cross {
         return Ok(JoinConstraint::None);
     }
@@ -275,7 +275,7 @@ pub(super) fn parse_optional_system_time(p: &mut Parser) -> BqResult<Option<Expr
     Ok(Some(parse_expr(p)?))
 }
 
-fn parse_pivot_spec(p: &mut Parser) -> BqResult<PivotSpec> {
+pub(super) fn parse_pivot_spec(p: &mut Parser) -> BqResult<PivotSpec> {
     p.expect(&TokenKind::LParen, "'('")?;
     let aggregates = p.parse_comma_list(|p| {
         let expr = parse_expr(p)?;
@@ -300,7 +300,7 @@ fn parse_pivot_spec(p: &mut Parser) -> BqResult<PivotSpec> {
     })
 }
 
-fn parse_unpivot_spec(p: &mut Parser) -> BqResult<UnpivotSpec> {
+pub(super) fn parse_unpivot_spec(p: &mut Parser) -> BqResult<UnpivotSpec> {
     let include_nulls = if p.eat_kw("INCLUDE") {
         p.expect_kw("NULLS")?;
         true

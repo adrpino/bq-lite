@@ -312,8 +312,24 @@ fn eval_grouped_fn(
         }
         args.push(eval_grouped_expr(&a.expr, bucket, keys, ctx)?);
     }
+    let sample = bucket.first().cloned().unwrap_or_default();
     match crate::executor::scalar::eval_scalar_builtin(&name, args, ctx) {
-        Ok(Some(val)) => return Ok(val),
+        Ok(Some(val)) => {
+            if matches!(upper.as_str(), "IF" | "COALESCE" | "IFNULL" | "NULLIF") {
+                let branch_exprs: Vec<&Expr> = if upper == "IF" {
+                    call.args.iter().skip(1).map(|a| &a.expr).collect()
+                } else {
+                    call.args.iter().map(|a| &a.expr).collect()
+                };
+                return crate::executor::evaluator::coerce_to_expr_supertype(
+                    val,
+                    &branch_exprs,
+                    &sample,
+                    ctx,
+                );
+            }
+            return Ok(val);
+        }
         Ok(None) => {}
         Err(err) if call.safe_prefix && err.is_safe_suppressible() => return Ok(BqValue::Null),
         Err(err) => return Err(err),
@@ -368,6 +384,11 @@ fn eval_grouped_case(
     let op_val = operand
         .map(|e| eval_grouped_expr(e, bucket, keys, ctx))
         .transpose()?;
+    let sample = bucket.first().cloned().unwrap_or_default();
+    let mut result_exprs: Vec<&Expr> = whens.iter().map(|w| &w.result).collect();
+    if let Some(e) = else_result {
+        result_exprs.push(e);
+    }
     for w in whens {
         let cond = eval_grouped_expr(&w.condition, bucket, keys, ctx)?;
         let matched = match &op_val {
@@ -375,10 +396,17 @@ fn eval_grouped_case(
             None => matches!(cond, BqValue::Bool(true)),
         };
         if matched {
-            return eval_grouped_expr(&w.result, bucket, keys, ctx);
+            let val = eval_grouped_expr(&w.result, bucket, keys, ctx)?;
+            return crate::executor::evaluator::coerce_to_expr_supertype(
+                val,
+                &result_exprs,
+                &sample,
+                ctx,
+            );
         }
     }
-    else_result.map_or(Ok(BqValue::Null), |e| {
+    let val = else_result.map_or(Ok(BqValue::Null), |e| {
         eval_grouped_expr(e, bucket, keys, ctx)
-    })
+    })?;
+    crate::executor::evaluator::coerce_to_expr_supertype(val, &result_exprs, &sample, ctx)
 }

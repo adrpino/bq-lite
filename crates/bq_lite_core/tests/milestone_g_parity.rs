@@ -147,14 +147,16 @@ fn milestone_g4_short_circuit_and_or_if_coalesce_ifnull() {
                (TRUE OR (1 / 0 = 1)) AS o_sc, \
                IF(0 = 0, 42, 10 / 0) AS if_sc, \
                COALESCE(99, 10 / 0) AS coal_sc, \
-               IFNULL(7, 10 / 0) AS ifn_sc",
+               IFNULL(7, 10 / 0) AS ifn_sc, \
+               IF(0 = 0, 42, DIV(10, 0)) AS if_int_sc",
         )
         .unwrap();
     assert_eq!(qr.rows[0][0], BqValue::Bool(false));
     assert_eq!(qr.rows[0][1], BqValue::Bool(true));
-    assert_eq!(qr.rows[0][2], BqValue::Int64(42));
-    assert_eq!(qr.rows[0][3], BqValue::Int64(99));
-    assert_eq!(qr.rows[0][4], BqValue::Int64(7));
+    assert_eq!(qr.rows[0][2], BqValue::Float64(42.0));
+    assert_eq!(qr.rows[0][3], BqValue::Float64(99.0));
+    assert_eq!(qr.rows[0][4], BqValue::Float64(7.0));
+    assert_eq!(qr.rows[0][5], BqValue::Int64(42));
 }
 
 #[test]

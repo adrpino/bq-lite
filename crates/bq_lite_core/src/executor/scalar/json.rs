@@ -100,9 +100,7 @@ fn bq_to_json(val: &BqValue) -> JsonValue {
         BqValue::Null => JsonValue::Null,
         BqValue::Bool(b) => JsonValue::Bool(*b),
         BqValue::Int64(n) => JsonValue::Number((*n).into()),
-        BqValue::Float64(f) => {
-            serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-        }
+        BqValue::Float64(f) => float_to_json_value(*f),
         BqValue::String(s) | BqValue::Geography(s) => JsonValue::String(s.clone()),
         BqValue::Timestamp(ts) => JsonValue::String(format_timestamp_rfc3339(*ts)),
         BqValue::Datetime(dt) => JsonValue::String(format_datetime_iso(*dt)),
@@ -118,6 +116,21 @@ fn bq_to_json(val: &BqValue) -> JsonValue {
         }
         other => JsonValue::String(other.to_string()),
     }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Float is verified finite, integral, and within exact IEEE-754 integer range [-2^53, 2^53]"
+)]
+fn float_to_json_value(f: f64) -> JsonValue {
+    const MAX_EXACT_INT: f64 = 9_007_199_254_740_992.0;
+    if f.is_finite()
+        && f.trunc().to_bits() == f.to_bits()
+        && (-MAX_EXACT_INT..=MAX_EXACT_INT).contains(&f)
+    {
+        return JsonValue::Number((f as i64).into());
+    }
+    serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
 }
 
 #[expect(
