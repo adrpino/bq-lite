@@ -92,32 +92,39 @@ pub(super) fn combine_rows_for_constraint(
     let JoinConstraint::Using(cols) = constraint else {
         return combine_rows(left, right);
     };
-    let mut merged = left.cols.clone();
-    for using_col in cols {
-        if let Some(lcol) = merged
-            .iter_mut()
-            .find(|c| c.name.eq_ignore_ascii_case(&using_col.value))
-        {
-            if lcol.value.is_null() {
+    let is_using = |name: &str| cols.iter().any(|c| c.value.eq_ignore_ascii_case(name));
+    let mut merged = Vec::with_capacity(left.cols.len() + right.cols.len());
+    let mut pseudo = left.pseudo_cols.clone();
+    for lcol in &left.cols {
+        if is_using(&lcol.name) {
+            if lcol.qualifier.is_some() {
+                pseudo.push(lcol.clone());
+            }
+            let mut merged_col = lcol.clone();
+            merged_col.qualifier = None;
+            if merged_col.value.is_null() {
                 if let Some(rcol) = right
                     .cols
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&using_col.value))
+                    .find(|c| c.name.eq_ignore_ascii_case(&lcol.name))
                 {
-                    lcol.value = rcol.value.clone();
+                    merged_col.value = rcol.value.clone();
                 }
             }
+            merged.push(merged_col);
+        } else {
+            merged.push(lcol.clone());
         }
     }
     for rcol in &right.cols {
-        if !cols
-            .iter()
-            .any(|c| c.value.eq_ignore_ascii_case(&rcol.name))
-        {
+        if is_using(&rcol.name) {
+            if rcol.qualifier.is_some() {
+                pseudo.push(rcol.clone());
+            }
+        } else {
             merged.push(rcol.clone());
         }
     }
-    let mut pseudo = left.pseudo_cols.clone();
     pseudo.extend(right.pseudo_cols.iter().cloned());
     EvalRow::with_pseudo(merged, pseudo)
 }

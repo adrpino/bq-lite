@@ -9,6 +9,7 @@ use crate::types::coercion::common_supertype;
 use crate::types::{BqType, BqValue};
 
 use super::from::eval_table_factor_standalone;
+use super::joins::combine_rows_for_constraint;
 use super::tvf::eval_table_function_schema;
 use super::type_infer::infer_expr_type;
 
@@ -77,29 +78,17 @@ fn infer_select_columns_from_from(
     select: &Select,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<QueryColumn>> {
-    let mut cols = Vec::new();
+    let mut acc = EvalRow::default();
     for twj in &select.from {
-        let mut part = infer_table_factor_schema(&twj.relation, None, ctx)?;
-        cols.extend(part.cols);
+        let part = infer_table_factor_schema(&twj.relation, None, ctx)?;
+        acc.cols.extend(part.cols);
+        acc.pseudo_cols.extend(part.pseudo_cols);
         for j in &twj.joins {
-            let r = infer_table_factor_schema(&j.relation, Some(&EvalRow::new(cols.clone())), ctx)?;
-            match &j.constraint {
-                crate::ast::JoinConstraint::Using(ucols) => {
-                    for rc in r.cols {
-                        if !ucols.iter().any(|u| u.value.eq_ignore_ascii_case(&rc.name)) {
-                            cols.push(rc);
-                        }
-                    }
-                }
-                crate::ast::JoinConstraint::None | crate::ast::JoinConstraint::On(_) => {
-                    cols.extend(r.cols);
-                }
-            }
+            let r = infer_table_factor_schema(&j.relation, Some(&acc), ctx)?;
+            acc = combine_rows_for_constraint(&acc, &r, &j.constraint);
         }
-        part.pseudo_cols.clear();
     }
-    let schema_row = EvalRow::new(cols);
-    Ok(infer_select_columns(select, &schema_row, ctx))
+    Ok(infer_select_columns(select, &acc, ctx))
 }
 
 pub(super) fn infer_select_columns(
@@ -167,8 +156,13 @@ fn expand_schema_wildcard(
 ) {
     let qual_str = qualifier.and_then(|q| q.normalized_parts().last().cloned());
     let mut matched_any = false;
-    for col in &schema_row.cols {
-        if col.name.starts_with("__win_") {
+    let pseudo_iter = if qual_str.is_some() {
+        schema_row.pseudo_cols.as_slice()
+    } else {
+        &[]
+    };
+    for col in pseudo_iter.iter().chain(schema_row.cols.iter()) {
+        if col.name.starts_with("__win_") || col.name.starts_with("_PARTITION") {
             continue;
         }
         if let Some(ref qs) = qual_str {

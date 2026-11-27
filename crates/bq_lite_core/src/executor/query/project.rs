@@ -103,6 +103,23 @@ fn expand_wildcard(
 ) -> BqResult<()> {
     let qual_str = qualifier.and_then(|q| q.normalized_parts().last().cloned());
     let mut matched_any = false;
+    if let Some(ref qs) = qual_str {
+        for col in &row.pseudo_cols {
+            if col.name.starts_with("_PARTITION") {
+                continue;
+            }
+            if col
+                .qualifier
+                .as_deref()
+                .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
+            {
+                matched_any = true;
+                push_expanded_binding(
+                    &col.name, &col.ty, &col.value, row, except, replace, ctx, out,
+                )?;
+            }
+        }
+    }
     for col in &row.cols {
         if col.name.starts_with("__win_") {
             continue;
