@@ -11,11 +11,11 @@ default = []
 js-udf = ["bq-lite-core/js-udf"]
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 bq-lite-core = { path = "../bq_lite_core" }
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 parking_lot = "0.12"
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
