@@ -16,3 +16,7 @@ repository = "https://github.com/adrpino/bq-lite"
 # Keep the hand-edited release.yml (--target removed to avoid the
 # 'workflows: write' 403); don't fail when CI differs from the template.
 allow-dirty = ["ci"]
+
+# GitHub retired macos-14; use macos-15 for Apple Silicon builds.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
