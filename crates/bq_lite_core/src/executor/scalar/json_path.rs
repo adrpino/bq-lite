@@ -135,20 +135,22 @@ pub(super) enum PathSeg {
     Idx(usize),
 }
 
+use super::json_fast::parse_json_path_cached;
+
 pub(super) fn resolve_json_path<'a>(
     doc: &'a JsonValue,
     path: &str,
     legacy_brackets: bool,
 ) -> BqResult<Option<&'a JsonValue>> {
-    let segs = parse_json_path(path, legacy_brackets)?;
+    let segs = parse_json_path_cached(path, legacy_brackets)?;
     let mut cur = doc;
-    for seg in segs {
+    for seg in segs.iter() {
         match (cur, seg) {
-            (JsonValue::Object(m), PathSeg::Key(k)) => match m.get(&k) {
+            (JsonValue::Object(m), PathSeg::Key(k)) => match m.get(k) {
                 Some(next) => cur = next,
                 None => return Ok(None),
             },
-            (JsonValue::Array(a), PathSeg::Idx(i)) => match a.get(i) {
+            (JsonValue::Array(a), PathSeg::Idx(i)) => match a.get(*i) {
                 Some(next) => cur = next,
                 None => return Ok(None),
             },
@@ -201,9 +203,9 @@ pub(super) fn resolve_json_query_path(
             "JSONPath 'recursive' modifier requires 'lax'",
         ));
     }
-    let segs = parse_json_path(rest, false)?;
+    let segs = parse_json_path_cached(rest, false)?;
     let mut current: Vec<&JsonValue> = vec![doc];
-    for seg in &segs {
+    for seg in segs.iter() {
         let mut next = Vec::new();
         for node in current {
             step_lax(node, seg, recursive, &mut next);
@@ -247,7 +249,7 @@ fn step_lax<'a>(node: &'a JsonValue, seg: &PathSeg, recursive: bool, out: &mut V
 }
 
 pub(super) fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> BqResult<()> {
-    let segs = parse_json_path(path, false)?;
+    let segs = parse_json_path_cached(path, false)?;
     if segs.is_empty() {
         *doc = val;
         return Ok(());
@@ -320,7 +322,7 @@ pub(super) fn insert_json_array_path(
     path: &str,
     val: JsonValue,
 ) -> BqResult<()> {
-    let segs = parse_json_path(path, false)?;
+    let segs = parse_json_path_cached(path, false)?;
     let Some((PathSeg::Idx(idx), prefix)) = segs.split_last() else {
         return Ok(());
     };
@@ -343,7 +345,7 @@ pub(super) fn append_json_array_path(
     path: &str,
     val: JsonValue,
 ) -> BqResult<()> {
-    let segs = parse_json_path(path, false)?;
+    let segs = parse_json_path_cached(path, false)?;
     if let Some(JsonValue::Array(arr)) = navigate_mut(doc, &segs) {
         arr.push(val);
     }
@@ -351,7 +353,7 @@ pub(super) fn append_json_array_path(
 }
 
 pub(super) fn remove_json_path(doc: &mut JsonValue, path: &str) -> BqResult<()> {
-    let segs = parse_json_path(path, false)?;
+    let segs = parse_json_path_cached(path, false)?;
     let Some((last, prefix)) = segs.split_last() else {
         return Ok(());
     };
@@ -381,7 +383,10 @@ fn navigate_mut<'a>(mut cur: &'a mut JsonValue, segs: &[PathSeg]) -> Option<&'a 
     Some(cur)
 }
 
-fn parse_json_path(path: &str, legacy_brackets: bool) -> BqResult<Vec<PathSeg>> {
+pub(super) fn parse_json_path_uncached(
+    path: &str,
+    legacy_brackets: bool,
+) -> BqResult<Vec<PathSeg>> {
     let rest = path
         .strip_prefix('$')
         .ok_or_else(|| BqError::semantic(format!("JSONPath must start with '$': '{path}'")))?;

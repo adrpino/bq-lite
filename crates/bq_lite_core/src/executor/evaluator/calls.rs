@@ -1,10 +1,11 @@
 use crate::ast::{Expr, FunctionCall, StructFieldExpr};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
-use crate::executor::scalar::eval_scalar_builtin;
+use crate::executor::scalar::{eval_scalar_builtin, is_scalar_registered};
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqStructFieldValue, BqType, BqValue};
 
+use super::lambda::infer_expr_col_name;
 use super::{coerce_to_expr_supertype, eval_expr};
 
 pub(super) fn eval_function_expr(
@@ -17,19 +18,40 @@ pub(super) fn eval_function_expr(
             "Window function cannot be evaluated outside SELECT/QUALIFY window pass",
         ));
     }
-    let fn_name = call.name.normalized_parts().join(".");
-    let upper = fn_name.to_ascii_uppercase();
+    let mut stack_buf = [0_u8; 40];
+    let (owned_fn_name, owned_upper);
+    let (fn_name, upper): (&str, &str) = match call.name.parts.as_slice() {
+        [single] if single.value.len() <= stack_buf.len() && single.value.is_ascii() => {
+            let s = single.value.as_str();
+            for (d, b) in stack_buf.iter_mut().zip(s.as_bytes()) {
+                *d = b.to_ascii_uppercase();
+            }
+            (
+                s,
+                std::str::from_utf8(stack_buf.get(..s.len()).unwrap_or(&[])).unwrap_or(""),
+            )
+        }
+        [single] => {
+            owned_upper = single.value.to_ascii_uppercase();
+            (single.value.as_str(), owned_upper.as_str())
+        }
+        _ => {
+            owned_fn_name = call.name.normalized_parts().join(".");
+            owned_upper = owned_fn_name.to_ascii_uppercase();
+            (owned_fn_name.as_str(), owned_upper.as_str())
+        }
+    };
     if matches!(
-        upper.as_str(),
+        upper,
         "ARRAY_TRANSFORM" | "ARRAY_FILTER" | "ARRAY_INCLUDES" | "ARRAY_FIND" | "ARRAY_OFFSET"
     ) && call
         .args
         .get(1)
         .is_some_and(|a| matches!(a.expr, Expr::Lambda { .. }))
     {
-        return super::lambda::eval_array_lambda_call(&upper, call, row, ctx);
+        return super::lambda::eval_array_lambda_call(upper, call, row, ctx);
     }
-    let short_res = match upper.as_str() {
+    let short_res = match upper {
         "IF" => Some(eval_if_short_circuit(call, row, ctx)),
         "COALESCE" => Some(eval_coalesce_short_circuit(call, row, ctx)),
         "IFNULL" => Some(eval_ifnull_short_circuit(call, row, ctx)),
@@ -45,11 +67,11 @@ pub(super) fn eval_function_expr(
         };
     }
     if upper == "MAKE_INTERVAL" && call.args.iter().any(|a| a.name.is_some()) {
-        return super::lambda::eval_make_interval_named(&fn_name, call, row, ctx);
+        return super::lambda::eval_make_interval_named(fn_name, call, row, ctx);
     }
     let mut args = Vec::with_capacity(call.args.len());
     for (idx, arg) in call.args.iter().enumerate() {
-        if is_date_part_arg_pos(&upper, idx) {
+        if is_date_part_arg_pos(upper, idx) {
             if let Some(part_str) = extract_date_part_arg(&arg.expr) {
                 args.push(BqValue::String(part_str));
                 continue;
@@ -57,10 +79,14 @@ pub(super) fn eval_function_expr(
         }
         args.push(eval_expr(&arg.expr, row, ctx)?);
     }
-    let res = match eval_scalar_builtin(&fn_name, args.clone(), ctx) {
-        Ok(Some(val)) => Ok(val),
-        Ok(None) => eval_user_scalar_udf(call, &args, ctx),
-        Err(err) => Err(err),
+    let res = if is_scalar_registered(upper) {
+        eval_scalar_builtin(upper, args, ctx).and_then(|opt| {
+            opt.ok_or_else(|| {
+                BqError::unimplemented(format!("Function '{fn_name}' is not implemented"))
+            })
+        })
+    } else {
+        eval_user_scalar_udf(call, &args, ctx)
     };
     match res {
         Ok(val) => Ok(val),
@@ -437,42 +463,5 @@ pub(super) fn eval_struct_literal(
         coerce_value(val, &target)
     } else {
         Ok(val)
-    }
-}
-
-#[must_use]
-pub(in crate::executor) fn infer_expr_col_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Ident(id) => Some(id.value.clone()),
-        Expr::CompoundIdent(parts) => parts.last().map(|id| id.value.clone()),
-        Expr::FieldAccess { field, .. } => Some(field.value.clone()),
-        Expr::Literal(_)
-        | Expr::Parameter(_)
-        | Expr::PositionalParam(_)
-        | Expr::SystemVar(_)
-        | Expr::Star
-        | Expr::QualifiedStar(_)
-        | Expr::ExprStar(_)
-        | Expr::WithExpr { .. }
-        | Expr::Binary { .. }
-        | Expr::Unary { .. }
-        | Expr::Is { .. }
-        | Expr::Between { .. }
-        | Expr::Like { .. }
-        | Expr::In { .. }
-        | Expr::Cast { .. }
-        | Expr::Case { .. }
-        | Expr::Function(_)
-        | Expr::ArrayLiteral { .. }
-        | Expr::ArraySubquery(_)
-        | Expr::StructLiteral { .. }
-        | Expr::Subscript { .. }
-        | Expr::Extract { .. }
-        | Expr::Interval { .. }
-        | Expr::RangeLiteral { .. }
-        | Expr::Lambda { .. }
-        | Expr::Exists(_)
-        | Expr::Subquery(_)
-        | Expr::Grouped(_) => None,
     }
 }

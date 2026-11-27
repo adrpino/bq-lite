@@ -5,6 +5,43 @@ use crate::types::BqValue;
 
 use super::eval_expr;
 
+#[must_use]
+pub(in crate::executor) fn infer_expr_col_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(id) => Some(id.value.clone()),
+        Expr::CompoundIdent(parts) => parts.last().map(|id| id.value.clone()),
+        Expr::FieldAccess { field, .. } => Some(field.value.clone()),
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::PositionalParam(_)
+        | Expr::SystemVar(_)
+        | Expr::Star
+        | Expr::QualifiedStar(_)
+        | Expr::ExprStar(_)
+        | Expr::WithExpr { .. }
+        | Expr::Binary { .. }
+        | Expr::Unary { .. }
+        | Expr::Is { .. }
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::In { .. }
+        | Expr::Cast { .. }
+        | Expr::Case { .. }
+        | Expr::Function(_)
+        | Expr::ArrayLiteral { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::StructLiteral { .. }
+        | Expr::Subscript { .. }
+        | Expr::Extract { .. }
+        | Expr::Interval { .. }
+        | Expr::RangeLiteral { .. }
+        | Expr::Lambda { .. }
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::Grouped(_) => None,
+    }
+}
+
 /// Evaluates lambda-accepting array functions (`ARRAY_TRANSFORM`, `ARRAY_FILTER`,
 /// `ARRAY_INCLUDES`, `ARRAY_FIND`, `ARRAY_OFFSET`).
 /// Per `GoogleSQL` `SAFE.` semantics, errors evaluating the array argument itself are NOT

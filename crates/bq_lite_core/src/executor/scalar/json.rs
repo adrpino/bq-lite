@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
 use serde_json::{Map, Value as JsonValue};
 
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
 
+use super::json_fast::{extract_json_scalar_str, parse_json_path_cached};
 use super::json_path::{
     append_json_array_path, insert_json_array_path, remove_json_path, resolve_json_path,
     resolve_json_query_path, set_json_path, write_bq_json_string,
@@ -105,12 +108,12 @@ fn bq_to_json(val: &BqValue) -> JsonValue {
     clippy::wildcard_enum_match_arm,
     reason = "JSON functions accept JSON or STRING input"
 )]
-fn extract_json_input(val: &BqValue) -> BqResult<Option<JsonValue>> {
+fn extract_json_input(val: &BqValue) -> BqResult<Option<Cow<'_, JsonValue>>> {
     match val {
         BqValue::Null => Ok(None),
-        BqValue::Json(j) => Ok(Some((**j).clone())),
+        BqValue::Json(j) => Ok(Some(Cow::Borrowed(j.as_ref()))),
         BqValue::String(s) => serde_json::from_str::<JsonValue>(s)
-            .map(Some)
+            .map(|v| Some(Cow::Owned(v)))
             .map_err(|e| BqError::semantic(format!("Invalid JSON: {e}"))),
         _ => Err(BqError::query("JSON function expects JSON or STRING input")),
     }
@@ -130,7 +133,7 @@ fn eval_json_query(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValu
             Err(BqError::query("JSONPath must be STRING"))
         };
     };
-    let Some(target) = resolve_json_query_path(&doc, &path, legacy_brackets)? else {
+    let Some(target) = resolve_json_query_path(doc.as_ref(), &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     #[expect(
@@ -150,9 +153,9 @@ fn eval_json_value(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValu
     let mut it = args.into_iter();
     let doc_v = it.next().unwrap_or(BqValue::Null);
     let path_v = it.next().unwrap_or_else(|| BqValue::String("$".to_owned()));
-    let Some(doc) = extract_json_input(&doc_v)? else {
+    if doc_v.is_null() {
         return Ok(BqValue::Null);
-    };
+    }
     let BqValue::String(path) = path_v else {
         return if path_v.is_null() {
             Ok(BqValue::Null)
@@ -160,7 +163,14 @@ fn eval_json_value(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValu
             Err(BqError::query("JSONPath must be STRING"))
         };
     };
-    let Some(target) = resolve_json_path(&doc, &path, legacy_brackets)? else {
+    if let BqValue::String(raw) = doc_v {
+        let segs = parse_json_path_cached(&path, legacy_brackets)?;
+        return Ok(extract_json_scalar_str(&raw, &segs)?.map_or(BqValue::Null, BqValue::String));
+    }
+    let Some(doc) = extract_json_input(&doc_v)? else {
+        return Ok(BqValue::Null);
+    };
+    let Some(target) = resolve_json_path(doc.as_ref(), &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     Ok(json_scalar_to_string(target).map_or(BqValue::Null, BqValue::String))
@@ -183,7 +193,8 @@ fn eval_json_array_query(
     let BqValue::String(path) = path_v else {
         return Ok(BqValue::Null);
     };
-    let Some(JsonValue::Array(arr)) = resolve_json_path(&doc, &path, legacy_brackets)? else {
+    let Some(JsonValue::Array(arr)) = resolve_json_path(doc.as_ref(), &path, legacy_brackets)?
+    else {
         return Ok(BqValue::Null);
     };
     let items: Vec<BqValue> = arr

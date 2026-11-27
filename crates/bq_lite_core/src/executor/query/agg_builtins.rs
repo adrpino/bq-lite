@@ -8,8 +8,8 @@ use crate::executor::evaluator::{compare_values, eval_expr, values_distinct_eq};
 use crate::types::BqValue;
 
 use super::agg_approx::{
-    eval_approx_count_distinct, eval_approx_quantiles, eval_array_concat_agg, eval_avg,
-    eval_bitwise_bytes_agg, eval_stat_agg, sum_collected_values,
+    eval_any_value, eval_approx_count_distinct, eval_approx_quantiles, eval_array_concat_agg,
+    eval_avg, eval_bitwise_bytes_agg, eval_stat_agg, sum_collected_values, try_stream_sum,
 };
 use super::exec_util::{hash_single_value, RowSlice};
 use super::sort::sort_with_order_keys;
@@ -42,6 +42,15 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
 
 #[must_use]
 pub(super) fn is_aggregate_name(name: &str) -> bool {
+    let mut buf = [0_u8; 32];
+    if name.len() <= buf.len() && name.is_ascii() {
+        for (dst, src) in buf.iter_mut().zip(name.as_bytes()) {
+            *dst = src.to_ascii_uppercase();
+        }
+        if let Ok(upper) = std::str::from_utf8(buf.get(..name.len()).unwrap_or(&[])) {
+            return AGGREGATE_FUNCTIONS.contains(&upper);
+        }
+    }
     let upper = name.to_ascii_uppercase();
     AGGREGATE_FUNCTIONS.contains(&upper.as_str())
 }
@@ -58,8 +67,21 @@ pub(super) fn eval_aggregate_call(
     } else {
         rows
     };
-    let upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
-    match upper.as_str() {
+    let mut stack_buf = [0_u8; 32];
+    let owned_upper;
+    let upper: &str = match call.name.parts.as_slice() {
+        [single] if single.value.len() <= stack_buf.len() && single.value.is_ascii() => {
+            for (d, b) in stack_buf.iter_mut().zip(single.value.as_bytes()) {
+                *d = b.to_ascii_uppercase();
+            }
+            std::str::from_utf8(stack_buf.get(..single.value.len()).unwrap_or(&[])).unwrap_or("")
+        }
+        _ => {
+            owned_upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
+            owned_upper.as_str()
+        }
+    };
+    match upper {
         "COUNT" => eval_count(call, rows, ctx),
         "COUNTIF" => eval_countif(call, rows, ctx),
         "SUM" => eval_sum(call, rows, ctx),
@@ -74,7 +96,7 @@ pub(super) fn eval_aggregate_call(
         "STRING_AGG" => eval_string_agg(call, rows, ctx),
         "LOGICAL_AND" => eval_logical(call, rows, ctx, true),
         "LOGICAL_OR" => eval_logical(call, rows, ctx, false),
-        "BIT_AND" | "BIT_OR" | "BIT_XOR" => eval_bitwise_agg(&upper, call, rows, ctx),
+        "BIT_AND" | "BIT_OR" | "BIT_XOR" => eval_bitwise_agg(upper, call, rows, ctx),
         "STDDEV" | "STDDEV_SAMP" => eval_stat_agg(call, rows, ctx, true, false),
         "STDDEV_POP" => eval_stat_agg(call, rows, ctx, true, true),
         "VARIANCE" | "VAR_SAMP" => eval_stat_agg(call, rows, ctx, false, false),
@@ -141,6 +163,15 @@ fn eval_count(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) ->
             i64::try_from(rows.len()).unwrap_or(i64::MAX),
         ));
     }
+    if !call.distinct {
+        let mut count = 0_i64;
+        for row in rows.iter() {
+            if !eval_expr(&arg.expr, row, ctx)?.is_null() {
+                count += 1;
+            }
+        }
+        return Ok(BqValue::Int64(count));
+    }
     let vals = collect_arg_values(call, rows, ctx)?;
     Ok(BqValue::Int64(
         i64::try_from(vals.len()).unwrap_or(i64::MAX),
@@ -169,6 +200,11 @@ fn eval_countif(
 }
 
 fn eval_sum(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+    if !call.distinct {
+        if let Some(streamed) = try_stream_sum(call, rows, ctx)? {
+            return Ok(streamed);
+        }
+    }
     let vals = collect_arg_values(call, rows, ctx)?;
     match sum_collected_values(vals) {
         Ok(v) => Ok(v),
@@ -183,11 +219,23 @@ fn eval_min_max(
     ctx: &ExecContext<'_>,
     is_min: bool,
 ) -> BqResult<BqValue> {
-    let vals = collect_arg_values(call, rows, ctx)?;
+    let arg = call
+        .args
+        .first()
+        .ok_or_else(|| BqError::query("Aggregate expects at least 1 argument"))?;
     let mut best: Option<BqValue> = None;
-    for v in vals {
+    let mut nan_val: Option<BqValue> = None;
+    for row in rows.iter() {
+        let v = eval_expr(&arg.expr, row, ctx)?;
+        if v.is_null() {
+            continue;
+        }
+        if nan_val.is_some() {
+            continue;
+        }
         if matches!(v, BqValue::Float64(f) if f.is_nan()) {
-            return Ok(v);
+            nan_val = Some(v);
+            continue;
         }
         best = match best {
             None => Some(v),
@@ -202,30 +250,7 @@ fn eval_min_max(
             }
         };
     }
-    Ok(best.unwrap_or(BqValue::Null))
-}
-
-fn eval_any_value(
-    call: &FunctionCall,
-    rows: RowSlice<'_>,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let arg = call
-        .args
-        .first()
-        .ok_or_else(|| BqError::query("ANY_VALUE requires 1 argument"))?;
-    if call.having.is_some() {
-        return rows
-            .first()
-            .map_or(Ok(BqValue::Null), |row| eval_expr(&arg.expr, row, ctx));
-    }
-    for row in rows.iter() {
-        let v = eval_expr(&arg.expr, row, ctx)?;
-        if !v.is_null() {
-            return Ok(v);
-        }
-    }
-    Ok(BqValue::Null)
+    Ok(nan_val.or(best).unwrap_or(BqValue::Null))
 }
 
 fn filter_rows_by_having(

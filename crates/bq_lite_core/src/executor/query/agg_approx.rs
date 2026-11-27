@@ -11,6 +11,29 @@ use super::agg_builtins::{collect_arg_values, dedup_values};
 use super::exec_util::RowSlice;
 use super::sort::sort_with_order_keys;
 
+pub(super) fn eval_any_value(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let arg = call
+        .args
+        .first()
+        .ok_or_else(|| BqError::query("ANY_VALUE requires 1 argument"))?;
+    if call.having.is_some() {
+        return rows
+            .first()
+            .map_or(Ok(BqValue::Null), |row| eval_expr(&arg.expr, row, ctx));
+    }
+    for row in rows.iter() {
+        let v = eval_expr(&arg.expr, row, ctx)?;
+        if !v.is_null() {
+            return Ok(v);
+        }
+    }
+    Ok(BqValue::Null)
+}
+
 pub(super) fn eval_array_concat_agg(
     call: &FunctionCall,
     rows: RowSlice<'_>,
@@ -127,6 +150,103 @@ pub(super) fn sum_collected_values(vals: Vec<BqValue>) -> BqResult<BqValue> {
     Ok(acc)
 }
 
+/// Zero-allocation streaming fast-path for homogeneous `INT64` / `FLOAT64` sums.
+/// Returns `Ok(None)` when values are mixed or non-primitive so callers fall back to generic coercion.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Fast path only handles Int64 and Float64; other variants fall back"
+)]
+pub(super) fn try_stream_sum(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<BqValue>> {
+    let arg = call
+        .args
+        .first()
+        .ok_or_else(|| BqError::query("Aggregate expects at least 1 argument"))?;
+    let mut int_acc: Option<i64> = None;
+    let mut flt_acc: Option<f64> = None;
+    for row in rows.iter() {
+        let v = eval_expr(&arg.expr, row, ctx)?;
+        match v {
+            BqValue::Null => {}
+            BqValue::Int64(n) if flt_acc.is_none() => {
+                let Some(sum) = int_acc.map_or(Some(n), |cur| cur.checked_add(n)) else {
+                    return Ok(None);
+                };
+                int_acc = Some(sum);
+            }
+            BqValue::Float64(f) if int_acc.is_none() => {
+                let next = flt_acc.map_or(f, |cur| cur + f);
+                if next.is_infinite() && !f.is_infinite() && !flt_acc.is_some_and(f64::is_infinite)
+                {
+                    return Ok(None);
+                }
+                flt_acc = Some(next);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(int_acc.map_or_else(
+        || flt_acc.map_or(BqValue::Null, BqValue::Float64),
+        BqValue::Int64,
+    )))
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Fast path only handles Int64 and Float64; other variants fall back"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "GoogleSQL AVG converts integer sums to FLOAT64"
+)]
+fn try_stream_avg(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<BqValue>> {
+    let arg = call
+        .args
+        .first()
+        .ok_or_else(|| BqError::query("Aggregate expects at least 1 argument"))?;
+    let mut int_acc: Option<i64> = None;
+    let mut flt_acc: Option<f64> = None;
+    let mut count = 0_usize;
+    for row in rows.iter() {
+        let v = eval_expr(&arg.expr, row, ctx)?;
+        match v {
+            BqValue::Null => {}
+            BqValue::Int64(n) if flt_acc.is_none() => {
+                let Some(sum) = int_acc.map_or(Some(n), |cur| cur.checked_add(n)) else {
+                    return Ok(None);
+                };
+                int_acc = Some(sum);
+                count += 1;
+            }
+            BqValue::Float64(f) if int_acc.is_none() => {
+                let next = flt_acc.map_or(f, |cur| cur + f);
+                if next.is_infinite() && !f.is_infinite() && !flt_acc.is_some_and(f64::is_infinite)
+                {
+                    return Ok(None);
+                }
+                flt_acc = Some(next);
+                count += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+    if count == 0 {
+        return Ok(Some(BqValue::Null));
+    }
+    let denom = count as f64;
+    Ok(Some(int_acc.map_or_else(
+        || flt_acc.map_or(BqValue::Null, |f| BqValue::Float64(f / denom)),
+        |n| BqValue::Float64((n as f64) / denom),
+    )))
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "AVG only supports numeric scalar variants"
@@ -140,6 +260,11 @@ pub(super) fn eval_avg(
     rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
+    if !call.distinct {
+        if let Some(streamed) = try_stream_avg(call, rows, ctx)? {
+            return Ok(streamed);
+        }
+    }
     let vals = collect_arg_values(call, rows, ctx)?;
     if vals.is_empty() {
         return Ok(BqValue::Null);

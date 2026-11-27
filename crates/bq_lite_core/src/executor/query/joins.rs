@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use crate::ast::{Join, JoinConstraint, JoinKind, TableFactor};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
-use crate::executor::evaluator::{eval_expr, values_equal};
+use crate::executor::context::{EvalRow, ExecContext, RowBinding, RowRef, RowSchema};
+use crate::executor::evaluator::{eval_expr, eval_expr_ref, values_equal};
 use crate::types::BqValue;
 
 use super::from::{eval_correlated_cross_or_factor, eval_table_factor};
@@ -66,33 +68,41 @@ fn nested_loop_join(
     let right_null = null_out_eval_row(right_schema);
     let mut right_matched = vec![false; right_rows.len()];
     let mut out = Vec::new();
-    let mut scratch = EvalRow::default();
+    let shared_on_schema = matches!(join.constraint, JoinConstraint::On(_))
+        .then(|| RowSchema::concat(&left_schema.schema, &right_schema.schema));
 
     for lrow in left_rows {
         let mut l_matched = false;
         if let JoinConstraint::On(ref expr) = join.constraint {
-            scratch.cols.clear();
-            scratch.cols.extend(lrow.cols.iter().cloned());
-            scratch.pseudo_cols.clear();
-            scratch.pseudo_cols.extend(lrow.pseudo_cols.iter().cloned());
-            let l_col_len = scratch.cols.len();
-            let l_pseudo_len = scratch.pseudo_cols.len();
             for (r_idx, rrow) in right_rows.iter().enumerate() {
-                scratch.cols.truncate(l_col_len);
-                scratch.cols.extend(rrow.cols.iter().cloned());
-                scratch.pseudo_cols.truncate(l_pseudo_len);
-                scratch.pseudo_cols.extend(rrow.pseudo_cols.iter().cloned());
-                if matches!(eval_expr(expr, &scratch, ctx)?, BqValue::Bool(true)) {
+                let pred = eval_expr_ref(
+                    expr,
+                    RowRef::Joined {
+                        left: lrow,
+                        right: rrow,
+                    },
+                    ctx,
+                )?;
+                if matches!(pred, BqValue::Bool(true)) {
                     l_matched = true;
                     if let Some(slot) = right_matched.get_mut(r_idx) {
                         *slot = true;
                     }
-                    out.push(scratch.clone());
+                    let schema = match &shared_on_schema {
+                        Some(cs)
+                            if Arc::ptr_eq(&lrow.schema, &left_schema.schema)
+                                && Arc::ptr_eq(&rrow.schema, &right_schema.schema) =>
+                        {
+                            Arc::clone(cs)
+                        }
+                        _ => RowSchema::concat(&lrow.schema, &rrow.schema),
+                    };
+                    out.push(EvalRow::combine_with_schema(lrow, rrow, schema));
                 }
             }
         } else {
             for (r_idx, rrow) in right_rows.iter().enumerate() {
-                if let Some(joined) = try_join_pair(lrow, rrow, &join.constraint, ctx)? {
+                if let Some(joined) = try_join_pair(lrow, rrow, &join.constraint, None, ctx)? {
                     l_matched = true;
                     if let Some(slot) = right_matched.get_mut(r_idx) {
                         *slot = true;
@@ -137,26 +147,27 @@ pub(super) fn combine_rows_for_constraint(
         return combine_rows(left, right);
     };
     let is_using = |name: &str| cols.iter().any(|c| c.value.eq_ignore_ascii_case(name));
-    let mut merged = Vec::with_capacity(left.cols.len() + right.cols.len());
-    let mut pseudo = left.pseudo_cols.clone();
+    let mut merged = Vec::with_capacity(left.col_len() + right.col_len());
+    let mut pseudo: Vec<RowBinding> = left
+        .iter_pseudo()
+        .map(crate::executor::row::BindingRef::to_owned_binding)
+        .collect();
 
     // Record full ordered columns per qualifier for sides that lose a USING column so `t.*`
     // preserves the table's exact original column order and pre-coalesce values.
-    record_using_table_cols(&left.cols, is_using, &mut pseudo);
-    record_using_table_cols(&right.cols, is_using, &mut pseudo);
+    record_using_table_cols(left, is_using, &mut pseudo);
+    record_using_table_cols(right, is_using, &mut pseudo);
 
     // BigQuery emits merged USING columns FIRST (in USING list order), then left non-USING, then right non-USING.
     for ucol in cols {
         let lmatch = left
-            .cols
-            .iter()
+            .iter_cols()
             .find(|c| c.name.eq_ignore_ascii_case(&ucol.value));
         let rmatch = right
-            .cols
-            .iter()
+            .iter_cols()
             .find(|c| c.name.eq_ignore_ascii_case(&ucol.value));
         if let Some(base) = lmatch.or(rmatch) {
-            let mut merged_col = base.clone();
+            let mut merged_col = base.to_owned_binding();
             merged_col.qualifier = None;
             if merged_col.value.is_null() {
                 if let Some(rc) = rmatch {
@@ -166,41 +177,41 @@ pub(super) fn combine_rows_for_constraint(
             merged.push(merged_col);
         }
     }
-    for lcol in &left.cols {
-        if !is_using(&lcol.name) {
-            merged.push(lcol.clone());
+    for lcol in left.iter_cols() {
+        if !is_using(lcol.name) {
+            merged.push(lcol.to_owned_binding());
         }
     }
-    for rcol in &right.cols {
-        if !is_using(&rcol.name) {
-            merged.push(rcol.clone());
+    for rcol in right.iter_cols() {
+        if !is_using(rcol.name) {
+            merged.push(rcol.to_owned_binding());
         }
     }
-    for rp in &right.pseudo_cols {
-        let already = rp.qualifier.as_deref().is_some_and(|rq| {
+    for rp in right.iter_pseudo() {
+        let already = rp.qualifier.is_some_and(|rq| {
             pseudo.iter().any(|p| {
                 p.qualifier
                     .as_deref()
                     .is_some_and(|pq| pq.eq_ignore_ascii_case(rq))
-                    && p.name.eq_ignore_ascii_case(&rp.name)
+                    && p.name.eq_ignore_ascii_case(rp.name)
             })
         });
         if !already {
-            pseudo.push(rp.clone());
+            pseudo.push(rp.to_owned_binding());
         }
     }
     EvalRow::with_pseudo(merged, pseudo)
 }
 
 fn record_using_table_cols(
-    side_cols: &[crate::executor::context::RowBinding],
+    side: &EvalRow,
     is_using: impl Fn(&str) -> bool,
-    pseudo: &mut Vec<crate::executor::context::RowBinding>,
+    pseudo: &mut Vec<RowBinding>,
 ) {
     let mut touched_quals: Vec<String> = Vec::new();
-    for col in side_cols {
-        if is_using(&col.name) {
-            if let Some(ref q) = col.qualifier {
+    for col in side.iter_cols() {
+        if is_using(col.name) {
+            if let Some(q) = col.qualifier {
                 if !touched_quals.iter().any(|t| t.eq_ignore_ascii_case(q)) {
                     touched_quals.push(q.as_ref().to_owned());
                 }
@@ -217,13 +228,9 @@ fn record_using_table_cols(
         if already {
             continue;
         }
-        for col in side_cols {
-            if col
-                .qualifier
-                .as_deref()
-                .is_some_and(|cq| cq.eq_ignore_ascii_case(q))
-            {
-                pseudo.push(col.clone());
+        for col in side.iter_cols() {
+            if col.qualifier.is_some_and(|cq| cq.eq_ignore_ascii_case(q)) {
+                pseudo.push(col.to_owned_binding());
             }
         }
     }
@@ -239,7 +246,7 @@ fn eval_correlated_unnest_join(
         let unnested = eval_table_factor(&join.relation, Some(lrow), ctx)?;
         let mut matched_any = false;
         for urow in &unnested {
-            if let Some(joined) = try_join_pair(lrow, urow, &join.constraint, ctx)? {
+            if let Some(joined) = try_join_pair(lrow, urow, &join.constraint, None, ctx)? {
                 matched_any = true;
                 out.push(joined);
             }
@@ -260,15 +267,28 @@ pub(super) fn try_join_pair(
     lrow: &EvalRow,
     rrow: &EvalRow,
     constraint: &JoinConstraint,
+    shared_schema: Option<&Arc<RowSchema>>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Option<EvalRow>> {
     match constraint {
-        JoinConstraint::None => Ok(Some(combine_rows(lrow, rrow))),
+        JoinConstraint::None => Ok(Some(shared_schema.map_or_else(
+            || combine_rows(lrow, rrow),
+            |s| EvalRow::combine_with_schema(lrow, rrow, Arc::clone(s)),
+        ))),
         JoinConstraint::On(expr) => {
-            let combined = combine_rows(lrow, rrow);
-            let pred = eval_expr(expr, &combined, ctx)?;
+            let pred = eval_expr_ref(
+                expr,
+                RowRef::Joined {
+                    left: lrow,
+                    right: rrow,
+                },
+                ctx,
+            )?;
             if matches!(pred, BqValue::Bool(true)) {
-                Ok(Some(combined))
+                Ok(Some(shared_schema.map_or_else(
+                    || combine_rows(lrow, rrow),
+                    |s| EvalRow::combine_with_schema(lrow, rrow, Arc::clone(s)),
+                )))
             } else {
                 Ok(None)
             }
@@ -281,8 +301,7 @@ pub(super) fn try_join_pair(
                 let rv = rrow.resolve_ident(&col.value)?.ok_or_else(|| {
                     BqError::query(format!("USING column '{}' not found on right", col.value))
                 })?;
-                if lv.value.is_null() || rv.value.is_null() || !values_equal(&lv.value, &rv.value)?
-                {
+                if lv.value.is_null() || rv.value.is_null() || !values_equal(lv.value, rv.value)? {
                     return Ok(None);
                 }
             }
@@ -292,13 +311,8 @@ pub(super) fn try_join_pair(
 }
 
 pub(super) fn combine_rows(l: &EvalRow, r: &EvalRow) -> EvalRow {
-    let mut cols = Vec::with_capacity(l.cols.len() + r.cols.len());
-    cols.extend(l.cols.iter().cloned());
-    cols.extend(r.cols.iter().cloned());
-    let mut pseudo = Vec::with_capacity(l.pseudo_cols.len() + r.pseudo_cols.len());
-    pseudo.extend(l.pseudo_cols.iter().cloned());
-    pseudo.extend(r.pseudo_cols.iter().cloned());
-    EvalRow::with_pseudo(cols, pseudo)
+    let schema = RowSchema::concat(&l.schema, &r.schema);
+    EvalRow::combine_with_schema(l, r, schema)
 }
 
 /// Resolves a correlated `FROM t.arr` / `FROM t.s.arr` table factor against `ctx.outer_rows`

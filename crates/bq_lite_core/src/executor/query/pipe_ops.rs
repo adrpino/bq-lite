@@ -174,35 +174,49 @@ pub(super) fn pipe_limit(
 
 pub(super) fn pipe_as(mut state: PipeState, alias: &Ident) -> PipeState {
     let qual: Option<Arc<str>> = Some(Arc::from(alias.value.as_str()));
-    for row in &mut state.rows {
-        for col in &mut row.cols {
+    let mut cached: Option<(
+        Arc<crate::executor::context::RowSchema>,
+        Arc<crate::executor::context::RowSchema>,
+    )> = None;
+    let rebind = |schema: &Arc<crate::executor::context::RowSchema>| {
+        let mut next = (**schema).clone();
+        for col in &mut next.cols {
             col.qualifier.clone_from(&qual);
         }
-        row.pseudo_cols.clear();
+        next.pseudo_cols.clear();
+        next.rebuild_indexes();
+        Arc::new(next)
+    };
+    for row in &mut state.rows {
+        let new_schema = match &cached {
+            Some((old, new_s)) if Arc::ptr_eq(old, &row.schema) => Arc::clone(new_s),
+            _ => {
+                let ns = rebind(&row.schema);
+                cached = Some((Arc::clone(&row.schema), Arc::clone(&ns)));
+                ns
+            }
+        };
+        row.schema = new_schema;
+        row.pseudo_values.clear();
     }
-    for col in &mut state.schema.cols {
-        col.qualifier.clone_from(&qual);
-    }
-    state.schema.pseudo_cols.clear();
+    state.schema.schema = rebind(&state.schema.schema);
+    state.schema.pseudo_values.clear();
     state
 }
 
 pub(super) fn pipe_distinct(state: PipeState) -> BqResult<PipeState> {
     let mut out: Vec<EvalRow> = Vec::with_capacity(state.rows.len());
     let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut vals_buf: Vec<BqValue> = Vec::new();
     for row in state.rows {
-        vals_buf.clear();
-        vals_buf.extend(row.cols.iter().map(|c| c.value.clone()));
-        let h = hash_value_slice(&vals_buf);
+        let h = hash_value_slice(&row.values);
         let entry = buckets.entry(h).or_default();
         let mut dup = false;
         for &existing_idx in entry.iter() {
             if let Some(existing) = out.get(existing_idx) {
-                if existing.cols.len() == row.cols.len() {
+                if existing.values.len() == row.values.len() {
                     let mut all_eq = true;
-                    for (a, b) in existing.cols.iter().zip(row.cols.iter()) {
-                        if !values_distinct_eq(&a.value, &b.value)? {
+                    for (a, b) in existing.values.iter().zip(row.values.iter()) {
+                        if !values_distinct_eq(a, b)? {
                             all_eq = false;
                             break;
                         }

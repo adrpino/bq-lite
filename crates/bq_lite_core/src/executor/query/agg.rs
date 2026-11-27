@@ -423,7 +423,7 @@ pub(super) fn project_grouped_row(
                 };
                 let expanded = project_eval_rows(&single_wc, &[sample], ctx)?;
                 if let Some(first) = expanded.into_iter().next() {
-                    cols.extend(first.cols);
+                    cols.extend(first.to_bindings());
                 }
             }
         }

@@ -8,6 +8,8 @@ mod js_udf;
 mod metadata;
 mod query;
 mod result;
+mod row;
+mod row_schema;
 mod scalar;
 mod script;
 

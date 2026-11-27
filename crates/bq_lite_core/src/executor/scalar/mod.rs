@@ -9,6 +9,7 @@ mod farmhash;
 mod geo_search;
 mod interval;
 mod json;
+mod json_fast;
 mod json_path;
 mod math_hash;
 mod range_geo_net;

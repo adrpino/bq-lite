@@ -4,170 +4,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::catalog::{Catalog, JobInfoProvider};
-use crate::error::{BqError, BqResult};
 use crate::storage::StorageEngine;
-use crate::types::{BqStructFieldValue, BqType, BqValue};
+use crate::types::BqValue;
 
 use super::result::QueryResult;
 
-/// A single column binding in the current evaluation row.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct RowBinding {
-    pub qualifier: Option<Arc<str>>,
-    pub name: Arc<str>,
-    pub ty: BqType,
-    pub value: BqValue,
-}
-
-/// Evaluation row holding visible column bindings plus optional pseudo-columns (`_PARTITIONTIME`).
-#[derive(Debug, Clone, Default)]
-pub(super) struct EvalRow {
-    pub cols: Vec<RowBinding>,
-    pub pseudo_cols: Vec<RowBinding>,
-}
-
-impl EvalRow {
-    #[must_use]
-    pub(super) const fn new(cols: Vec<RowBinding>) -> Self {
-        Self {
-            cols,
-            pseudo_cols: Vec::new(),
-        }
-    }
-
-    #[must_use]
-    pub(super) const fn with_pseudo(cols: Vec<RowBinding>, pseudo_cols: Vec<RowBinding>) -> Self {
-        Self { cols, pseudo_cols }
-    }
-
-    #[must_use]
-    pub(super) fn from_query_result(alias: Option<&str>, qr: &QueryResult) -> Vec<Self> {
-        let qual: Option<Arc<str>> = alias.map(Arc::from);
-        let col_names: Vec<Arc<str>> = qr
-            .columns
-            .iter()
-            .map(|c| Arc::from(c.name.as_str()))
-            .collect();
-        qr.rows
-            .iter()
-            .map(|row| {
-                let cols = qr
-                    .columns
-                    .iter()
-                    .zip(col_names.iter())
-                    .zip(row.iter())
-                    .map(|((col, cname), val)| RowBinding {
-                        qualifier: qual.clone(),
-                        name: cname.clone(),
-                        ty: col.ty.clone(),
-                        value: val.clone(),
-                    })
-                    .collect();
-                Self::new(cols)
-            })
-            .collect()
-    }
-
-    pub(super) fn resolve_ident(&self, name: &str) -> BqResult<Option<&RowBinding>> {
-        let mut found: Option<&RowBinding> = None;
-        for col in &self.cols {
-            if col.name.eq_ignore_ascii_case(name) {
-                if found.is_some() {
-                    return Err(BqError::query(format!("Column name {name} is ambiguous")));
-                }
-                found = Some(col);
-            }
-        }
-        if found.is_some() {
-            return Ok(found);
-        }
-        for col in &self.pseudo_cols {
-            if col.name.eq_ignore_ascii_case(name) {
-                return Ok(Some(col));
-            }
-        }
-        Ok(None)
-    }
-
-    pub(super) fn resolve_qualified(&self, qualifier: &str, name: &str) -> Option<&RowBinding> {
-        self.cols.iter().chain(self.pseudo_cols.iter()).find(|c| {
-            c.qualifier
-                .as_deref()
-                .is_some_and(|q| q.eq_ignore_ascii_case(qualifier))
-                && c.name.eq_ignore_ascii_case(name)
-        })
-    }
-
-    /// Collects the ordered visible columns belonging to a table alias / range variable.
-    /// Prefers pre-coalesce `USING` snapshots in `pseudo_cols` (excluding `_PARTITION*`),
-    /// falling back to visible `cols` (excluding internal `__win_*` bindings).
-    pub(super) fn resolve_range_var_cols(&self, name: &str) -> Vec<&RowBinding> {
-        let from_pseudo: Vec<&RowBinding> = self
-            .pseudo_cols
-            .iter()
-            .filter(|c| {
-                !c.name.starts_with("_PARTITION")
-                    && c.qualifier
-                        .as_deref()
-                        .is_some_and(|q| q.eq_ignore_ascii_case(name))
-            })
-            .collect();
-        if !from_pseudo.is_empty() {
-            return from_pseudo;
-        }
-        self.cols
-            .iter()
-            .filter(|c| {
-                !c.name.starts_with("__win_")
-                    && c.qualifier
-                        .as_deref()
-                        .is_some_and(|q| q.eq_ignore_ascii_case(name))
-            })
-            .collect()
-    }
-
-    #[must_use]
-    pub(super) fn resolve_range_var_struct(&self, name: &str) -> Option<BqValue> {
-        let cols = self.resolve_range_var_cols(name);
-        if cols.is_empty() {
-            return None;
-        }
-        Some(BqValue::Struct(
-            cols.into_iter()
-                .map(|c| BqStructFieldValue {
-                    name: Some(c.name.as_ref().to_owned()),
-                    value: c.value.clone(),
-                })
-                .collect(),
-        ))
-    }
-
-    #[must_use]
-    pub(super) fn resolve_range_var_type(&self, name: &str) -> Option<BqType> {
-        let cols = self.resolve_range_var_cols(name);
-        if cols.is_empty() {
-            return None;
-        }
-        Some(BqType::Struct(
-            cols.into_iter()
-                .map(|c| crate::types::StructField::named(c.name.as_ref().to_owned(), c.ty.clone()))
-                .collect(),
-        ))
-    }
-
-    #[must_use]
-    pub(super) fn to_struct_value(&self) -> BqValue {
-        BqValue::Struct(
-            self.cols
-                .iter()
-                .map(|c| BqStructFieldValue {
-                    name: Some(c.name.as_ref().to_owned()),
-                    value: c.value.clone(),
-                })
-                .collect(),
-        )
-    }
-}
+pub(super) use super::row::{ColMeta, EvalRow, RowBinding, RowRef, RowSchema};
 
 /// Borrowed script variables and query parameters passed into DDL/DML execution.
 #[derive(Debug, Clone, Copy, Default)]
@@ -284,6 +126,7 @@ mod memory_guard_tests {
     use crate::executor::query::{eval_from_clause_public, project_eval_rows_public};
     use crate::executor::result::QueryColumn;
     use crate::parser::parse_query;
+    use crate::types::BqType;
 
     #[test]
     fn hot_row_types_stay_within_size_budgets() {
@@ -291,6 +134,11 @@ mod memory_guard_tests {
             size_of::<BqValue>() <= 40,
             "BqValue bloated to {} bytes (budget <= 40)",
             size_of::<BqValue>()
+        );
+        assert!(
+            size_of::<EvalRow>() <= 64,
+            "EvalRow bloated to {} bytes (budget <= 64)",
+            size_of::<EvalRow>()
         );
         assert!(
             size_of::<RowBinding>() <= 112,
@@ -348,36 +196,19 @@ mod memory_guard_tests {
             vec![vec![BqValue::Int64(1)], vec![BqValue::Int64(2)]],
         );
 
-        // 1. EvalRow::from_query_result shares Arc<str> name and qualifier across rows.
+        // 1. EvalRow::from_query_result shares Arc<RowSchema> across rows.
         let from_qr = EvalRow::from_query_result(Some("q"), &qr);
-        assert!(Arc::ptr_eq(
-            &from_qr[0].cols[0].name,
-            &from_qr[1].cols[0].name
-        ));
-        assert!(Arc::ptr_eq(
-            from_qr[0].cols[0].qualifier.as_ref().unwrap(),
-            from_qr[1].cols[0].qualifier.as_ref().unwrap()
-        ));
+        assert!(Arc::ptr_eq(&from_qr[0].schema, &from_qr[1].schema));
 
-        // 2. Concrete table scan & projection share Arc<str> across rows.
+        // 2. Concrete table scan & projection share Arc<RowSchema> across rows.
         let parsed = parse_query("SELECT id, label AS lbl FROM ds.t").unwrap();
         let crate::ast::SetExpr::Select(sel) = &parsed.body else {
             panic!("expected SELECT");
         };
         let scanned = eval_from_clause_public(&sel.from, &ctx).unwrap();
-        assert!(Arc::ptr_eq(
-            &scanned[0].cols[0].name,
-            &scanned[1].cols[0].name
-        ));
-        assert!(Arc::ptr_eq(
-            scanned[0].cols[0].qualifier.as_ref().unwrap(),
-            scanned[1].cols[0].qualifier.as_ref().unwrap()
-        ));
+        assert!(Arc::ptr_eq(&scanned[0].schema, &scanned[1].schema));
         let projected = project_eval_rows_public(sel, &scanned, &ctx).unwrap();
-        assert!(Arc::ptr_eq(
-            &projected[0].cols[1].name,
-            &projected[1].cols[1].name
-        ));
+        assert!(Arc::ptr_eq(&projected[0].schema, &projected[1].schema));
 
         // 3. ExecContext::with_outer shares Arc<QueryResult> CTEs without deep-cloning.
         ctx.ctes.insert("big".to_owned(), Arc::new(qr));

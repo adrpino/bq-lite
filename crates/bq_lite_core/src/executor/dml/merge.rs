@@ -190,7 +190,7 @@ fn apply_not_matched_by_target(
                     .collect::<BqResult<Vec<_>>>()?;
                 finalize_new_row(meta, columns, evaluated, ctx)?
             } else {
-                let raw: Vec<BqValue> = srow.cols.iter().map(|c| c.value.clone()).collect();
+                let raw: Vec<BqValue> = srow.values.clone();
                 finalize_new_row(meta, columns, raw, ctx)?
             };
             out_rows.push(new_row);
@@ -237,8 +237,6 @@ fn make_target_eval_row(meta: &TableMeta, row: &[BqValue], qual: &str) -> EvalRo
 }
 
 fn combine_eval(a: &EvalRow, b: &EvalRow) -> EvalRow {
-    let mut cols = Vec::with_capacity(a.cols.len() + b.cols.len());
-    cols.extend(a.cols.iter().cloned());
-    cols.extend(b.cols.iter().cloned());
-    EvalRow::new(cols)
+    let schema = crate::executor::context::RowSchema::concat(&a.schema, &b.schema);
+    EvalRow::combine_with_schema(a, b, schema)
 }

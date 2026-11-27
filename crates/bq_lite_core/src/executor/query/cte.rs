@@ -8,14 +8,22 @@ use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::BqValue;
 
 use super::cte_refs::{
-    collect_query_table_refs, query_references_table, set_expr_references_table,
+    collect_query_outer_refs, collect_query_table_refs, query_references_table,
+    set_expr_references_table,
 };
 use super::set_ops::{dedup_rows, rows_equal};
 use super::{execute_query, execute_set_expr};
 
 const MAX_CTE_RECURSION: usize = 100;
 
-pub(super) fn eval_with_clause(with: &WithClause, ctx: &mut ExecContext<'_>) -> BqResult<()> {
+pub(super) fn eval_with_clause(
+    with: &WithClause,
+    enclosing_query: Option<&Query>,
+    ctx: &mut ExecContext<'_>,
+) -> BqResult<()> {
+    let needed = enclosing_query
+        .filter(|_| !with.recursive)
+        .map(|q| compute_referenced_ctes(with, q));
     let order = if with.recursive {
         topo_order_ctes(&with.ctes)
     } else {
@@ -26,6 +34,9 @@ pub(super) fn eval_with_clause(with: &WithClause, ctx: &mut ExecContext<'_>) -> 
             continue;
         };
         let key = cte.name.value.to_ascii_lowercase();
+        if needed.as_ref().is_some_and(|set| !set.contains(&key)) {
+            continue;
+        }
         let is_self_rec = with.recursive && query_references_table(&cte.query, &key);
         let mut qr = if is_self_rec {
             eval_recursive_cte(cte, ctx)?
@@ -46,6 +57,19 @@ pub(super) fn eval_with_clause(with: &WithClause, ctx: &mut ExecContext<'_>) -> 
         ctx.ctes.insert(key, std::sync::Arc::new(qr));
     }
     Ok(())
+}
+
+fn compute_referenced_ctes(with: &WithClause, query: &Query) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    collect_query_outer_refs(query, &mut reachable);
+    // Transitively pull in CTEs referenced by reachable CTEs (reverse order handles chaining).
+    for cte in with.ctes.iter().rev() {
+        let key = cte.name.value.to_ascii_lowercase();
+        if reachable.contains(&key) {
+            collect_query_table_refs(&cte.query, &mut reachable);
+        }
+    }
+    reachable
 }
 
 fn topo_order_ctes(ctes: &[Cte]) -> Vec<usize> {
@@ -105,7 +129,7 @@ fn eval_recursive_cte(cte: &Cte, ctx: &ExecContext<'_>) -> BqResult<QueryResult>
     let empty_outer = EvalRow::default();
     let mut inner_ctx = ctx.with_outer(&empty_outer);
     if let Some(ref inner_with) = cte.query.with {
-        eval_with_clause(inner_with, &mut inner_ctx)?;
+        eval_with_clause(inner_with, None, &mut inner_ctx)?;
     }
     let Some(parts) = split_recursive_query(&cte.query, &key, &inner_ctx)? else {
         return execute_query(&cte.query, ctx);

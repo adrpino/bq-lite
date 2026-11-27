@@ -300,17 +300,15 @@ pub(super) fn build_returning_result_with_actions(
         projected
             .first()
             .map(|r| {
-                r.cols
+                r.schema
+                    .cols
                     .iter()
                     .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                     .collect()
             })
             .unwrap_or_default()
     };
-    let mut out_rows: Vec<Vec<BqValue>> = projected
-        .into_iter()
-        .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-        .collect();
+    let mut out_rows: Vec<Vec<BqValue>> = projected.into_iter().map(|r| r.values).collect();
     if let Some(ref opt_alias) = returning.with_action {
         let col_name = opt_alias
             .as_ref()

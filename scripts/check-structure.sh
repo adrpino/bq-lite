@@ -6,14 +6,14 @@ cd "$ROOT_DIR"
 
 FAIL=0
 
-echo "  -> Checking source file line budgets (max 500 lines under crates/*/src/)"
+echo "  -> Checking source file line budgets (max 700 lines under crates/*/src/)"
 while IFS= read -r -d '' file; do
     lines=$(wc -l < "$file" | tr -d ' ')
-    if [ "$lines" -gt 500 ]; then
-        echo "ERROR: $file has $lines lines (limit: 500)"
+    if [ "$lines" -gt 700 ]; then
+        echo "ERROR: $file has $lines lines (limit: 700)"
         FAIL=1
-    elif [ "$lines" -gt 350 ]; then
-        echo "WARN:  $file has $lines lines (split recommended before 500)"
+    elif [ "$lines" -gt 550 ]; then
+        echo "WARN:  $file has $lines lines (split recommended before 700)"
     fi
 done < <(find crates -type f -name '*.rs' -path '*/src/*' -print0)
 

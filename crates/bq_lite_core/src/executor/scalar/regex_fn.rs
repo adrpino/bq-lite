@@ -1,8 +1,18 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
+
+const MAX_REGEX_CACHE_ENTRIES: usize = 128;
+
+thread_local! {
+    static STR_REGEX_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+    static BYTES_REGEX_CACHE: RefCell<HashMap<String, BytesRegex>> = RefCell::new(HashMap::new());
+}
 
 pub(super) const REGEX_FUNCTIONS: &[&str] = &[
     "REGEXP_CONTAINS",
@@ -26,15 +36,44 @@ pub(super) fn eval_regex_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<B
     }
 }
 
-fn compile_regex(pat: &str) -> BqResult<Regex> {
-    Regex::new(pat).map_err(|e| BqError::semantic(format!("Invalid regular expression: {e}")))
+fn with_regex<T>(pat: &str, f: impl FnOnce(&Regex) -> BqResult<T>) -> BqResult<T> {
+    STR_REGEX_CACHE.with(|c| {
+        if !c.borrow().contains_key(pat) {
+            let compiled = Regex::new(pat)
+                .map_err(|e| BqError::semantic(format!("Invalid regular expression: {e}")))?;
+            let mut map = c.borrow_mut();
+            if map.len() >= MAX_REGEX_CACHE_ENTRIES {
+                map.clear();
+            }
+            map.insert(pat.to_owned(), compiled);
+        }
+        let map = c.borrow();
+        let Some(re) = map.get(pat) else {
+            return Err(BqError::internal("regex cache entry missing"));
+        };
+        f(re)
+    })
 }
 
-fn compile_bytes_regex(pat: &[u8]) -> BqResult<BytesRegex> {
+fn with_bytes_regex<T>(pat: &[u8], f: impl FnOnce(&BytesRegex) -> BqResult<T>) -> BqResult<T> {
     let pat_s = std::str::from_utf8(pat)
         .map_err(|_| BqError::semantic("Invalid UTF-8 in BYTES regular expression"))?;
-    BytesRegex::new(pat_s)
-        .map_err(|e| BqError::semantic(format!("Invalid regular expression: {e}")))
+    BYTES_REGEX_CACHE.with(|c| {
+        if !c.borrow().contains_key(pat_s) {
+            let compiled = BytesRegex::new(pat_s)
+                .map_err(|e| BqError::semantic(format!("Invalid regular expression: {e}")))?;
+            let mut map = c.borrow_mut();
+            if map.len() >= MAX_REGEX_CACHE_ENTRIES {
+                map.clear();
+            }
+            map.insert(pat_s.to_owned(), compiled);
+        }
+        let map = c.borrow();
+        let Some(re) = map.get(pat_s) else {
+            return Err(BqError::internal("bytes regex cache entry missing"));
+        };
+        f(re)
+    })
 }
 
 fn eval_regexp_contains(args: Vec<BqValue>, full_match: bool) -> BqResult<BqValue> {
@@ -46,23 +85,23 @@ fn eval_regexp_contains(args: Vec<BqValue>, full_match: bool) -> BqResult<BqValu
     }
     match (val, pat) {
         (BqValue::String(s), BqValue::String(p)) => {
-            let re = if full_match {
-                compile_regex(&format!("^(?:{p})$"))?
+            let matched = if full_match {
+                with_regex(&format!("^(?:{p})$"), |re| Ok(re.is_match(&s)))?
             } else {
-                compile_regex(&p)?
+                with_regex(&p, |re| Ok(re.is_match(&s)))?
             };
-            Ok(BqValue::Bool(re.is_match(&s)))
+            Ok(BqValue::Bool(matched))
         }
         (BqValue::Bytes(b), BqValue::Bytes(p)) => {
-            let re = if full_match {
+            let matched = if full_match {
                 let mut wrapped = b"^(?:".to_vec();
                 wrapped.extend_from_slice(&p);
                 wrapped.extend_from_slice(b")$");
-                compile_bytes_regex(&wrapped)?
+                with_bytes_regex(&wrapped, |re| Ok(re.is_match(&b)))?
             } else {
-                compile_bytes_regex(&p)?
+                with_bytes_regex(&p, |re| Ok(re.is_match(&b)))?
             };
-            Ok(BqValue::Bool(re.is_match(&b)))
+            Ok(BqValue::Bool(matched))
         }
         _ => Err(BqError::query(
             "REGEXP_CONTAINS expects STRING or BYTES arguments",
@@ -83,8 +122,7 @@ fn eval_regexp_extract(args: Vec<BqValue>) -> BqResult<BqValue> {
     let pos = parse_opt_pos(it.next().as_ref())?;
     let occ = parse_opt_occ(it.next().as_ref())?;
     match (val, pat) {
-        (BqValue::String(s), BqValue::String(p)) => {
-            let re = compile_regex(&p)?;
+        (BqValue::String(s), BqValue::String(p)) => with_regex(&p, |re| {
             if re.captures_len() > 2 {
                 return Err(BqError::semantic(
                     "REGEXP_EXTRACT supports at most 1 capturing group",
@@ -99,9 +137,8 @@ fn eval_regexp_extract(args: Vec<BqValue>) -> BqResult<BqValue> {
             Ok(found
                 .and_then(|c| c.get(group_idx))
                 .map_or(BqValue::Null, |m| BqValue::String(m.as_str().to_owned())))
-        }
-        (BqValue::Bytes(b), BqValue::Bytes(p)) => {
-            let re = compile_bytes_regex(&p)?;
+        }),
+        (BqValue::Bytes(b), BqValue::Bytes(p)) => with_bytes_regex(&p, |re| {
             if re.captures_len() > 2 {
                 return Err(BqError::semantic(
                     "REGEXP_EXTRACT supports at most 1 capturing group",
@@ -115,7 +152,7 @@ fn eval_regexp_extract(args: Vec<BqValue>) -> BqResult<BqValue> {
             Ok(found
                 .and_then(|c| c.get(group_idx))
                 .map_or(BqValue::Null, |m| BqValue::Bytes(m.as_bytes().to_vec())))
-        }
+        }),
         _ => Err(BqError::query(
             "REGEXP_EXTRACT expects STRING or BYTES arguments",
         )),
@@ -130,8 +167,7 @@ fn eval_regexp_extract_all(args: Vec<BqValue>) -> BqResult<BqValue> {
         return Ok(BqValue::Null);
     }
     match (val, pat) {
-        (BqValue::String(s), BqValue::String(p)) => {
-            let re = compile_regex(&p)?;
+        (BqValue::String(s), BqValue::String(p)) => with_regex(&p, |re| {
             let group_idx = usize::from(re.captures_len() > 1);
             let items: Vec<BqValue> = re
                 .captures_iter(&s)
@@ -141,9 +177,8 @@ fn eval_regexp_extract_all(args: Vec<BqValue>) -> BqResult<BqValue> {
                 })
                 .collect();
             Ok(BqValue::Array(items))
-        }
-        (BqValue::Bytes(b), BqValue::Bytes(p)) => {
-            let re = compile_bytes_regex(&p)?;
+        }),
+        (BqValue::Bytes(b), BqValue::Bytes(p)) => with_bytes_regex(&p, |re| {
             let group_idx = usize::from(re.captures_len() > 1);
             let items: Vec<BqValue> = re
                 .captures_iter(&b)
@@ -153,7 +188,7 @@ fn eval_regexp_extract_all(args: Vec<BqValue>) -> BqResult<BqValue> {
                 })
                 .collect();
             Ok(BqValue::Array(items))
-        }
+        }),
         _ => Err(BqError::query(
             "REGEXP_EXTRACT_ALL expects STRING or BYTES arguments",
         )),
@@ -187,8 +222,7 @@ fn eval_regexp_instr(args: Vec<BqValue>) -> BqResult<BqValue> {
         }
     };
     match (val, pat) {
-        (BqValue::String(s), BqValue::String(p)) => {
-            let re = compile_regex(&p)?;
+        (BqValue::String(s), BqValue::String(p)) => with_regex(&p, |re| {
             if re.captures_len() > 2 {
                 return Err(BqError::semantic(
                     "REGEXP_INSTR supports at most 1 capturing group",
@@ -209,9 +243,8 @@ fn eval_regexp_instr(args: Vec<BqValue>) -> BqResult<BqValue> {
                     .unwrap_or(i64::MAX)
             });
             Ok(BqValue::Int64(res))
-        }
-        (BqValue::Bytes(b), BqValue::Bytes(p)) => {
-            let re = compile_bytes_regex(&p)?;
+        }),
+        (BqValue::Bytes(b), BqValue::Bytes(p)) => with_bytes_regex(&p, |re| {
             if re.captures_len() > 2 {
                 return Err(BqError::semantic(
                     "REGEXP_INSTR supports at most 1 capturing group",
@@ -230,7 +263,7 @@ fn eval_regexp_instr(args: Vec<BqValue>) -> BqResult<BqValue> {
                 i64::try_from(target_byte + 1).unwrap_or(i64::MAX)
             });
             Ok(BqValue::Int64(res))
-        }
+        }),
         _ => Err(BqError::query(
             "REGEXP_INSTR expects STRING or BYTES arguments",
         )),
@@ -245,16 +278,14 @@ fn eval_regexp_replace(args: Vec<BqValue>) -> BqResult<BqValue> {
         return Ok(BqValue::Null);
     }
     match (val, pat, rep) {
-        (BqValue::String(s), BqValue::String(p), BqValue::String(r)) => {
-            let re = compile_regex(&p)?;
+        (BqValue::String(s), BqValue::String(p), BqValue::String(r)) => with_regex(&p, |re| {
             Ok(BqValue::String(re.replace_all(&s, r.as_str()).into_owned()))
-        }
-        (BqValue::Bytes(b), BqValue::Bytes(p), BqValue::Bytes(r)) => {
-            let re = compile_bytes_regex(&p)?;
+        }),
+        (BqValue::Bytes(b), BqValue::Bytes(p), BqValue::Bytes(r)) => with_bytes_regex(&p, |re| {
             Ok(BqValue::Bytes(
                 re.replace_all(&b, r.as_slice()).into_owned(),
             ))
-        }
+        }),
         _ => Err(BqError::query(
             "REGEXP_REPLACE expects STRING or BYTES arguments",
         )),

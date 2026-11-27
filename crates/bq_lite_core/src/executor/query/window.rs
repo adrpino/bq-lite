@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::ast::{Expr, FunctionCall, NamedWindowDef, OrderByExpr, Select, SelectItem, WindowSpec};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext, RowBinding};
+use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::{eval_expr, values_distinct_eq};
 use crate::types::BqValue;
 
@@ -102,15 +102,7 @@ pub(super) fn apply_windows(
     for (idx, call) in calls.iter().enumerate() {
         let vals = eval_window_call(call, &rows, &select.window, ctx)?;
         let col_name: std::sync::Arc<str> = std::sync::Arc::from(format!("__win_{idx}"));
-        for (row, val) in rows.iter_mut().zip(vals) {
-            let ty = val.infer_type()?;
-            row.cols.push(RowBinding {
-                qualifier: None,
-                name: col_name.clone(),
-                ty,
-                value: val,
-            });
-        }
+        EvalRow::append_column_batch(&mut rows, &col_name, vals)?;
     }
     Ok((rewritten, rows))
 }
@@ -128,15 +120,7 @@ pub(super) fn apply_windows_to_exprs(
     for (idx, call) in calls.iter().enumerate() {
         let vals = eval_window_call(call, rows, named_windows, ctx)?;
         let col_name: std::sync::Arc<str> = std::sync::Arc::from(format!("__win_{idx}"));
-        for (row, val) in rows.iter_mut().zip(vals) {
-            let ty = val.infer_type()?;
-            row.cols.push(RowBinding {
-                qualifier: None,
-                name: col_name.clone(),
-                ty,
-                value: val,
-            });
-        }
+        EvalRow::append_column_batch(rows, &col_name, vals)?;
     }
     Ok(())
 }
@@ -210,7 +194,7 @@ fn filter_grouped_qualify(
     let mut out_src = Vec::new();
     for ((bucket, proj_row), src_row) in buckets.iter().zip(projected).zip(src_rows.iter()) {
         let mut active = bucket.active_keys.clone();
-        for col in &proj_row.cols {
+        for col in proj_row.iter_cols() {
             let ident = Expr::Ident(crate::ast::Ident::unquoted(col.name.as_ref()));
             if !active.iter().any(|(k, _)| k == &ident)
                 && !bucket
@@ -257,18 +241,16 @@ fn eval_grouped_window_call(
         }
         let col_name = format!("__warg_{i}");
         let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
-        for (b_idx, bucket) in buckets.iter().enumerate() {
-            let val = eval_grouped_expr(&arg.expr, bucket.rows.as_slice(), &bucket.keys(), ctx)?;
-            let ty = val.infer_type()?;
-            if let Some(sr) = syn_rows.get_mut(b_idx) {
-                sr.cols.push(RowBinding {
-                    qualifier: None,
-                    name: col_arc.clone(),
-                    ty,
-                    value: val,
-                });
-            }
+        let mut vals = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            vals.push(eval_grouped_expr(
+                &arg.expr,
+                bucket.rows.as_slice(),
+                &bucket.keys(),
+                ctx,
+            )?);
         }
+        EvalRow::append_column_batch(&mut syn_rows, &col_arc, vals)?;
         arg.expr = Expr::Ident(crate::ast::Ident::unquoted(col_name));
     }
     let mut syn_spec = spec.clone();
@@ -294,18 +276,16 @@ fn rewrite_spec_exprs(
     for (i, expr) in exprs.iter().enumerate() {
         let col_name = format!("__w{prefix}_{i}");
         let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
-        for (b_idx, bucket) in buckets.iter().enumerate() {
-            let val = eval_grouped_expr(expr, bucket.rows.as_slice(), &bucket.keys(), ctx)?;
-            let ty = val.infer_type()?;
-            if let Some(sr) = syn_rows.get_mut(b_idx) {
-                sr.cols.push(RowBinding {
-                    qualifier: None,
-                    name: col_arc.clone(),
-                    ty,
-                    value: val,
-                });
-            }
+        let mut vals = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            vals.push(eval_grouped_expr(
+                expr,
+                bucket.rows.as_slice(),
+                &bucket.keys(),
+                ctx,
+            )?);
         }
+        EvalRow::append_column_batch(syn_rows, &col_arc, vals)?;
         out.push(Expr::Ident(crate::ast::Ident::unquoted(col_name)));
     }
     Ok(out)

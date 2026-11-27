@@ -50,9 +50,10 @@ impl PipeState {
         if self.rows.is_empty() {
             let cols = self
                 .schema
+                .schema
                 .cols
-                .into_iter()
-                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty))
+                .iter()
+                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                 .collect();
             return QueryResult::new(cols, Vec::new());
         }
@@ -60,7 +61,8 @@ impl PipeState {
             .rows
             .first()
             .map(|r| {
-                r.cols
+                r.schema
+                    .cols
                     .iter()
                     .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                     .collect()
@@ -71,22 +73,18 @@ impl PipeState {
                 if let Some(found) = self
                     .rows
                     .iter()
-                    .filter_map(|r| r.cols.get(idx))
+                    .filter_map(|r| r.schema.cols.get(idx))
                     .find(|c| !has_untyped_null(&c.ty))
                 {
                     col.ty = found.ty.clone();
-                } else if let Some(sc) = self.schema.cols.get(idx) {
+                } else if let Some(sc) = self.schema.schema.cols.get(idx) {
                     if !has_untyped_null(&sc.ty) {
                         col.ty = sc.ty.clone();
                     }
                 }
             }
         }
-        let out_rows = self
-            .rows
-            .into_iter()
-            .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-            .collect();
+        let out_rows = self.rows.into_iter().map(|r| r.values).collect();
         QueryResult::new(cols, out_rows)
     }
 }
@@ -129,10 +127,7 @@ fn init_pipe_state(query: &Query, ctx: &ExecContext<'_>) -> BqResult<PipeState> 
             query.offset.as_ref(),
             ctx,
         )?;
-        qr.rows = eval_rows
-            .into_iter()
-            .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-            .collect();
+        qr.rows = eval_rows.into_iter().map(|r| r.values).collect();
     }
     Ok(PipeState::from_result(&qr))
 }
@@ -200,7 +195,28 @@ fn apply_single_pipe_op(
 
 pub(super) fn strip_synthetic_win_cols(rows: &mut [EvalRow]) {
     for row in rows {
-        row.cols.retain(|c| !c.name.starts_with("__win_"));
+        let keep_indices: Vec<usize> = row
+            .schema
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.name.starts_with("__win_"))
+            .map(|(i, _)| i)
+            .collect();
+        if keep_indices.len() == row.schema.cols.len() {
+            continue;
+        }
+        let metas = keep_indices
+            .iter()
+            .filter_map(|&i| row.schema.cols.get(i).cloned())
+            .collect();
+        let vals = keep_indices
+            .iter()
+            .filter_map(|&i| row.values.get(i).cloned())
+            .collect();
+        let pcols = row.schema.pseudo_cols.clone();
+        row.schema = Arc::new(crate::executor::context::RowSchema::new(metas, pcols));
+        row.values = vals;
     }
 }
 
@@ -318,14 +334,16 @@ fn pipe_extend(
                 value: val,
             });
         }
-        row.cols.extend(additions);
+        for add in additions {
+            row.push_binding(add);
+        }
     }
     if has_win {
         strip_synthetic_win_cols(&mut state.rows);
     }
     for (expr, name) in exprs.iter().zip(names.iter()) {
         let ty = infer_expr_type(expr, &state.schema, ctx);
-        state.schema.cols.push(RowBinding {
+        state.schema.push_binding(RowBinding {
             qualifier: None,
             name: name.clone(),
             ty,
@@ -350,15 +368,18 @@ fn pipe_set(
             let val = eval_expr(expr, row, ctx)?;
             let ty = val.infer_type()?;
             let pos = row
+                .schema
                 .cols
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&col.value))
                 .ok_or_else(|| {
                     BqError::query(format!("Column '{}' not found in SET", col.value))
                 })?;
-            if let Some(slot) = row.cols.get_mut(pos) {
-                slot.ty = ty;
-                slot.value = val;
+            if let Some(meta) = Arc::make_mut(&mut row.schema).cols.get_mut(pos) {
+                meta.ty = ty;
+            }
+            if let Some(slot) = row.values.get_mut(pos) {
+                *slot = val;
             }
         }
     }
@@ -372,11 +393,31 @@ fn pipe_set(
 }
 
 fn pipe_drop(mut state: PipeState, drops: &[Ident]) -> PipeState {
-    let keep = |c: &RowBinding| !drops.iter().any(|d| d.value.eq_ignore_ascii_case(&c.name));
+    let retain_row = |row: &mut EvalRow| {
+        let keep_idx: Vec<usize> = row
+            .schema
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !drops.iter().any(|d| d.value.eq_ignore_ascii_case(&c.name)))
+            .map(|(i, _)| i)
+            .collect();
+        let metas = keep_idx
+            .iter()
+            .filter_map(|&i| row.schema.cols.get(i).cloned())
+            .collect();
+        let vals = keep_idx
+            .iter()
+            .filter_map(|&i| row.values.get(i).cloned())
+            .collect();
+        let pcols = row.schema.pseudo_cols.clone();
+        row.schema = Arc::new(crate::executor::context::RowSchema::new(metas, pcols));
+        row.values = vals;
+    };
     for row in &mut state.rows {
-        row.cols.retain(&keep);
+        retain_row(row);
     }
-    state.schema.cols.retain(keep);
+    retain_row(&mut state.schema);
     state
 }
 
@@ -385,23 +426,28 @@ fn pipe_rename(mut state: PipeState, pairs: &[(Ident, Ident)]) -> BqResult<PipeS
     for (old, new) in pairs {
         let pos = state
             .schema
+            .schema
             .cols
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&old.value))
             .ok_or_else(|| BqError::query(format!("Column '{}' not found in RENAME", old.value)))?;
         targets.push((pos, Arc::from(new.value.as_str())));
     }
+    let schema_mut = Arc::make_mut(&mut state.schema.schema);
     for (pos, new_name) in &targets {
-        if let Some(col) = state.schema.cols.get_mut(*pos) {
+        if let Some(col) = schema_mut.cols.get_mut(*pos) {
             col.name = new_name.clone();
         }
     }
+    schema_mut.rebuild_indexes();
     for row in &mut state.rows {
+        let rs_mut = Arc::make_mut(&mut row.schema);
         for (pos, new_name) in &targets {
-            if let Some(col) = row.cols.get_mut(*pos) {
+            if let Some(col) = rs_mut.cols.get_mut(*pos) {
                 col.name = new_name.clone();
             }
         }
+        rs_mut.rebuild_indexes();
     }
     Ok(state)
 }

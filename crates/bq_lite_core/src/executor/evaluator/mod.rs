@@ -5,22 +5,24 @@ mod literals;
 mod ops;
 mod subquery;
 
-use crate::ast::{Expr, Ident, UnaryOp, WhenBranch};
+use crate::ast::{Expr, Ident, UnaryOp};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::{EvalRow, ExecContext, RowRef};
 use crate::executor::query::execute_query;
 use crate::types::coercion::cast_value;
 use crate::types::BqValue;
 
 use calls::{eval_array_literal, eval_function_expr, eval_struct_literal};
-pub(super) use calls::{infer_expr_col_name, is_date_part_arg_pos, lookup_udf_return_type};
+pub(super) use calls::{is_date_part_arg_pos, lookup_udf_return_type};
+pub(super) use lambda::infer_expr_col_name;
 pub(super) use ops::{
     combine_logical, compare_values, eval_binary, eval_is_test, eval_unary, to_opt_bool,
     values_distinct_eq, values_equal,
 };
+pub(in crate::executor) use subquery::coerce_to_expr_supertype;
 use subquery::{
-    eval_array_subquery, eval_extract, eval_in_expr, eval_scalar_subquery, eval_subscript,
-    eval_with_expr,
+    eval_array_subquery, eval_case_expr, eval_extract, eval_in_expr, eval_scalar_subquery,
+    eval_subscript, eval_with_expr,
 };
 
 pub(super) fn eval_subscript_values(
@@ -51,11 +53,19 @@ pub(super) fn like_match_values(text: &str, pattern: &str) -> bool {
     literals::eval_like(text, pattern)
 }
 
+pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+    eval_expr_ref(expr, RowRef::Single(row), ctx)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Single dispatch table over all Expr AST variants"
 )]
-pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+pub(super) fn eval_expr_ref(
+    expr: &Expr,
+    row: RowRef<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
     match expr {
         Expr::Literal(lit) => literals::eval_literal(lit),
         Expr::Ident(id) => resolve_single_ident(&id.value, row, ctx),
@@ -63,10 +73,10 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
         Expr::Parameter(_) | Expr::PositionalParam(_) | Expr::SystemVar(_) => {
             eval_param_or_sysvar(expr, ctx)
         }
-        Expr::Grouped(inner) => eval_expr(inner, row, ctx),
+        Expr::Grouped(inner) => eval_expr_ref(inner, row, ctx),
         Expr::Unary { op, expr } => eval_unary_expr(*op, expr, row, ctx),
         Expr::Binary { left, op, right } => eval_binary_expr(*op, left, right, row, ctx),
-        Expr::Is { expr, test } => Ok(eval_is_test(&eval_expr(expr, row, ctx)?, *test)),
+        Expr::Is { expr, test } => Ok(eval_is_test(&eval_expr_ref(expr, row, ctx)?, *test)),
         Expr::Between {
             expr,
             negated,
@@ -82,7 +92,7 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             expr,
             negated,
             target,
-        } => eval_in_expr(expr, *negated, target, row, ctx),
+        } => eval_in_expr(expr, *negated, target, row.as_eval_row().as_ref(), ctx),
         Expr::Cast {
             expr,
             ty,
@@ -98,31 +108,56 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             operand,
             whens,
             else_result,
-        } => eval_case_expr(operand.as_deref(), whens, else_result.as_deref(), row, ctx),
-        Expr::Function(call) => eval_function_expr(call, row, ctx),
+        } => eval_case_expr(
+            operand.as_deref(),
+            whens,
+            else_result.as_deref(),
+            row.as_eval_row().as_ref(),
+            ctx,
+        ),
+        Expr::Function(call) => eval_function_expr(call, row.as_eval_row().as_ref(), ctx),
         Expr::ArrayLiteral {
             elem_type,
             elements,
-        } => eval_array_literal(elem_type.as_ref(), elements, row, ctx),
+        } => eval_array_literal(
+            elem_type.as_ref(),
+            elements,
+            row.as_eval_row().as_ref(),
+            ctx,
+        ),
         Expr::StructLiteral {
             explicit_type,
             fields,
-        } => eval_struct_literal(explicit_type.as_ref(), fields, row, ctx),
-        Expr::Subscript { expr, kind, index } => eval_subscript(expr, *kind, index, row, ctx),
+        } => eval_struct_literal(
+            explicit_type.as_ref(),
+            fields,
+            row.as_eval_row().as_ref(),
+            ctx,
+        ),
+        Expr::Subscript { expr, kind, index } => {
+            eval_subscript(expr, *kind, index, row.as_eval_row().as_ref(), ctx)
+        }
         Expr::FieldAccess { expr, field } => {
-            access_struct_field(&eval_expr(expr, row, ctx)?, &field.value)
+            access_struct_field(&eval_expr_ref(expr, row, ctx)?, &field.value)
         }
         Expr::Extract {
             part,
             expr,
             time_zone,
-        } => eval_extract(&part.value, expr, time_zone.as_deref(), row, ctx),
+        } => eval_extract(
+            &part.value,
+            expr,
+            time_zone.as_deref(),
+            row.as_eval_row().as_ref(),
+            ctx,
+        ),
         Expr::Exists(q) => {
-            let res = execute_query(q, &ctx.with_outer(row))?;
+            let owned = row.as_eval_row();
+            let res = execute_query(q, &ctx.with_outer(owned.as_ref()))?;
             Ok(BqValue::Bool(!res.rows.is_empty()))
         }
-        Expr::Subquery(q) => eval_scalar_subquery(q, row, ctx),
-        Expr::ArraySubquery(q) => eval_array_subquery(q, row, ctx),
+        Expr::Subquery(q) => eval_scalar_subquery(q, row.as_eval_row().as_ref(), ctx),
+        Expr::ArraySubquery(q) => eval_array_subquery(q, row.as_eval_row().as_ref(), ctx),
         Expr::Interval {
             value,
             unit,
@@ -138,8 +173,10 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             elem_type,
             start,
             end,
-        } => literals::eval_range_literal(elem_type, start, end, row, ctx),
-        Expr::WithExpr { bindings, body } => eval_with_expr(bindings, body, row, ctx),
+        } => literals::eval_range_literal(elem_type, start, end, row.as_eval_row().as_ref(), ctx),
+        Expr::WithExpr { bindings, body } => {
+            eval_with_expr(bindings, body, row.as_eval_row().as_ref(), ctx)
+        }
         Expr::Star | Expr::QualifiedStar(_) | Expr::ExprStar(_) => {
             Err(BqError::query("Unexpected '*' in expression"))
         }
@@ -153,23 +190,23 @@ fn eval_binary_expr(
     op: crate::ast::BinaryOp,
     left: &Expr,
     right: &Expr,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     if matches!(op, crate::ast::BinaryOp::And | crate::ast::BinaryOp::Or) {
-        let l = eval_expr(left, row, ctx)?;
+        let l = eval_expr_ref(left, row, ctx)?;
         let lb = to_opt_bool(&l)?;
         if (op == crate::ast::BinaryOp::And && lb == Some(false))
             || (op == crate::ast::BinaryOp::Or && lb == Some(true))
         {
             return Ok(BqValue::Bool(lb.unwrap_or(false)));
         }
-        let r = eval_expr(right, row, ctx)?;
+        let r = eval_expr_ref(right, row, ctx)?;
         let rb = to_opt_bool(&r)?;
         return Ok(combine_logical(op, lb, rb));
     }
-    let mut l = eval_expr(left, row, ctx)?;
-    let mut r = eval_expr(right, row, ctx)?;
+    let mut l = eval_expr_ref(left, row, ctx)?;
+    let mut r = eval_expr_ref(right, row, ctx)?;
     if matches!(
         op,
         crate::ast::BinaryOp::Eq
@@ -223,10 +260,10 @@ fn eval_interval_expr(
     value: &Expr,
     unit: &str,
     end_unit: Option<&str>,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let val = eval_expr(value, row, ctx)?;
+    let val = eval_expr_ref(value, row, ctx)?;
     if val.is_null() {
         return Ok(BqValue::Null);
     }
@@ -244,14 +281,14 @@ fn eval_interval_expr(
 fn eval_unary_expr(
     op: UnaryOp,
     expr: &Expr,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let val = eval_expr(expr, row, ctx)?;
+    let val = eval_expr_ref(expr, row, ctx)?;
     eval_unary(op, val)
 }
 
-fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+fn resolve_single_ident(name: &str, row: RowRef<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     if let Some(binding) = row.resolve_ident(name)? {
         return Ok(binding.value.clone());
     }
@@ -284,7 +321,7 @@ fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqR
 
 fn resolve_compound_ident(
     parts: &[Ident],
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let [first, rest @ ..] = parts else {
@@ -296,7 +333,9 @@ fn resolve_compound_ident(
             return Ok(val);
         }
         for outer in ctx.outer_rows.iter().rev() {
-            if let Some(val) = resolve_qualified_from_row(first, second, tail, outer)? {
+            if let Some(val) =
+                resolve_qualified_from_row(first, second, tail, RowRef::Single(outer))?
+            {
                 return Ok(val);
             }
         }
@@ -312,7 +351,7 @@ fn resolve_qualified_from_row(
     first: &Ident,
     second: &Ident,
     tail: &[Ident],
-    row: &EvalRow,
+    row: RowRef<'_>,
 ) -> BqResult<Option<BqValue>> {
     let Some(binding) = row.resolve_qualified(&first.value, &second.value) else {
         return Ok(None);
@@ -355,12 +394,12 @@ fn eval_between(
     negated: bool,
     low: &Expr,
     high: &Expr,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let mut v = eval_expr(expr, row, ctx)?;
-    let mut l = eval_expr(low, row, ctx)?;
-    let mut h = eval_expr(high, row, ctx)?;
+    let mut v = eval_expr_ref(expr, row, ctx)?;
+    let mut l = eval_expr_ref(low, row, ctx)?;
+    let mut h = eval_expr_ref(high, row, ctx)?;
     let is_lit_str = |e: &Expr| matches!(e, Expr::Literal(crate::ast::Literal::String(_)));
     let temporal_ty = [&v, &l, &h].iter().find_map(|val| {
         #[expect(
@@ -400,11 +439,11 @@ fn eval_like_expr(
     expr: &Expr,
     negated: bool,
     pattern: &Expr,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let val = eval_expr(expr, row, ctx)?;
-    let pat = eval_expr(pattern, row, ctx)?;
+    let val = eval_expr_ref(expr, row, ctx)?;
+    let pat = eval_expr_ref(pattern, row, ctx)?;
     if val.is_null() || pat.is_null() {
         return Ok(BqValue::Null);
     }
@@ -423,69 +462,16 @@ fn eval_cast_expr(
         Option<&Expr>,
         Option<&Expr>,
     ),
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let (expr, ty, safe, format, time_zone) = cast;
-    let val = eval_expr(expr, row, ctx)?;
-    let fmt_val = format.map(|f| eval_expr(f, row, ctx)).transpose()?;
-    let tz_val = time_zone.map(|z| eval_expr(z, row, ctx)).transpose()?;
+    let val = eval_expr_ref(expr, row, ctx)?;
+    let fmt_val = format.map(|f| eval_expr_ref(f, row, ctx)).transpose()?;
+    let tz_val = time_zone.map(|z| eval_expr_ref(z, row, ctx)).transpose()?;
     match cast_fmt::eval_cast_with_format(val, ty, fmt_val, tz_val) {
         Ok(v) => Ok(v),
         Err(err) if safe && err.is_safe_suppressible() => Ok(BqValue::Null),
         Err(err) => Err(err),
     }
-}
-
-fn eval_case_expr(
-    operand: Option<&Expr>,
-    whens: &[WhenBranch],
-    else_result: Option<&Expr>,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let op_val = operand.map(|e| eval_expr(e, row, ctx)).transpose()?;
-    let mut result_exprs: Vec<&Expr> = whens.iter().map(|w| &w.result).collect();
-    if let Some(e) = else_result {
-        result_exprs.push(e);
-    }
-    for branch in whens {
-        let cond = eval_expr(&branch.condition, row, ctx)?;
-        let matched = match &op_val {
-            Some(ov) => !ov.is_null() && !cond.is_null() && values_equal(ov, &cond)?,
-            None => matches!(cond, BqValue::Bool(true)),
-        };
-        if matched {
-            let val = eval_expr(&branch.result, row, ctx)?;
-            return coerce_to_expr_supertype(val, &result_exprs, row, ctx);
-        }
-    }
-    let val = else_result.map_or(Ok(BqValue::Null), |e| eval_expr(e, row, ctx))?;
-    coerce_to_expr_supertype(val, &result_exprs, row, ctx)
-}
-
-pub(in crate::executor) fn coerce_to_expr_supertype(
-    val: BqValue,
-    exprs: &[&Expr],
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    if val.is_null() {
-        return Ok(val);
-    }
-    let tys: Vec<crate::types::BqType> = exprs
-        .iter()
-        .map(|e| crate::executor::query::infer_expr_type_public(e, row, ctx))
-        .collect();
-    let Ok(super_ty) = crate::types::coercion::common_supertype(&tys) else {
-        return Ok(val);
-    };
-    let val_ty = val.infer_type()?;
-    if !matches!(super_ty, crate::types::BqType::UntypedNull)
-        && val_ty != super_ty
-        && crate::types::coercion::can_implicitly_coerce(&val_ty, &super_ty)
-    {
-        return crate::types::coercion::coerce_value(val, &super_ty);
-    }
-    Ok(val)
 }

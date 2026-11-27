@@ -7,6 +7,7 @@ mod cte;
 mod cte_refs;
 mod exec_util;
 mod from;
+mod from_unnest;
 mod governance;
 mod joins;
 mod joins_hash;
@@ -40,12 +41,15 @@ pub(in crate::executor) use from::{
 
 use agg::{execute_grouped_select_with_order, select_uses_grouping};
 use cte::eval_with_clause;
-use from::eval_from_clause_with_schema;
+use from::eval_from_clause_with_filter;
 use pipe::execute_query_with_pipes;
 use project::{has_untyped_null, project_eval_rows};
 use schema::infer_select_columns;
 use set_ops::execute_set_op;
-use sort::{apply_limit_offset, apply_order_by, apply_order_by_with_source, merge_proj_and_source};
+use sort::{
+    apply_limit_offset, apply_order_by, apply_order_by_with_source, eval_limit_offset_bounds,
+    merge_proj_and_source,
+};
 use window::{apply_windows, execute_grouped_with_windows, select_has_windows};
 
 pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
@@ -62,7 +66,7 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
         governance: ctx.governance.clone(),
     };
     if let Some(ref with) = query.with {
-        eval_with_clause(with, &mut local_ctx)?;
+        eval_with_clause(with, Some(query), &mut local_ctx)?;
     }
 
     if !query.pipe_ops.is_empty() {
@@ -90,10 +94,7 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
                 query.offset.as_ref(),
                 &local_ctx,
             )?;
-            res.rows = eval_rows
-                .into_iter()
-                .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-                .collect();
+            res.rows = eval_rows.into_iter().map(|r| r.values).collect();
         }
         Ok(res)
     }
@@ -156,11 +157,19 @@ fn execute_select_full(
     offset: Option<&Expr>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<QueryResult> {
-    let (mut rows, schema_row) = eval_from_clause_with_schema(&select.from, ctx)?;
-    if let Some(ref pred) = select.where_clause {
+    let (mut rows, schema_row, remaining_where) =
+        eval_from_clause_with_filter(&select.from, select.where_clause.as_ref(), ctx)?;
+    if !remaining_where.is_empty() {
         let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
-            if matches!(eval_expr(pred, &row, ctx)?, BqValue::Bool(true)) {
+            let mut keep = true;
+            for pred in &remaining_where {
+                if !matches!(eval_expr(pred, &row, ctx)?, BqValue::Bool(true)) {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
                 filtered.push(row);
             }
         }
@@ -178,7 +187,7 @@ fn execute_select_full(
         let (rewritten, aug_rows) = apply_windows(select, rows, ctx)?;
         let out = project_eval_rows(&rewritten, &aug_rows, ctx)?;
         let (p, s) = if need_src {
-            filter_qualify_with_src(&rewritten, out, &aug_rows, ctx)?
+            filter_qualify_with_src(&rewritten, out, aug_rows, ctx)?
         } else {
             (out, Vec::new())
         };
@@ -186,7 +195,7 @@ fn execute_select_full(
     } else {
         let out = project_eval_rows(select, &rows, ctx)?;
         let (p, s) = if need_src {
-            filter_qualify_with_src(select, out, &rows, ctx)?
+            filter_qualify_with_src(select, out, rows, ctx)?
         } else {
             drop(rows);
             (out, Vec::new())
@@ -195,25 +204,37 @@ fn execute_select_full(
     };
 
     if select.distinct {
-        let (deduped_proj, deduped_src) = dedup_eval_rows_with_sources(&projected, &qualify_src)?;
+        let (deduped_proj, deduped_src) = dedup_eval_rows_with_sources(projected, qualify_src)?;
         projected = deduped_proj;
         qualify_src = deduped_src;
     }
 
-    if !effective_order.is_empty() {
-        apply_order_by_with_source(&mut projected, &qualify_src, &effective_order, ctx)?;
+    if effective_order.is_empty() {
+        apply_limit_offset(&mut projected, limit, offset, ctx)?;
+    } else {
+        let (skip, take) = eval_limit_offset_bounds(limit, offset, ctx)?;
+        let top_k = take.map(|t| skip.saturating_add(t));
+        apply_order_by_with_source(&mut projected, &qualify_src, &effective_order, top_k, ctx)?;
+        if let Some(k) = top_k {
+            projected.truncate(k);
+        }
+        if skip > 0 {
+            projected.drain(..skip.min(projected.len()));
+        }
+        if let Some(lim) = take {
+            projected.truncate(lim);
+        }
     }
-    apply_limit_offset(&mut projected, limit, offset, ctx)?;
 
     build_select_result(select, projected, &schema_row, ctx)
 }
 
 fn dedup_eval_rows_with_sources(
-    projected: &[EvalRow],
-    qualify_src: &[EvalRow],
+    projected: Vec<EvalRow>,
+    qualify_src: Vec<EvalRow>,
 ) -> BqResult<(Vec<EvalRow>, Vec<EvalRow>)> {
-    for row in projected {
-        for col in &row.cols {
+    for row in &projected {
+        for col in row.iter_cols() {
             let ty = col.value.infer_type().unwrap_or_else(|_| col.ty.clone());
             if matches!(ty, BqType::Array(_) | BqType::Json)
                 || matches!(col.ty, BqType::Array(_) | BqType::Json)
@@ -229,19 +250,17 @@ fn dedup_eval_rows_with_sources(
     let mut out_src: Vec<EvalRow> = Vec::with_capacity(qualify_src.len());
     let mut index: std::collections::HashMap<u64, Vec<usize>> =
         std::collections::HashMap::with_capacity(projected.len());
-    let mut key_buf: Vec<BqValue> = Vec::new();
-    for (idx, prow) in projected.iter().enumerate() {
-        key_buf.clear();
-        key_buf.extend(prow.cols.iter().map(|c| c.value.clone()));
-        let h = exec_util::hash_value_slice(&key_buf);
+    let mut src_iter = qualify_src.into_iter();
+    for prow in projected {
+        let srow_opt = src_iter.next();
+        let h = exec_util::hash_value_slice(&prow.values);
         let cands = index.entry(h).or_default();
         let mut dup = false;
         for &ex_idx in cands.iter() {
             if let Some(existing) = out_proj.get(ex_idx) {
-                if existing.cols.len() == key_buf.len()
-                    && existing.cols.iter().zip(&key_buf).all(|(ec, kv)| {
-                        crate::executor::evaluator::values_distinct_eq(&ec.value, kv)
-                            .unwrap_or(false)
+                if existing.values.len() == prow.values.len()
+                    && existing.values.iter().zip(&prow.values).all(|(ev, kv)| {
+                        crate::executor::evaluator::values_distinct_eq(ev, kv).unwrap_or(false)
                     })
                 {
                     dup = true;
@@ -251,10 +270,10 @@ fn dedup_eval_rows_with_sources(
         }
         if !dup {
             let new_idx = out_proj.len();
-            out_proj.push(prow.clone());
+            out_proj.push(prow);
             cands.push(new_idx);
-            if let Some(srow) = qualify_src.get(idx) {
-                out_src.push(srow.clone());
+            if let Some(srow) = srow_opt {
+                out_src.push(srow);
             }
         }
     }
@@ -264,19 +283,19 @@ fn dedup_eval_rows_with_sources(
 pub(super) fn filter_qualify_with_src(
     select: &Select,
     projected: Vec<EvalRow>,
-    source_rows: &[EvalRow],
+    source_rows: Vec<EvalRow>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<(Vec<EvalRow>, Vec<EvalRow>)> {
     let Some(ref qualify) = select.qualify else {
-        return Ok((projected, source_rows.to_vec()));
+        return Ok((projected, source_rows));
     };
     let mut out_proj = Vec::new();
     let mut out_src = Vec::new();
-    for (proj_row, src_row) in projected.into_iter().zip(source_rows.iter()) {
-        let combined = merge_proj_and_source(&proj_row, src_row);
+    for (proj_row, src_row) in projected.into_iter().zip(source_rows) {
+        let combined = merge_proj_and_source(&proj_row, &src_row);
         if matches!(eval_expr(qualify, &combined, ctx)?, BqValue::Bool(true)) {
             out_proj.push(proj_row);
-            out_src.push(src_row.clone());
+            out_src.push(src_row);
         }
     }
     Ok((out_proj, out_src))
@@ -307,14 +326,12 @@ fn build_select_result(
         Some(SelectAsKind::Value) => {
             let mut rows = Vec::with_capacity(projected.len());
             for r in projected {
-                if r.cols.len() != 1 {
+                if r.values.len() != 1 {
                     return Err(BqError::query(
                         "SELECT AS VALUE requires exactly 1 expression",
                     ));
                 }
-                if let Some(first) = r.cols.into_iter().next() {
-                    rows.push(vec![first.value]);
-                }
+                rows.push(r.values);
             }
             let ty = rows
                 .first()
@@ -327,21 +344,35 @@ fn build_select_result(
 }
 
 fn build_tabular_result(projected: Vec<EvalRow>) -> BqResult<QueryResult> {
-    let mut cols: Vec<QueryColumn> = projected
-        .first()
-        .map(|r| {
-            r.cols
-                .iter()
-                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(first) = projected.first() else {
+        return Ok(QueryResult::new(Vec::new(), Vec::new()));
+    };
+    let all_same_schema = projected
+        .iter()
+        .skip(1)
+        .all(|r| std::sync::Arc::ptr_eq(&r.schema, &first.schema));
+    if all_same_schema {
+        let cols: Vec<QueryColumn> = first
+            .schema
+            .cols
+            .iter()
+            .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
+            .collect();
+        let rows: Vec<Vec<BqValue>> = projected.into_iter().map(|r| r.values).collect();
+        return Ok(QueryResult::new(cols, rows));
+    }
+    let mut cols: Vec<QueryColumn> = first
+        .schema
+        .cols
+        .iter()
+        .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
+        .collect();
     for (idx, col) in cols.iter_mut().enumerate() {
         for r in &projected {
-            if let Some(cell) = r.cols.get(idx) {
-                if cell.ty != col.ty {
+            if let Some(meta) = r.schema.cols.get(idx) {
+                if meta.ty != col.ty {
                     if let Ok(sup) =
-                        crate::types::coercion::common_supertype(&[col.ty.clone(), cell.ty.clone()])
+                        crate::types::coercion::common_supertype(&[col.ty.clone(), meta.ty.clone()])
                     {
                         col.ty = sup;
                     }
@@ -351,7 +382,7 @@ fn build_tabular_result(projected: Vec<EvalRow>) -> BqResult<QueryResult> {
         if has_untyped_null(&col.ty) {
             if let Some(found) = projected
                 .iter()
-                .filter_map(|r| r.cols.get(idx))
+                .filter_map(|r| r.schema.cols.get(idx))
                 .find(|c| !has_untyped_null(&c.ty))
             {
                 col.ty = found.ty.clone();
@@ -360,15 +391,15 @@ fn build_tabular_result(projected: Vec<EvalRow>) -> BqResult<QueryResult> {
     }
     let mut rows = Vec::with_capacity(projected.len());
     for r in projected {
-        let mut out_row = Vec::with_capacity(r.cols.len());
-        for (c, target_col) in r.cols.into_iter().zip(&cols) {
-            let coerced = if !c.value.is_null()
-                && c.ty != target_col.ty
-                && crate::types::coercion::can_implicitly_coerce(&c.ty, &target_col.ty)
+        let mut out_row = Vec::with_capacity(r.values.len());
+        for ((meta, val), target_col) in r.schema.cols.iter().zip(r.values).zip(&cols) {
+            let coerced = if !val.is_null()
+                && meta.ty != target_col.ty
+                && crate::types::coercion::can_implicitly_coerce(&meta.ty, &target_col.ty)
             {
-                crate::types::coercion::coerce_value(c.value, &target_col.ty)?
+                crate::types::coercion::coerce_value(val, &target_col.ty)?
             } else {
-                c.value
+                val
             };
             out_row.push(coerced);
         }

@@ -81,8 +81,7 @@ fn infer_select_columns_from_from(
     let mut acc = EvalRow::default();
     for twj in &select.from {
         let part = infer_table_factor_schema(&twj.relation, None, ctx)?;
-        acc.cols.extend(part.cols);
-        acc.pseudo_cols.extend(part.pseudo_cols);
+        acc = super::joins::combine_rows(&acc, &part);
         for j in &twj.joins {
             let r = infer_table_factor_schema(&j.relation, Some(&acc), ctx)?;
             acc = combine_rows_for_constraint(&acc, &r, &j.constraint);
@@ -157,7 +156,7 @@ fn expand_schema_wildcard(
     let qual_str = qualifier.and_then(|q| q.normalized_parts().last().cloned());
     let mut matched_any = false;
     if let Some(ref qs) = qual_str {
-        for col in &schema_row.pseudo_cols {
+        for col in &schema_row.schema.pseudo_cols {
             if !col.name.starts_with("_PARTITION")
                 && col
                     .qualifier
@@ -177,7 +176,7 @@ fn expand_schema_wildcard(
         }
     }
     if !matched_any {
-        for col in &schema_row.cols {
+        for col in &schema_row.schema.cols {
             if col.name.starts_with("__win_") {
                 continue;
             }
@@ -390,7 +389,7 @@ fn infer_table_ref_schema(
         if let Some((tbl_name, meta)) = ds.tables.iter().find(|(k, _)| k.starts_with(prefix)) {
             let qual = alias.unwrap_or(tbl_name.as_str());
             let mut row = infer_concrete_table_schema(meta, Some(qual), ctx)?;
-            row.cols.push(RowBinding {
+            row.push_binding(RowBinding {
                 qualifier: Some(std::sync::Arc::from(qual)),
                 name: std::sync::Arc::from("_TABLE_SUFFIX"),
                 ty: BqType::String,
@@ -449,15 +448,10 @@ fn infer_concrete_table_schema(
 }
 
 pub(super) fn null_out_eval_row(row: &EvalRow) -> EvalRow {
-    let zero = |c: &RowBinding| RowBinding {
-        qualifier: c.qualifier.clone(),
-        name: c.name.clone(),
-        ty: c.ty.clone(),
-        value: BqValue::Null,
-    };
-    EvalRow::with_pseudo(
-        row.cols.iter().map(zero).collect(),
-        row.pseudo_cols.iter().map(zero).collect(),
+    EvalRow::from_schema_with_pseudo(
+        std::sync::Arc::clone(&row.schema),
+        vec![BqValue::Null; row.values.len()],
+        vec![BqValue::Null; row.pseudo_values.len()],
     )
 }
 

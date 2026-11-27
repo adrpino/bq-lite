@@ -4,7 +4,7 @@ use crate::ast::{
     Expr, GroupByClause, GroupByItem, Ident, Literal, OrderByExpr, Select, SelectItem,
 };
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext, RowBinding};
+use crate::executor::context::{EvalRow, ExecContext};
 use crate::types::BqType;
 
 use super::agg::{expr_has_aggregate, GroupedBucket, GroupedKeys};
@@ -118,7 +118,7 @@ pub(super) fn expand_group_by(
                             .as_ref()
                             .and_then(|q| q.parts.last())
                             .map(|i| &i.value);
-                        for col in &schema_row.cols {
+                        for col in &schema_row.schema.cols {
                             if col.name.starts_with("__win_") {
                                 continue;
                             }
@@ -448,15 +448,7 @@ pub(super) fn attach_grouped_order_by(
         }
         if evaluated_all {
             let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
-            for (srow, val) in src_rows.iter_mut().zip(vals) {
-                let ty = val.infer_type().unwrap_or(BqType::UntypedNull);
-                srow.cols.push(RowBinding {
-                    qualifier: None,
-                    name: col_arc.clone(),
-                    ty,
-                    value: val,
-                });
-            }
+            let _ = EvalRow::append_column_batch(src_rows, &col_arc, vals);
             rewritten.push(OrderByExpr {
                 expr: Expr::Ident(Ident::unquoted(col_name)),
                 asc: ob.asc,

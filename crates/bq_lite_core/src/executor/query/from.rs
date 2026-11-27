@@ -5,20 +5,23 @@ use chrono::{DateTime, Utc};
 use crate::ast::{TableFactor, TableWithJoins};
 use crate::catalog::TableKind;
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext, RowBinding};
+use crate::executor::context::{ColMeta, EvalRow, ExecContext, RowSchema};
 use crate::executor::evaluator::eval_expr;
 use crate::executor::query::execute_query;
 use crate::types::{BqType, BqValue};
 
+pub(super) use super::from_unnest::eval_unnest;
+use super::from_unnest::{
+    can_push_where_to_first_table, eval_wildcard_tables, split_pushable_where,
+    try_eval_unnest_cross_direct,
+};
 use super::governance::{
     apply_tablesample, derived_query_to_eval_rows, mask_row_columns, policy_matches_session,
-    unpack_null_struct_unnest, unpack_struct_unnest,
 };
 use super::joins::{combine_rows, eval_join_with_schema};
 use super::pivot::{apply_pivot, apply_unpivot};
 use super::schema::{infer_table_factor_schema, null_out_eval_row};
 use super::tvf::eval_table_function;
-use super::type_infer::infer_expr_type;
 
 pub(in crate::executor) fn eval_from_clause(
     from: &[TableWithJoins],
@@ -31,36 +34,76 @@ pub(super) fn eval_from_clause_with_schema(
     from: &[TableWithJoins],
     ctx: &ExecContext<'_>,
 ) -> BqResult<(Vec<EvalRow>, EvalRow)> {
+    let (rows, schema, _) = eval_from_clause_with_filter(from, None, ctx)?;
+    Ok((rows, schema))
+}
+
+type FromFilterOut<'a> = (Vec<EvalRow>, EvalRow, Vec<&'a crate::ast::Expr>);
+type CachedPairSchema = Option<(Arc<RowSchema>, Arc<RowSchema>, Arc<RowSchema>)>;
+
+pub(super) fn eval_from_clause_with_filter<'a>(
+    from: &[TableWithJoins],
+    where_clause: Option<&'a crate::ast::Expr>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<FromFilterOut<'a>> {
     if from.is_empty() {
-        return Ok((vec![EvalRow::default()], EvalRow::default()));
+        let rem = where_clause.into_iter().collect();
+        return Ok((vec![EvalRow::default()], EvalRow::default(), rem));
     }
-    let (mut rows, mut schema) = eval_table_with_joins_first(from.first(), ctx)?;
+    let push_where = where_clause.filter(|_| can_push_where_to_first_table(from));
+    let (mut rows, mut schema, remaining) =
+        eval_table_with_joins_first(from.first(), push_where, where_clause, ctx)?;
     for item in from.iter().skip(1) {
         let (next_rows, next_schema) = cross_join_table_with_joins(&rows, &schema, item, ctx)?;
         rows = next_rows;
         schema = next_schema;
     }
-    Ok((rows, schema))
+    Ok((rows, schema, remaining))
 }
 
-fn eval_table_with_joins_first(
+fn eval_table_with_joins_first<'a>(
     twj: Option<&TableWithJoins>,
+    push_where: Option<&'a crate::ast::Expr>,
+    orig_where: Option<&'a crate::ast::Expr>,
     ctx: &ExecContext<'_>,
-) -> BqResult<(Vec<EvalRow>, EvalRow)> {
+) -> BqResult<FromFilterOut<'a>> {
     let Some(item) = twj else {
-        return Ok((vec![EvalRow::default()], EvalRow::default()));
+        let rem = orig_where.into_iter().collect();
+        return Ok((vec![EvalRow::default()], EvalRow::default(), rem));
     };
     let mut rows = eval_table_factor(&item.relation, None, ctx)?;
     let mut schema = rows
         .first()
         .map(null_out_eval_row)
         .map_or_else(|| infer_table_factor_schema(&item.relation, None, ctx), Ok)?;
+    let remaining = if let Some(pred) = push_where {
+        let (pushable, rem) = split_pushable_where(pred, &schema);
+        if !pushable.is_empty() {
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut ok = true;
+                for p in &pushable {
+                    if !matches!(eval_expr(p, &row, ctx)?, BqValue::Bool(true)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    kept.push(row);
+                }
+            }
+            rows = kept;
+        }
+        rem
+    } else {
+        orig_where.into_iter().collect()
+    };
     for join in &item.joins {
         let (next_rows, next_schema) = eval_join_with_schema(&rows, &schema, join, ctx)?;
         rows = next_rows;
         schema = next_schema;
     }
-    Ok((rows, schema))
+    Ok((rows, schema, remaining))
 }
 
 fn cross_join_table_with_joins(
@@ -90,20 +133,57 @@ pub(super) fn eval_correlated_cross_or_factor(
             .first()
             .is_some_and(|l| is_correlated_table_array_path(factor, l));
     if is_corr_path {
+        if let Some(direct) = try_eval_unnest_cross_direct(left_rows, factor, ctx)? {
+            return Ok(direct);
+        }
         let mut out = Vec::new();
+        let mut cached_pair: CachedPairSchema = None;
         for lrow in left_rows {
             let unnested = eval_table_factor(factor, Some(lrow), ctx)?;
             for urow in unnested {
-                out.push(combine_rows(lrow, &urow));
+                let schema = match &cached_pair {
+                    Some((ls, rs, cs))
+                        if Arc::ptr_eq(ls, &lrow.schema) && Arc::ptr_eq(rs, &urow.schema) =>
+                    {
+                        Arc::clone(cs)
+                    }
+                    _ => {
+                        let cs = RowSchema::concat(&lrow.schema, &urow.schema);
+                        cached_pair = Some((
+                            Arc::clone(&lrow.schema),
+                            Arc::clone(&urow.schema),
+                            Arc::clone(&cs),
+                        ));
+                        cs
+                    }
+                };
+                out.push(EvalRow::combine_with_schema(lrow, &urow, schema));
             }
         }
         return Ok(out);
     }
     let right_rows = eval_table_factor(factor, None, ctx)?;
     let mut out = Vec::with_capacity(left_rows.len() * right_rows.len());
+    let shared_schema = left_rows
+        .first()
+        .zip(right_rows.first())
+        .map(|(l, r)| RowSchema::concat(&l.schema, &r.schema));
     for lrow in left_rows {
         for rrow in &right_rows {
-            out.push(combine_rows(lrow, rrow));
+            let schema = match &shared_schema {
+                Some(cs)
+                    if left_rows
+                        .first()
+                        .is_some_and(|l0| Arc::ptr_eq(&l0.schema, &lrow.schema))
+                        && right_rows
+                            .first()
+                            .is_some_and(|r0| Arc::ptr_eq(&r0.schema, &rrow.schema)) =>
+                {
+                    Arc::clone(cs)
+                }
+                _ => RowSchema::concat(&lrow.schema, &rrow.schema),
+            };
+            out.push(EvalRow::combine_with_schema(lrow, rrow, schema));
         }
     }
     Ok(out)
@@ -119,7 +199,7 @@ fn is_correlated_table_array_path(factor: &TableFactor, lrow: &EvalRow) -> bool 
     let Some(first) = name.parts.first() else {
         return false;
     };
-    let has_qual = lrow.cols.iter().any(|c| {
+    let has_qual = lrow.schema.cols.iter().any(|c| {
         c.qualifier
             .as_deref()
             .is_some_and(|q| q.eq_ignore_ascii_case(&first.value))
@@ -145,27 +225,14 @@ pub(super) fn eval_table_factor(
             alias,
             system_time,
             tablesample_percent,
-        } => {
-            if name.parts.len() >= 2 && (corr_row.is_some() || !ctx.outer_rows.is_empty()) {
-                let path_expr = crate::ast::Expr::CompoundIdent(name.parts.clone());
-                let empty = EvalRow::default();
-                if let Ok(BqValue::Array(_) | BqValue::Null) =
-                    eval_expr(&path_expr, corr_row.unwrap_or(&empty), ctx)
-                {
-                    return eval_unnest(&path_expr, alias.as_ref(), None, corr_row, ctx);
-                }
-            }
-            let rows = eval_table_ref(
-                name,
-                alias.as_ref().map(|a| a.value.as_str()),
-                system_time.as_ref(),
-                ctx,
-            )?;
-            match tablesample_percent {
-                Some(pct) => apply_tablesample(rows, pct, ctx),
-                None => Ok(rows),
-            }
-        }
+        } => eval_table_factor_table(
+            name,
+            alias.as_ref(),
+            system_time.as_ref(),
+            tablesample_percent.as_deref(),
+            corr_row,
+            ctx,
+        ),
         TableFactor::Derived { query, alias } => {
             let qr = execute_query(query, ctx)?;
             Ok(derived_query_to_eval_rows(
@@ -217,7 +284,33 @@ pub(super) fn eval_table_factor(
         TableFactor::TableFunction { name, args, alias } => {
             eval_table_function(name, args, alias.as_ref().map(|a| a.value.as_str()), ctx)
         }
-        TableFactor::NestedJoin(twj) => Ok(eval_table_with_joins_first(Some(twj), ctx)?.0),
+        TableFactor::NestedJoin(twj) => {
+            Ok(eval_table_with_joins_first(Some(twj), None, None, ctx)?.0)
+        }
+    }
+}
+
+fn eval_table_factor_table(
+    name: &crate::ast::ObjectName,
+    alias: Option<&crate::ast::Ident>,
+    system_time: Option<&crate::ast::Expr>,
+    tablesample_percent: Option<&crate::ast::Expr>,
+    corr_row: Option<&EvalRow>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<EvalRow>> {
+    if name.parts.len() >= 2 && (corr_row.is_some() || !ctx.outer_rows.is_empty()) {
+        let path_expr = crate::ast::Expr::CompoundIdent(name.parts.clone());
+        let empty = EvalRow::default();
+        if let Ok(BqValue::Array(_) | BqValue::Null) =
+            eval_expr(&path_expr, corr_row.unwrap_or(&empty), ctx)
+        {
+            return eval_unnest(&path_expr, alias, None, corr_row, ctx);
+        }
+    }
+    let rows = eval_table_ref(name, alias.map(|a| a.value.as_str()), system_time, ctx)?;
+    match tablesample_percent {
+        Some(pct) => apply_tablesample(rows, pct, ctx),
+        None => Ok(rows),
     }
 }
 
@@ -260,50 +353,34 @@ fn eval_table_ref(
     eval_concrete_table(&tref, alias, system_time, ctx)
 }
 
-fn eval_wildcard_tables(
-    tref: &crate::catalog::TableRef,
-    prefix: &str,
-    alias: Option<&str>,
-    ctx: &ExecContext<'_>,
-) -> BqResult<Vec<EvalRow>> {
-    let ds = ctx.catalog.get_dataset(&tref.project, &tref.dataset)?;
-    let mut all_rows = Vec::new();
-    for (tbl_name, meta) in &ds.tables {
-        let Some(suffix) = tbl_name.strip_prefix(prefix) else {
-            continue;
-        };
-        let concrete_ref = crate::catalog::TableRef::new(&tref.project, &tref.dataset, tbl_name);
-        let qual_arc: Option<Arc<str>> = Some(Arc::from(alias.unwrap_or(tbl_name)));
-        let col_names: Vec<Arc<str>> = meta
-            .columns
-            .iter()
-            .map(|c| Arc::from(c.name.as_str()))
-            .collect();
-        let suffix_name: Arc<str> = Arc::from("_TABLE_SUFFIX");
-        let (_, rows_iter) = ctx.storage.iter_rows(&concrete_ref);
-        for (row, _) in rows_iter {
-            let mut cols: Vec<RowBinding> = meta
-                .columns
-                .iter()
-                .zip(&col_names)
-                .zip(row)
-                .map(|((col, cname), val)| RowBinding {
-                    qualifier: qual_arc.clone(),
-                    name: cname.clone(),
-                    ty: col.ty.clone(),
-                    value: val.clone(),
-                })
-                .collect();
-            cols.push(RowBinding {
+fn build_concrete_schema(meta: &crate::catalog::TableMeta, qual: &str) -> Arc<RowSchema> {
+    let qual_arc: Option<Arc<str>> = Some(Arc::from(qual));
+    let cols: Vec<ColMeta> = meta
+        .columns
+        .iter()
+        .map(|c| ColMeta {
+            qualifier: qual_arc.clone(),
+            name: Arc::from(c.name.as_str()),
+            ty: c.ty.clone(),
+        })
+        .collect();
+    let pseudo_cols = if meta.partition_by.is_some() {
+        vec![
+            ColMeta {
                 qualifier: qual_arc.clone(),
-                name: suffix_name.clone(),
-                ty: BqType::String,
-                value: BqValue::String(suffix.to_owned()),
-            });
-            all_rows.push(EvalRow::new(cols));
-        }
-    }
-    Ok(all_rows)
+                name: Arc::from("_PARTITIONTIME"),
+                ty: BqType::Timestamp,
+            },
+            ColMeta {
+                qualifier: qual_arc,
+                name: Arc::from("_PARTITIONDATE"),
+                ty: BqType::Date,
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+    Arc::new(RowSchema::new(cols, pseudo_cols))
 }
 
 fn eval_concrete_table(
@@ -327,19 +404,14 @@ fn eval_concrete_table(
         .ok()
         .and_then(|ds| ds.policies.get(&meta.name))
         .filter(|list| !list.is_empty());
-    let qual_arc: Option<Arc<str>> = Some(Arc::from(qual));
-    let col_names: Vec<Arc<str>> = meta
-        .columns
-        .iter()
-        .map(|c| Arc::from(c.name.as_str()))
-        .collect();
-    let names_pair = (&qual_arc, col_names.as_slice());
+    let schema = build_concrete_schema(meta, qual);
 
     if meta.kind == TableKind::Table && system_time.is_none() {
         let (row_count, rows_iter) = ctx.storage.iter_rows(tref);
         let mut out = Vec::with_capacity(row_count);
         for (row, ing_ts) in rows_iter {
-            let eval_row = build_concrete_eval_row(meta, names_pair, row.clone(), ing_ts, ctx);
+            let eval_row =
+                build_concrete_eval_row(meta, Arc::clone(&schema), row.clone(), ing_ts, ctx);
             if check_row_policies(&eval_row, policies, ctx)? {
                 out.push(eval_row);
             }
@@ -357,7 +429,8 @@ fn eval_concrete_table(
     };
     let mut out = Vec::with_capacity(owned_rows.len());
     for row in owned_rows {
-        let eval_row = build_concrete_eval_row(meta, names_pair, row, meta.created_at, ctx);
+        let eval_row =
+            build_concrete_eval_row(meta, Arc::clone(&schema), row, meta.created_at, ctx);
         if check_row_policies(&eval_row, policies, ctx)? {
             out.push(eval_row);
         }
@@ -389,109 +462,23 @@ fn check_row_policies(
 
 fn build_concrete_eval_row(
     meta: &crate::catalog::TableMeta,
-    names: (&Option<Arc<str>>, &[Arc<str>]),
+    schema: Arc<RowSchema>,
     mut row: Vec<BqValue>,
     ing_ts: DateTime<Utc>,
     ctx: &ExecContext<'_>,
 ) -> EvalRow {
-    let (qual_arc, col_names) = names;
-    mask_row_columns(&meta.columns, &mut row, ctx);
-    let cols = meta
-        .columns
-        .iter()
-        .zip(col_names)
-        .zip(row)
-        .map(|((col, cname), val)| RowBinding {
-            qualifier: qual_arc.clone(),
-            name: cname.clone(),
-            ty: col.ty.clone(),
-            value: val,
-        })
-        .collect();
-    let pseudo = if meta.partition_by.is_some() {
+    if ctx.governance.enforce_column_masking {
+        mask_row_columns(&meta.columns, &mut row, ctx);
+    }
+    let pseudo_values = if meta.partition_by.is_some() {
         let part_date = ing_ts.date_naive();
         let part_ts = DateTime::<Utc>::from_naive_utc_and_offset(
             part_date.and_hms_opt(0, 0, 0).unwrap_or_default(),
             Utc,
         );
-        vec![
-            RowBinding {
-                qualifier: qual_arc.clone(),
-                name: Arc::from("_PARTITIONTIME"),
-                ty: BqType::Timestamp,
-                value: BqValue::Timestamp(part_ts),
-            },
-            RowBinding {
-                qualifier: qual_arc.clone(),
-                name: Arc::from("_PARTITIONDATE"),
-                ty: BqType::Date,
-                value: BqValue::Date(part_date),
-            },
-        ]
+        vec![BqValue::Timestamp(part_ts), BqValue::Date(part_date)]
     } else {
         Vec::new()
     };
-    EvalRow::with_pseudo(cols, pseudo)
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "UNNEST accepts Null or Array"
-)]
-pub(super) fn eval_unnest(
-    expr: &crate::ast::Expr,
-    alias: Option<&crate::ast::Ident>,
-    with_offset: Option<&Option<crate::ast::Ident>>,
-    corr_row: Option<&EvalRow>,
-    ctx: &ExecContext<'_>,
-) -> BqResult<Vec<EvalRow>> {
-    let empty_row = EvalRow::default();
-    let row_ref = corr_row.unwrap_or(&empty_row);
-    let val = eval_expr(expr, row_ref, ctx)?;
-    let items = match val {
-        BqValue::Null => Vec::new(),
-        BqValue::Array(items) => items,
-        other => {
-            return Err(BqError::query(format!(
-                "UNNEST expects an ARRAY argument, got {}",
-                other.infer_type()?
-            )))
-        }
-    };
-    let elem_name: Arc<str> = Arc::from(alias.map_or("f0_", |a| a.value.as_str()));
-    let qual_arc: Option<Arc<str>> = alias.map(|a| Arc::from(a.value.as_str()));
-    let offset_arc: Option<Arc<str>> = with_offset
-        .map(|opt_alias| Arc::from(opt_alias.as_ref().map_or("offset", |a| a.value.as_str())));
-    let static_elem_ty = match infer_expr_type(expr, row_ref, ctx) {
-        BqType::Array(inner) => Some(*inner),
-        _ => None,
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for (idx, item) in items.into_iter().enumerate() {
-        let ty = item.infer_type()?;
-        let (mut cols, pseudo) = match (&item, &static_elem_ty) {
-            (BqValue::Struct(fields), _) => unpack_struct_unnest(fields, alias, &item, &ty),
-            (BqValue::Null, Some(BqType::Struct(sf))) => unpack_null_struct_unnest(sf, alias),
-            _ => (
-                vec![RowBinding {
-                    qualifier: qual_arc.clone(),
-                    name: elem_name.clone(),
-                    ty,
-                    value: item,
-                }],
-                Vec::new(),
-            ),
-        };
-        if let Some(ref offset_name) = offset_arc {
-            let off_val = i64::try_from(idx).unwrap_or(i64::MAX);
-            cols.push(RowBinding {
-                qualifier: None,
-                name: offset_name.clone(),
-                ty: BqType::Int64,
-                value: BqValue::Int64(off_val),
-            });
-        }
-        out.push(EvalRow::with_pseudo(cols, pseudo));
-    }
-    Ok(out)
+    EvalRow::from_schema_with_pseudo(schema, row, pseudo_values)
 }

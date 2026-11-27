@@ -252,7 +252,9 @@ fn exec_update(
                 }
                 let mut ret_row = row_to_eval(&meta, &updated, &qual);
                 if let Some(frow) = matched_from {
-                    ret_row.cols.extend(frow.cols);
+                    let schema =
+                        crate::executor::context::RowSchema::concat(&ret_row.schema, &frow.schema);
+                    ret_row = EvalRow::combine_with_schema(&ret_row, &frow, schema);
                 }
                 returned_evals.push(ret_row);
                 out_rows.push(updated);
@@ -297,9 +299,8 @@ fn find_update_match(
     }
     let mut found: Option<(EvalRow, Option<EvalRow>)> = None;
     for frow in from_rows {
-        let mut combined_cols = base.cols.clone();
-        combined_cols.extend(frow.cols.iter().cloned());
-        let combined = EvalRow::new(combined_cols);
+        let schema = crate::executor::context::RowSchema::concat(&base.schema, &frow.schema);
+        let combined = EvalRow::combine_with_schema(base, frow, schema);
         let matched = match where_clause {
             Some(pred) => matches!(eval_expr(pred, &combined, ctx)?, BqValue::Bool(true)),
             None => true,
@@ -387,9 +388,8 @@ fn matches_delete_row(
         });
     }
     for urow in using_rows {
-        let mut combined_cols = base.cols.clone();
-        combined_cols.extend(urow.cols.iter().cloned());
-        let combined = EvalRow::new(combined_cols);
+        let schema = crate::executor::context::RowSchema::concat(&base.schema, &urow.schema);
+        let combined = EvalRow::combine_with_schema(base, urow, schema);
         let matched = match where_clause {
             Some(pred) => matches!(eval_expr(pred, &combined, ctx)?, BqValue::Bool(true)),
             None => true,

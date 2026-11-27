@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 
 use crate::ast::{BinaryOp, Expr, Join, JoinConstraint, JoinKind};
 use crate::error::BqResult;
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::{EvalRow, ExecContext, RowSchema};
 use crate::executor::evaluator::eval_expr;
 use crate::types::BqValue;
 
@@ -91,6 +92,8 @@ fn probe_hash_join(
 ) -> BqResult<Option<Vec<EvalRow>>> {
     let left_null = super::schema::null_out_eval_row(left_schema);
     let right_null = super::schema::null_out_eval_row(right_schema);
+    let shared_schema = (!matches!(join.constraint, JoinConstraint::Using(_)))
+        .then(|| RowSchema::concat(&left_schema.schema, &right_schema.schema));
     let mut right_matched = vec![false; right_rows.len()];
     let mut out = Vec::new();
 
@@ -103,7 +106,13 @@ fn probe_hash_join(
                         let Some(rrow) = right_rows.get(r_idx) else {
                             continue;
                         };
-                        if let Some(joined) = try_join_pair(lrow, rrow, &join.constraint, ctx)? {
+                        let pair_schema = shared_schema.as_ref().filter(|_| {
+                            Arc::ptr_eq(&lrow.schema, &left_schema.schema)
+                                && Arc::ptr_eq(&rrow.schema, &right_schema.schema)
+                        });
+                        if let Some(joined) =
+                            try_join_pair(lrow, rrow, &join.constraint, pair_schema, ctx)?
+                        {
                             l_matched = true;
                             if let Some(slot) = right_matched.get_mut(r_idx) {
                                 *slot = true;

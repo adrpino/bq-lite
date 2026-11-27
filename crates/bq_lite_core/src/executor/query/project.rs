@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::ast::{Expr, ObjectName, Select, SelectItem};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext, RowBinding};
+use crate::executor::context::{ColMeta, EvalRow, ExecContext, RowBinding, RowSchema};
 use crate::executor::evaluator::{eval_expr, infer_expr_col_name};
 use crate::types::{BqType, BqValue};
 
@@ -34,10 +34,28 @@ pub(in crate::executor) fn project_eval_rows(
             SelectItem::Wildcard { .. } => None,
         })
         .collect();
+    let has_wildcard_or_star = select.projection.iter().any(|i| match i {
+        SelectItem::Wildcard { .. } => true,
+        SelectItem::Expr { expr, .. } => matches!(expr.as_ref(), Expr::ExprStar(_)),
+    });
+    if !has_wildcard_or_star {
+        return project_simple_rows(select, &proj_names, rows, ctx);
+    }
+    project_wildcard_rows(select, &proj_names, rows, ctx)
+}
+
+fn project_wildcard_rows(
+    select: &Select,
+    proj_names: &[Option<Arc<str>>],
+    rows: &[EvalRow],
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<EvalRow>> {
     let mut out = Vec::with_capacity(rows.len());
+    let mut cached_schema: Option<Arc<RowSchema>> = None;
     for row in rows {
-        let mut cols = Vec::with_capacity(select.projection.len());
-        for (item, pre_name) in select.projection.iter().zip(&proj_names) {
+        let cap = select.projection.len().max(row.col_len());
+        let mut cols = Vec::with_capacity(cap);
+        for (item, pre_name) in select.projection.iter().zip(proj_names) {
             match item {
                 SelectItem::Expr { expr, .. } => {
                     if let Expr::ExprStar(inner) = expr.as_ref() {
@@ -70,9 +88,103 @@ pub(in crate::executor) fn project_eval_rows(
                 }
             }
         }
-        out.push(EvalRow::new(cols));
+        let matches_cached =
+            cached_schema.as_ref().is_some_and(|cs| {
+                cs.cols.len() == cols.len()
+                    && cs.cols.iter().zip(&cols).all(|(m, b)| {
+                        m.name == b.name && m.ty == b.ty && m.qualifier == b.qualifier
+                    })
+            });
+        if matches_cached {
+            if let Some(ref cs) = cached_schema {
+                let vals = cols.into_iter().map(|b| b.value).collect();
+                out.push(EvalRow::from_schema(Arc::clone(cs), vals));
+                continue;
+            }
+        }
+        let eval_row = EvalRow::new(cols);
+        if cached_schema.is_none() {
+            cached_schema = Some(Arc::clone(&eval_row.schema));
+        }
+        out.push(eval_row);
     }
     Ok(out)
+}
+
+fn project_simple_rows(
+    select: &Select,
+    proj_names: &[Option<Arc<str>>],
+    rows: &[EvalRow],
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<EvalRow>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut base_schema: Option<Arc<RowSchema>> = None;
+    let ncols = select.projection.len();
+    for row in rows {
+        let mut vals = Vec::with_capacity(ncols);
+        for item in &select.projection {
+            if let SelectItem::Expr { expr, .. } = item {
+                vals.push(eval_expr(expr, row, ctx)?);
+            }
+        }
+        if let Some(ref schema) = base_schema {
+            if schema
+                .cols
+                .iter()
+                .zip(&vals)
+                .all(|(meta, val)| value_matches_primitive_type(val, &meta.ty))
+            {
+                out.push(EvalRow::from_schema(Arc::clone(schema), vals));
+                continue;
+            }
+        }
+        let mut metas = Vec::with_capacity(ncols);
+        for ((item, pre_name), val) in select.projection.iter().zip(proj_names).zip(&vals) {
+            if let SelectItem::Expr { expr, .. } = item {
+                let raw_ty = val.infer_type()?;
+                let ty = if has_untyped_null(&raw_ty) {
+                    merge_inferred_type(raw_ty, infer_expr_type(expr, row, ctx))
+                } else {
+                    raw_ty
+                };
+                let name = pre_name.clone().unwrap_or_else(|| Arc::from("f0_"));
+                metas.push(ColMeta {
+                    qualifier: None,
+                    name,
+                    ty,
+                });
+            }
+        }
+        let schema = RowSchema::from_cols(metas);
+        if base_schema.is_none() {
+            base_schema = Some(Arc::clone(&schema));
+        }
+        out.push(EvalRow::from_schema(schema, vals));
+    }
+    Ok(out)
+}
+
+const fn value_matches_primitive_type(val: &BqValue, ty: &BqType) -> bool {
+    matches!(
+        (val, ty),
+        (BqValue::Null, t) if !matches!(t, BqType::UntypedNull)
+    ) || matches!(
+        (val, ty),
+        (BqValue::Bool(_), BqType::Bool)
+            | (BqValue::Int64(_), BqType::Int64)
+            | (BqValue::Float64(_), BqType::Float64)
+            | (BqValue::Numeric(_), BqType::Numeric)
+            | (BqValue::BigNumeric(_), BqType::BigNumeric)
+            | (BqValue::String(_), BqType::String)
+            | (BqValue::Bytes(_), BqType::Bytes)
+            | (BqValue::Date(_), BqType::Date)
+            | (BqValue::Datetime(_), BqType::Datetime)
+            | (BqValue::Time(_), BqType::Time)
+            | (BqValue::Timestamp(_), BqType::Timestamp)
+            | (BqValue::Interval(_), BqType::Interval)
+            | (BqValue::Json(_), BqType::Json)
+            | (BqValue::Geography(_), BqType::Geography)
+    )
 }
 
 pub(super) fn expand_struct_star_value(
@@ -161,42 +273,30 @@ fn expand_wildcard(
     let qual_str = qualifier.and_then(|q| q.normalized_parts().last().cloned());
     let mut matched_any = false;
     if let Some(ref qs) = qual_str {
-        for col in &row.pseudo_cols {
+        for col in row.iter_pseudo() {
             if col.name.starts_with("_PARTITION") {
                 continue;
             }
-            if col
-                .qualifier
-                .as_deref()
-                .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
-            {
+            if col.qualifier.is_some_and(|cq| cq.eq_ignore_ascii_case(qs)) {
                 matched_any = true;
-                push_expanded_binding(
-                    &col.name, &col.ty, &col.value, row, except, replace, ctx, out,
-                )?;
+                push_expanded_binding(col.name, col.ty, col.value, row, except, replace, ctx, out)?;
             }
         }
         if matched_any {
             return Ok(());
         }
     }
-    for col in &row.cols {
+    for col in row.iter_cols() {
         if col.name.starts_with("__win_") {
             continue;
         }
         if let Some(ref qs) = qual_str {
-            if !col
-                .qualifier
-                .as_deref()
-                .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
-            {
+            if !col.qualifier.is_some_and(|cq| cq.eq_ignore_ascii_case(qs)) {
                 continue;
             }
         }
         matched_any = true;
-        push_expanded_binding(
-            &col.name, &col.ty, &col.value, row, except, replace, ctx, out,
-        )?;
+        push_expanded_binding(col.name, col.ty, col.value, row, except, replace, ctx, out)?;
     }
     if !matched_any {
         if let Some(q) = qualifier {
@@ -291,11 +391,12 @@ fn build_struct_eval_row(
         let fname = sf.name.clone().unwrap_or_else(|| format!("f{i}_"));
         let fty = sf.value.infer_type()?;
         if !struct_row
+            .schema
             .cols
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(&fname))
         {
-            struct_row.cols.push(RowBinding {
+            struct_row.push_binding(RowBinding {
                 qualifier: None,
                 name: Arc::from(fname),
                 ty: fty,

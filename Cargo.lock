@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "bq-lite-core"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "bq-lite-server"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "bq-lite-test-support"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "bq-lite-core",
 ]

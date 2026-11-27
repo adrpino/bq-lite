@@ -61,7 +61,8 @@ fn eval_pivot_values(
 fn collect_pivot_group_cols(sample: Option<&EvalRow>, spec: &PivotSpec) -> Vec<String> {
     sample
         .map(|r| {
-            r.cols
+            r.schema
+                .cols
                 .iter()
                 .filter(|c| {
                     !expr_mentions(&spec.for_expr, &c.name)
@@ -275,12 +276,11 @@ fn base_unpivot_cols(
     alias: Option<&str>,
 ) -> Vec<RowBinding> {
     let qual_arc: Option<std::sync::Arc<str>> = alias.map(std::sync::Arc::from);
-    row.cols
-        .iter()
+    row.iter_cols()
         .filter(|c| !excluded.contains(&c.name.to_ascii_lowercase()))
         .map(|c| RowBinding {
             qualifier: qual_arc.clone(),
-            name: c.name.clone(),
+            name: std::sync::Arc::clone(c.name),
             ty: c.ty.clone(),
             value: c.value.clone(),
         })
@@ -303,7 +303,7 @@ fn build_unpivot_row(
         let b = row
             .resolve_ident(&sc.value)?
             .ok_or_else(|| BqError::query(format!("Column '{}' not found in UNPIVOT", sc.value)))?;
-        vals.push(b.clone());
+        vals.push(b);
     }
     if !spec.include_nulls && vals.iter().all(|b| b.value.is_null()) {
         return Ok(None);
@@ -314,8 +314,8 @@ fn build_unpivot_row(
         new_cols.push(RowBinding {
             qualifier: qual_arc.clone(),
             name: std::sync::Arc::from(dst_ident.value.as_str()),
-            ty: src_binding.ty,
-            value: src_binding.value,
+            ty: src_binding.ty.clone(),
+            value: src_binding.value.clone(),
         });
     }
     let label = match label_expr {
