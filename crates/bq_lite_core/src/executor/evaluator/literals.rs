@@ -276,3 +276,61 @@ fn check_decimal_precision(raw: &str, precision: u32, scale: u32, name: &str) ->
     }
     Ok(())
 }
+
+/// Zero-allocation equality fast-path for matching non-composite `BqValue` variants.
+#[expect(
+    clippy::float_cmp,
+    reason = "SQL Float64 equality uses IEEE-754 semantics"
+)]
+pub(super) fn try_fast_sql_equal(a: &BqValue, b: &BqValue) -> Option<bool> {
+    match (a, b) {
+        (BqValue::Bool(x), BqValue::Bool(y)) => Some(x == y),
+        (BqValue::Int64(x), BqValue::Int64(y)) => Some(x == y),
+        (BqValue::Float64(x), BqValue::Float64(y)) => Some(x == y),
+        (BqValue::Numeric(x), BqValue::Numeric(y)) => Some(x == y),
+        (BqValue::BigNumeric(x), BqValue::BigNumeric(y)) => Some(x == y),
+        (BqValue::String(x), BqValue::String(y))
+        | (BqValue::Geography(x), BqValue::Geography(y)) => Some(x == y),
+        (BqValue::Bytes(x), BqValue::Bytes(y)) => Some(x == y),
+        (BqValue::Date(x), BqValue::Date(y)) => Some(x == y),
+        (BqValue::Datetime(x), BqValue::Datetime(y)) => Some(x == y),
+        (BqValue::Time(x), BqValue::Time(y)) => Some(x == y),
+        (BqValue::Timestamp(x), BqValue::Timestamp(y)) => Some(x == y),
+        (BqValue::Interval(x), BqValue::Interval(y)) => {
+            Some(interval_sort_key(*x) == interval_sort_key(*y))
+        }
+        (BqValue::Range(x), BqValue::Range(y)) if x.elem_type == y.elem_type => Some(x == y),
+        (BqValue::Json(x), BqValue::Json(y)) => Some(x == y),
+        _ => None,
+    }
+}
+
+pub(super) enum FastCompare {
+    Handled(Option<std::cmp::Ordering>),
+    Fallback,
+}
+
+/// Zero-allocation ordering fast-path for matching orderable `BqValue` variants.
+pub(super) fn try_fast_compare(a: &BqValue, b: &BqValue) -> BqResult<FastCompare> {
+    let ord = match (a, b) {
+        (BqValue::Bool(x), BqValue::Bool(y)) => x.partial_cmp(y),
+        (BqValue::Int64(x), BqValue::Int64(y)) => x.partial_cmp(y),
+        (BqValue::Float64(x), BqValue::Float64(y)) => x.partial_cmp(y),
+        (BqValue::Numeric(x), BqValue::Numeric(y)) => x.partial_cmp(y),
+        (BqValue::BigNumeric(x), BqValue::BigNumeric(y)) => x.partial_cmp(y),
+        (BqValue::String(x), BqValue::String(y)) => x.partial_cmp(y),
+        (BqValue::Bytes(x), BqValue::Bytes(y)) => x.partial_cmp(y),
+        (BqValue::Date(x), BqValue::Date(y)) => x.partial_cmp(y),
+        (BqValue::Datetime(x), BqValue::Datetime(y)) => x.partial_cmp(y),
+        (BqValue::Time(x), BqValue::Time(y)) => x.partial_cmp(y),
+        (BqValue::Timestamp(x), BqValue::Timestamp(y)) => x.partial_cmp(y),
+        (BqValue::Interval(x), BqValue::Interval(y)) => {
+            Some(interval_sort_key(*x).cmp(&interval_sort_key(*y)))
+        }
+        (BqValue::Range(rx), BqValue::Range(ry)) if rx.elem_type == ry.elem_type => {
+            compare_ranges(rx, ry)?
+        }
+        _ => return Ok(FastCompare::Fallback),
+    };
+    Ok(FastCompare::Handled(ord))
+}

@@ -176,7 +176,7 @@ pub(super) fn execute_grouped_with_windows(
     for bucket in &buckets {
         projected.push(project_grouped_row(
             &rewritten,
-            &bucket.rows,
+            bucket.rows.as_slice(),
             schema_row,
             &bucket.keys(),
             ctx,
@@ -198,7 +198,7 @@ pub(super) fn execute_grouped_with_windows(
 
 fn filter_grouped_qualify(
     qualify: &Expr,
-    buckets: &[super::agg::GroupedBucket],
+    buckets: &[super::agg::GroupedBucket<'_>],
     projected: Vec<EvalRow>,
     src_rows: &[EvalRow],
     alias_map: &std::collections::BTreeMap<String, Expr>,
@@ -220,7 +220,7 @@ fn filter_grouped_qualify(
             select_aliases: Some(alias_map),
         };
         if matches!(
-            eval_grouped_expr(qualify, &bucket.rows, &keys, ctx)?,
+            eval_grouped_expr(qualify, bucket.rows.as_slice(), &keys, ctx)?,
             BqValue::Bool(true)
         ) {
             out_proj.push(proj_row);
@@ -232,7 +232,7 @@ fn filter_grouped_qualify(
 
 fn eval_grouped_window_call(
     call: &FunctionCall,
-    buckets: &[super::agg::GroupedBucket],
+    buckets: &[super::agg::GroupedBucket<'_>],
     named_windows: &[NamedWindowDef],
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<BqValue>> {
@@ -250,7 +250,7 @@ fn eval_grouped_window_call(
         let col_name = format!("__warg_{i}");
         let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
         for (b_idx, bucket) in buckets.iter().enumerate() {
-            let val = eval_grouped_expr(&arg.expr, &bucket.rows, &bucket.keys(), ctx)?;
+            let val = eval_grouped_expr(&arg.expr, bucket.rows.as_slice(), &bucket.keys(), ctx)?;
             let ty = val.infer_type()?;
             if let Some(sr) = syn_rows.get_mut(b_idx) {
                 sr.cols.push(RowBinding {
@@ -277,7 +277,7 @@ fn eval_grouped_window_call(
 
 fn rewrite_spec_exprs(
     exprs: &[Expr],
-    buckets: &[super::agg::GroupedBucket],
+    buckets: &[super::agg::GroupedBucket<'_>],
     syn_rows: &mut [EvalRow],
     prefix: &str,
     ctx: &ExecContext<'_>,
@@ -287,7 +287,7 @@ fn rewrite_spec_exprs(
         let col_name = format!("__w{prefix}_{i}");
         let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
         for (b_idx, bucket) in buckets.iter().enumerate() {
-            let val = eval_grouped_expr(expr, &bucket.rows, &bucket.keys(), ctx)?;
+            let val = eval_grouped_expr(expr, bucket.rows.as_slice(), &bucket.keys(), ctx)?;
             let ty = val.infer_type()?;
             if let Some(sr) = syn_rows.get_mut(b_idx) {
                 sr.cols.push(RowBinding {

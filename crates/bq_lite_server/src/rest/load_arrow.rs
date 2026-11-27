@@ -36,8 +36,9 @@ pub(super) async fn download_arrow_ipc(
     if let Some(ref err) = rec.error {
         return bq_error_response(err);
     }
-    let qr = rec.result.unwrap_or_default();
-    match query_result_to_arrow_ipc(&qr) {
+    let empty = QueryResult::empty();
+    let qr = rec.result.as_deref().unwrap_or(&empty);
+    match query_result_to_arrow_ipc(qr) {
         Ok(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
@@ -276,7 +277,7 @@ fn execute_load_job(
         location,
         state: JobStatus::Done,
         created_at: Utc::now(),
-        result: Some(QueryResult::empty()),
+        result: Some(std::sync::Arc::new(QueryResult::empty())),
         error: None,
         total_bytes_processed: 0,
         query: None,

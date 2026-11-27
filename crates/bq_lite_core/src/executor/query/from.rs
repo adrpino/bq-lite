@@ -267,8 +267,8 @@ fn eval_wildcard_tables(
             .map(|c| Arc::from(c.name.as_str()))
             .collect();
         let suffix_name: Arc<str> = Arc::from("_TABLE_SUFFIX");
-        let (rows_ref, _) = ctx.storage.read_rows_ref(&concrete_ref);
-        for row in rows_ref {
+        let (_, rows_iter) = ctx.storage.iter_rows(&concrete_ref);
+        for (row, _) in rows_iter {
             let mut cols: Vec<RowBinding> = meta
                 .columns
                 .iter()
@@ -323,10 +323,9 @@ fn eval_concrete_table(
     let names_pair = (&qual_arc, col_names.as_slice());
 
     if meta.kind == TableKind::Table && system_time.is_none() {
-        let (rows_ref, times_ref) = ctx.storage.read_rows_ref(tref);
-        let mut out = Vec::with_capacity(rows_ref.len());
-        for (i, row) in rows_ref.iter().enumerate() {
-            let ing_ts = times_ref.get(i).copied().unwrap_or(meta.created_at);
+        let (row_count, rows_iter) = ctx.storage.iter_rows(tref);
+        let mut out = Vec::with_capacity(row_count);
+        for (row, ing_ts) in rows_iter {
             let eval_row = build_concrete_eval_row(meta, names_pair, row.clone(), ing_ts, ctx);
             if check_row_policies(&eval_row, policies, ctx)? {
                 out.push(eval_row);

@@ -6,13 +6,36 @@ use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::{eval_expr, infer_expr_col_name, values_distinct_eq};
 use crate::types::BqValue;
 
-type BucketList = Vec<(Vec<BqValue>, Vec<EvalRow>)>;
+use super::exec_util::RowSlice;
+
+type BucketList<'a> = Vec<(Vec<BqValue>, BucketRows<'a>)>;
 pub(super) type GroupedSelectOut = (Vec<EvalRow>, Vec<EvalRow>, Vec<OrderByExpr>);
 
-pub(super) struct GroupedBucket {
+pub(super) enum BucketRows<'a> {
+    All(&'a [EvalRow]),
+    Indexed {
+        all_rows: &'a [EvalRow],
+        indices: Vec<usize>,
+    },
+}
+
+impl BucketRows<'_> {
+    #[must_use]
+    pub(super) fn as_slice(&self) -> RowSlice<'_> {
+        match self {
+            Self::All(rows) => RowSlice::Owned(rows),
+            Self::Indexed { all_rows, indices } => RowSlice::Indexed {
+                rows: all_rows,
+                indices,
+            },
+        }
+    }
+}
+
+pub(super) struct GroupedBucket<'a> {
     pub active_keys: Vec<(Expr, BqValue)>,
     pub rolled_up_keys: Vec<Expr>,
-    pub rows: Vec<EvalRow>,
+    pub rows: BucketRows<'a>,
 }
 
 #[derive(Default)]
@@ -22,7 +45,7 @@ pub(super) struct GroupedKeys<'a> {
     pub select_aliases: Option<&'a BTreeMap<String, Expr>>,
 }
 
-impl GroupedBucket {
+impl GroupedBucket<'_> {
     pub(super) fn keys(&self) -> GroupedKeys<'_> {
         GroupedKeys {
             active: &self.active_keys,
@@ -124,7 +147,7 @@ pub(super) fn eval_aggregate_expr(
     bucket: &[EvalRow],
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    eval_grouped_expr(expr, bucket, &GroupedKeys::default(), ctx)
+    eval_grouped_expr(expr, RowSlice::Owned(bucket), &GroupedKeys::default(), ctx)
 }
 
 pub(super) fn execute_grouped_select_with_order(
@@ -140,7 +163,7 @@ pub(super) fn execute_grouped_select_with_order(
     for b in &buckets {
         projected.push(project_grouped_row(
             select,
-            &b.rows,
+            b.rows.as_slice(),
             schema_row,
             &b.keys(),
             ctx,
@@ -157,12 +180,12 @@ pub(super) fn execute_grouped_select_with_order(
     Ok((projected, src_rows, rewritten_order))
 }
 
-pub(super) fn execute_grouped_buckets(
+pub(super) fn execute_grouped_buckets<'a>(
     select: &Select,
-    rows: &[EvalRow],
+    rows: &'a [EvalRow],
     schema_row: &EvalRow,
     ctx: &ExecContext<'_>,
-) -> BqResult<Vec<GroupedBucket>> {
+) -> BqResult<Vec<GroupedBucket<'a>>> {
     let alias_map = build_select_alias_map(select);
     let effective_schema = rows.first().unwrap_or(schema_row);
     let grouping_sets = match &select.group_by {
@@ -187,7 +210,7 @@ pub(super) fn execute_grouped_buckets(
             .collect();
         let buckets = bucket_rows(rows, &key_exprs, ctx)?;
         let buckets = if buckets.is_empty() && key_exprs.is_empty() {
-            vec![(Vec::new(), Vec::new())]
+            vec![(Vec::new(), BucketRows::All(&[]))]
         } else {
             buckets
         };
@@ -207,7 +230,7 @@ pub(super) fn execute_grouped_buckets(
                     rolled_up: &rolled_full,
                     select_aliases: Some(&alias_map),
                 };
-                let hval = eval_grouped_expr(having, &bucket, &keys, ctx)?;
+                let hval = eval_grouped_expr(having, bucket.as_slice(), &keys, ctx)?;
                 if !matches!(hval, BqValue::Bool(true)) {
                     continue;
                 }
@@ -339,21 +362,21 @@ fn expand_group_by(
     }
 }
 
-fn bucket_rows(
-    rows: &[EvalRow],
+fn bucket_rows<'a>(
+    rows: &'a [EvalRow],
     key_exprs: &[Expr],
     ctx: &ExecContext<'_>,
-) -> BqResult<BucketList> {
+) -> BqResult<BucketList<'a>> {
     if key_exprs.is_empty() {
         return Ok(if rows.is_empty() {
             Vec::new()
         } else {
-            vec![(Vec::new(), rows.to_vec())]
+            vec![(Vec::new(), BucketRows::All(rows))]
         });
     }
-    let mut buckets: BucketList = Vec::new();
+    let mut raw_buckets: Vec<(Vec<BqValue>, Vec<usize>)> = Vec::new();
     let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
         let mut key_vals = Vec::with_capacity(key_exprs.len());
         for expr in key_exprs {
             let val = eval_expr(expr, row, ctx)?;
@@ -368,7 +391,7 @@ fn bucket_rows(
         let cands = index.entry(h).or_default();
         let mut found_idx = None;
         for &b_idx in cands.iter() {
-            if let Some((existing, _)) = buckets.get(b_idx) {
+            if let Some((existing, _)) = raw_buckets.get(b_idx) {
                 if existing.len() == key_vals.len()
                     && existing
                         .iter()
@@ -381,21 +404,32 @@ fn bucket_rows(
             }
         }
         if let Some(b_idx) = found_idx {
-            if let Some((_, bucket)) = buckets.get_mut(b_idx) {
-                bucket.push(row.clone());
+            if let Some((_, bucket)) = raw_buckets.get_mut(b_idx) {
+                bucket.push(row_idx);
             }
         } else {
-            let new_idx = buckets.len();
-            buckets.push((key_vals, vec![row.clone()]));
+            let new_idx = raw_buckets.len();
+            raw_buckets.push((key_vals, vec![row_idx]));
             cands.push(new_idx);
         }
     }
-    Ok(buckets)
+    Ok(raw_buckets
+        .into_iter()
+        .map(|(k, indices)| {
+            (
+                k,
+                BucketRows::Indexed {
+                    all_rows: rows,
+                    indices,
+                },
+            )
+        })
+        .collect())
 }
 
 pub(super) fn project_grouped_row(
     select: &Select,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     schema_row: &EvalRow,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,

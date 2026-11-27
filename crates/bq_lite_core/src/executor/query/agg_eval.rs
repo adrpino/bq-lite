@@ -12,6 +12,7 @@ use crate::types::{BqStructFieldValue, BqValue};
 use super::agg::GroupedKeys;
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
 use super::agg_grouping::expr_eq_gb;
+use super::exec_util::RowSlice;
 
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -19,7 +20,7 @@ use super::agg_grouping::expr_eq_gb;
 )]
 pub(super) fn eval_grouped_expr(
     expr: &Expr,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -90,8 +91,9 @@ pub(super) fn eval_grouped_expr(
         | Expr::StructLiteral { .. } => eval_grouped_compound(expr, bucket, keys, ctx),
         Expr::Ident(id) => eval_grouped_ident(expr, &id.value, bucket, keys, ctx),
         _ => {
-            let sample = bucket.first().cloned().unwrap_or_default();
-            eval_expr(expr, &sample, ctx)
+            let empty_row = EvalRow::default();
+            let sample = bucket.first().unwrap_or(&empty_row);
+            eval_expr(expr, sample, ctx)
         }
     }
 }
@@ -99,7 +101,7 @@ pub(super) fn eval_grouped_expr(
 fn eval_grouped_ident(
     expr: &Expr,
     name: &str,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -113,8 +115,9 @@ fn eval_grouped_ident(
             return eval_grouped_expr(aliased, bucket, &next_keys, ctx);
         }
     }
-    let sample = bucket.first().cloned().unwrap_or_default();
-    eval_expr(expr, &sample, ctx)
+    let empty_row = EvalRow::default();
+    let sample = bucket.first().unwrap_or(&empty_row);
+    eval_expr(expr, sample, ctx)
 }
 
 #[expect(
@@ -123,7 +126,7 @@ fn eval_grouped_ident(
 )]
 fn eval_grouped_compound(
     expr: &Expr,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -184,7 +187,7 @@ fn eval_grouped_like(
     inner: &Expr,
     negated: bool,
     pattern: &Expr,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -208,7 +211,7 @@ fn eval_grouped_in(
     inner: &Expr,
     negated: bool,
     target: &InTarget,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -229,8 +232,9 @@ fn eval_grouped_in(
             }
         },
         InTarget::Subquery(q) => {
-            let sample = bucket.first().cloned().unwrap_or_default();
-            let sub_ctx = ctx.with_outer(&sample);
+            let empty_row = EvalRow::default();
+            let sample = bucket.first().unwrap_or(&empty_row);
+            let sub_ctx = ctx.with_outer(sample);
             let res = execute_query(q, &sub_ctx)?;
             if res.columns.len() != 1 {
                 return Err(BqError::query("IN subquery must return exactly 1 column"));
@@ -246,7 +250,7 @@ fn eval_grouped_in(
 
 fn eval_grouped_struct(
     fields: &[StructFieldExpr],
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -265,7 +269,7 @@ fn eval_grouped_binary(
     left: &Expr,
     op: BinaryOp,
     right: &Expr,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -286,7 +290,7 @@ fn eval_grouped_binary(
 
 fn eval_grouped_fn(
     call: &crate::ast::FunctionCall,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -295,7 +299,7 @@ fn eval_grouped_fn(
         return eval_grouping_fn(call, keys);
     }
     if is_aggregate_name(&name) {
-        return match eval_aggregate_call(call, super::exec_util::RowSlice::Owned(bucket), ctx) {
+        return match eval_aggregate_call(call, bucket, ctx) {
             Ok(val) => Ok(val),
             Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
             Err(err) => Err(err),
@@ -312,7 +316,8 @@ fn eval_grouped_fn(
         }
         args.push(eval_grouped_expr(&a.expr, bucket, keys, ctx)?);
     }
-    let sample = bucket.first().cloned().unwrap_or_default();
+    let empty_row = EvalRow::default();
+    let sample = bucket.first().unwrap_or(&empty_row);
     match crate::executor::scalar::eval_scalar_builtin(&name, args, ctx) {
         Ok(Some(val)) => {
             if matches!(upper.as_str(), "IF" | "COALESCE" | "IFNULL" | "NULLIF") {
@@ -324,7 +329,7 @@ fn eval_grouped_fn(
                 return crate::executor::evaluator::coerce_to_expr_supertype(
                     val,
                     &branch_exprs,
-                    &sample,
+                    sample,
                     ctx,
                 );
             }
@@ -377,14 +382,15 @@ fn eval_grouped_case(
     operand: Option<&Expr>,
     whens: &[WhenBranch],
     else_result: Option<&Expr>,
-    bucket: &[EvalRow],
+    bucket: RowSlice<'_>,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let op_val = operand
         .map(|e| eval_grouped_expr(e, bucket, keys, ctx))
         .transpose()?;
-    let sample = bucket.first().cloned().unwrap_or_default();
+    let empty_row = EvalRow::default();
+    let sample = bucket.first().unwrap_or(&empty_row);
     let mut result_exprs: Vec<&Expr> = whens.iter().map(|w| &w.result).collect();
     if let Some(e) = else_result {
         result_exprs.push(e);
@@ -400,7 +406,7 @@ fn eval_grouped_case(
             return crate::executor::evaluator::coerce_to_expr_supertype(
                 val,
                 &result_exprs,
-                &sample,
+                sample,
                 ctx,
             );
         }
@@ -408,5 +414,5 @@ fn eval_grouped_case(
     let val = else_result.map_or(Ok(BqValue::Null), |e| {
         eval_grouped_expr(e, bucket, keys, ctx)
     })?;
-    crate::executor::evaluator::coerce_to_expr_supertype(val, &result_exprs, &sample, ctx)
+    crate::executor::evaluator::coerce_to_expr_supertype(val, &result_exprs, sample, ctx)
 }

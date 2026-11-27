@@ -108,7 +108,7 @@ fn build_sync_query_response(
         location: "US".to_owned(),
         state: JobStatus::Done,
         created_at: Utc::now(),
-        result: Some(qr),
+        result: Some(std::sync::Arc::new(qr)),
         error: None,
         total_bytes_processed: 0,
         query: Some(sql.to_owned()),
@@ -233,7 +233,7 @@ pub(super) async fn insert_job(
             location,
             state: JobStatus::Done,
             created_at: Utc::now(),
-            result: Some(QueryResult::empty()),
+            result: Some(std::sync::Arc::new(QueryResult::empty())),
             error: None,
             total_bytes_processed: 0,
             query: None,
@@ -277,7 +277,7 @@ fn run_insert_query_job(
 
     let (result, error) = if dry_run {
         match dry_run_sql(state, sql, default_ds, &named_params, &pos_params) {
-            Ok(qr) => (Some(qr), None),
+            Ok(qr) => (Some(std::sync::Arc::new(qr)), None),
             Err(err) => (None, Some(*err)),
         }
     } else {
@@ -288,7 +288,7 @@ fn run_insert_query_job(
                 Ok(()) => {
                     *eng = fork;
                     drop(eng);
-                    (Some(qr), None)
+                    (Some(std::sync::Arc::new(qr)), None)
                 }
                 Err(err) => (None, Some(*err)),
             },
@@ -360,7 +360,8 @@ pub(super) async fn get_query_results(
     if let Some(ref err) = rec.error {
         return bq_error_response(err);
     }
-    let qr = rec.result.clone().unwrap_or_default();
+    let empty = QueryResult::empty();
+    let qr = rec.result.as_deref().unwrap_or(&empty);
     let total = qr.rows.len();
     let start = pag
         .page_token

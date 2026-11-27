@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
 use crate::error::{BqError, BqResult};
-use crate::storage::{StorageEngine, TableStorage};
+use crate::storage::{Row, RowChunk, StorageEngine, TableSnapshot, TableStorage, TableVersion};
 
 const SNAPSHOT_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("bq_lite_snapshot");
 const SNAPSHOT_KEY: &str = "state_v1";
@@ -29,6 +30,120 @@ pub struct PersistCache {
 struct EngineSnapshot {
     catalog: Catalog,
     tables: Vec<TableEntry>,
+}
+
+/// Chunk-deduplicated wire format so shared `Arc<RowChunk>`s are serialized only once across history.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTableV2 {
+    chunks: Vec<RowChunk>,
+    current_chunks: Vec<usize>,
+    history: Vec<(DateTime<Utc>, Vec<usize>)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTableVersion {
+    timestamp: DateTime<Utc>,
+    rows: Vec<Row>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTableStorage {
+    current: Vec<Row>,
+    #[serde(default)]
+    ingestion_times: Vec<DateTime<Utc>>,
+    #[serde(default)]
+    history: Vec<LegacyTableVersion>,
+}
+
+fn encode_table_storage(ts: &TableStorage) -> PersistedTableV2 {
+    let mut ptr_to_idx: HashMap<usize, usize> = HashMap::new();
+    let mut chunks: Vec<RowChunk> = Vec::new();
+    let mut intern = |snap: &TableSnapshot| -> Vec<usize> {
+        let mut indices = Vec::with_capacity(snap.chunks.len());
+        for ch in &snap.chunks {
+            let key = Arc::as_ptr(ch) as usize;
+            let idx = *ptr_to_idx.entry(key).or_insert_with(|| {
+                let id = chunks.len();
+                chunks.push((**ch).clone());
+                id
+            });
+            indices.push(idx);
+        }
+        indices
+    };
+    let current_chunks = intern(&ts.current);
+    let history = ts
+        .history
+        .iter()
+        .map(|v| (v.timestamp, intern(&v.snapshot)))
+        .collect();
+    PersistedTableV2 {
+        chunks,
+        current_chunks,
+        history,
+    }
+}
+
+fn decode_table_storage(raw: &[u8]) -> BqResult<TableStorage> {
+    if let Ok(v2) = serde_json::from_slice::<PersistedTableV2>(raw) {
+        let shared: Vec<Arc<RowChunk>> = v2.chunks.into_iter().map(Arc::new).collect();
+        let rebuild = |idxs: &[usize]| -> TableSnapshot {
+            let mut chs = Vec::with_capacity(idxs.len());
+            let mut total_rows = 0_usize;
+            for &i in idxs {
+                if let Some(ch) = shared.get(i) {
+                    total_rows = total_rows.saturating_add(ch.rows.len());
+                    chs.push(Arc::clone(ch));
+                }
+            }
+            TableSnapshot {
+                chunks: chs,
+                total_rows,
+            }
+        };
+        let current = rebuild(&v2.current_chunks);
+        let history = v2
+            .history
+            .into_iter()
+            .map(|(timestamp, idxs)| TableVersion {
+                timestamp,
+                snapshot: rebuild(&idxs),
+            })
+            .collect();
+        return Ok(TableStorage { current, history });
+    }
+    if let Ok(ts) = serde_json::from_slice::<TableStorage>(raw) {
+        return Ok(ts);
+    }
+    let legacy: LegacyTableStorage = serde_json::from_slice(raw)
+        .map_err(|e| BqError::internal(format!("Failed to deserialize table: {e}")))?;
+    let default_ts = legacy
+        .ingestion_times
+        .first()
+        .copied()
+        .unwrap_or_else(Utc::now);
+    let mut current = TableSnapshot::default();
+    current.push_chunk(legacy.current, default_ts);
+    let history = if legacy.history.is_empty() {
+        vec![TableVersion {
+            timestamp: default_ts,
+            snapshot: current.clone(),
+        }]
+    } else {
+        legacy
+            .history
+            .into_iter()
+            .map(|v| {
+                let mut snap = TableSnapshot::default();
+                snap.push_chunk(v.rows, v.timestamp);
+                TableVersion {
+                    timestamp: v.timestamp,
+                    snapshot: snap,
+                }
+            })
+            .collect()
+    };
+    Ok(TableStorage { current, history })
 }
 
 fn encode_table_key((p, d, t): &(String, String, String)) -> String {
@@ -76,7 +191,8 @@ pub fn save_snapshot_incremental(
             .get(k)
             .is_some_and(|prev| Arc::ptr_eq(prev, arc));
         if !unchanged {
-            let bytes = serde_json::to_vec(arc.as_ref())
+            let encoded = encode_table_storage(arc.as_ref());
+            let bytes = serde_json::to_vec(&encoded)
                 .map_err(|e| BqError::internal(format!("Failed to serialize table: {e}")))?;
             dirty.push((k.clone(), Arc::clone(arc), bytes));
         }
@@ -142,10 +258,7 @@ pub fn load_snapshot(path: &Path) -> BqResult<Option<(Catalog, StorageEngine)>> 
                     let (k_guard, v_guard) = item
                         .map_err(|e| BqError::internal(format!("redb entry read failed: {e}")))?;
                     if let Some(tkey) = decode_table_key(k_guard.value()) {
-                        let tstorage: TableStorage = serde_json::from_slice(v_guard.value())
-                            .map_err(|e| {
-                                BqError::internal(format!("Failed to deserialize table: {e}"))
-                            })?;
+                        let tstorage = decode_table_storage(v_guard.value())?;
                         entries.push((tkey, tstorage));
                     }
                 }
@@ -169,4 +282,47 @@ pub fn load_snapshot(path: &Path) -> BqResult<Option<(Catalog, StorageEngine)>> 
         snap.catalog,
         StorageEngine::from_entries(snap.tables),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::TableRef;
+    use crate::types::BqValue;
+
+    #[test]
+    fn persisted_v2_deduplicates_shared_chunks_and_restores_sharing() {
+        let mut ts = TableStorage::new();
+        for i in 0..10_i64 {
+            ts.append(vec![vec![BqValue::Int64(i)]]);
+        }
+        let encoded = encode_table_storage(&ts);
+        // 10 appends across 11 versions should serialize only 10 distinct chunks total.
+        assert_eq!(encoded.chunks.len(), 10);
+        assert_eq!(encoded.current_chunks.len(), 10);
+        assert_eq!(encoded.history.len(), 11);
+
+        let raw = serde_json::to_vec(&encoded).unwrap();
+        let decoded = decode_table_storage(&raw).unwrap();
+        assert_eq!(decoded.current.len(), 10);
+        assert!(Arc::ptr_eq(
+            &decoded.current.chunks[0],
+            &decoded.history[1].snapshot.chunks[0]
+        ));
+    }
+
+    #[test]
+    fn decode_table_storage_reads_legacy_unsharded_json() {
+        let now = Utc::now();
+        let legacy_json = serde_json::json!({
+            "current": [[{ "Int64": 42 }]],
+            "ingestion_times": [now],
+            "history": [{ "timestamp": now, "rows": [[{ "Int64": 42 }]] }]
+        });
+        let raw = serde_json::to_vec(&legacy_json).unwrap();
+        let decoded = decode_table_storage(&raw).unwrap();
+        assert_eq!(decoded.current.len(), 1);
+        assert_eq!(decoded.current.to_rows(), vec![vec![BqValue::Int64(42)]]);
+        let _ = TableRef::new("p", "d", "t");
+    }
 }

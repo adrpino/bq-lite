@@ -382,6 +382,9 @@ pub(in crate::executor) fn sql_values_equal(a: &BqValue, b: &BqValue) -> BqResul
     if a.is_null() || b.is_null() {
         return Ok(None);
     }
+    if let Some(eq) = super::literals::try_fast_sql_equal(a, b) {
+        return Ok(Some(eq));
+    }
     let supertype = common_supertype(&[a.infer_type()?, b.infer_type()?])?;
     let ca = coerce_value(a.clone(), &supertype)?;
     let cb = coerce_value(b.clone(), &supertype)?;
@@ -429,6 +432,9 @@ pub(in crate::executor) fn values_equal(a: &BqValue, b: &BqValue) -> BqResult<bo
 pub(in crate::executor) fn compare_values(a: &BqValue, b: &BqValue) -> BqResult<Option<Ordering>> {
     if a.is_null() || b.is_null() {
         return Ok(None);
+    }
+    if let super::literals::FastCompare::Handled(ord) = super::literals::try_fast_compare(a, b)? {
+        return Ok(ord);
     }
     let supertype = common_supertype(&[a.infer_type()?, b.infer_type()?])?;
     let ca = coerce_value(a.clone(), &supertype)?;

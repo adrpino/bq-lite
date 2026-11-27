@@ -118,7 +118,7 @@ pub(super) fn execute_copy_job(
         location,
         state: JobStatus::Done,
         created_at: Utc::now(),
-        result: Some(QueryResult::empty()),
+        result: Some(std::sync::Arc::new(QueryResult::empty())),
         error: None,
         total_bytes_processed: 0,
         query: None,

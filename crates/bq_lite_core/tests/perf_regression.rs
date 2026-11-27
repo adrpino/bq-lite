@@ -98,4 +98,37 @@ fn non_quadratic_window_groupby_distinct_and_cte_correlated_guard() {
         "correlated CTE regression: took {:?}",
         t2.elapsed()
     );
+
+    // Repeated small appends must stay non-quadratic thanks to chunked TableStorage
+    let t3 = Instant::now();
+    eng.exec("CREATE TABLE perf.t_append (id INT64, label STRING)")
+        .unwrap();
+    let append_ref = TableRef::new("local", "perf", "t_append");
+    for i in 0..250_i64 {
+        eng.insert_rows(
+            &append_ref,
+            vec![vec![BqValue::Int64(i), BqValue::String(format!("row-{i}"))]],
+        )
+        .unwrap();
+    }
+    let aqr = eng
+        .query("SELECT COUNT(*), SUM(id) FROM perf.t_append")
+        .unwrap();
+    assert_eq!(aqr.rows[0][0], BqValue::Int64(250));
+    assert_eq!(aqr.rows[0][1], BqValue::Int64(249 * 250 / 2));
+    assert!(
+        t3.elapsed().as_secs() < 5,
+        "repeated append regression: took {:?}",
+        t3.elapsed()
+    );
+
+    // GROUP BY ROLLUP over indexed buckets (no per-grouping-set EvalRow cloning)
+    let rqr = eng
+        .query(
+            "SELECT grp, MOD(val, 5) AS b, SUM(val) AS s
+             FROM perf.t_gb
+             GROUP BY ROLLUP(grp, MOD(val, 5))",
+        )
+        .unwrap();
+    assert!(rqr.rows.len() > 1_000);
 }

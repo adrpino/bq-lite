@@ -196,7 +196,7 @@ fn resolve_gb_expr(
 /// Evaluates grouped `ORDER BY` expressions against each `GroupedBucket`, storing the results
 /// as synthetic `__grp_ord_{i}` columns on `src_rows` and returning rewritten `OrderByExpr`s.
 pub(super) fn attach_grouped_order_by(
-    buckets: &[GroupedBucket],
+    buckets: &[GroupedBucket<'_>],
     src_rows: &mut [EvalRow],
     order_by: &[OrderByExpr],
     alias_map: &BTreeMap<String, Expr>,
@@ -223,7 +223,7 @@ pub(super) fn attach_grouped_order_by(
                 rolled_up: &bucket.rolled_up_keys,
                 select_aliases: Some(alias_map),
             };
-            if let Ok(val) = eval_grouped_expr(&ob.expr, &bucket.rows, &keys, ctx) {
+            if let Ok(val) = eval_grouped_expr(&ob.expr, bucket.rows.as_slice(), &keys, ctx) {
                 vals.push(val);
             } else {
                 evaluated_all = false;

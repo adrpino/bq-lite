@@ -183,7 +183,7 @@ fn handle_create_read_session(
         session_name.clone(),
         ReadSessionRecord {
             name: session_name.clone(),
-            result: qr,
+            result: std::sync::Arc::new(qr),
             data_format: out_format,
             stream_ranges,
         },
@@ -295,7 +295,10 @@ fn resolve_read_query_result(
             let rec = jobs.get(jid).ok_or_else(|| {
                 BqError::not_found(format!("Anonymous result table '{jid}' not found"))
             })?;
-            let qr = rec.result.clone().unwrap_or_default();
+            let qr = rec
+                .result
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(QueryResult::empty()));
             drop(jobs);
             qr
         };
@@ -365,7 +368,7 @@ async fn handle_read_rows(
             .unwrap_or(&[])
             .to_vec();
         let batch_count = i64::try_from(sliced_rows.len()).unwrap_or(i64::MAX);
-        let sliced_qr = QueryResult::new(rec.result.columns, sliced_rows);
+        let sliced_qr = QueryResult::new(rec.result.columns.clone(), sliced_rows);
         let resp = if rec.data_format == DATA_FORMAT_AVRO {
             let schema_json = query_result_to_avro_schema_json(&sliced_qr);
             let avro_bytes =
