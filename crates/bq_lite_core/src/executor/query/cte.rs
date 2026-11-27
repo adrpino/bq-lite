@@ -343,7 +343,9 @@ fn collect_factor_table_refs(factor: &TableFactor, out: &mut BTreeSet<String>) {
         }
         TableFactor::Derived { query, .. } => collect_query_table_refs(query, out),
         TableFactor::NestedJoin(twj) => collect_twj_table_refs(twj, out),
-        TableFactor::Pivot { source, .. } | TableFactor::Unpivot { source, .. } => {
+        TableFactor::Pivot { source, .. }
+        | TableFactor::Unpivot { source, .. }
+        | TableFactor::TableSample { source, .. } => {
             collect_factor_table_refs(source, out);
         }
         TableFactor::Unnest { expr, .. } => collect_expr_table_refs(expr, out),

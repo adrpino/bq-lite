@@ -184,21 +184,25 @@ pub(super) fn eval_table_factor(
             spec,
             alias,
         } => {
-            let src_rows = eval_table_factor(source, corr_row, ctx)?;
-            apply_pivot(
-                src_rows,
-                spec,
-                alias.as_ref().map(|a| a.value.as_str()),
-                ctx,
-            )
+            let src = eval_table_factor(source, corr_row, ctx)?;
+            apply_pivot(src, spec, alias.as_ref().map(|a| a.value.as_str()), ctx)
         }
         TableFactor::Unpivot {
             source,
             spec,
             alias,
         } => {
-            let src_rows = eval_table_factor(source, corr_row, ctx)?;
-            apply_unpivot(src_rows, spec, alias.as_ref().map(|a| a.value.as_str()))
+            let src = eval_table_factor(source, corr_row, ctx)?;
+            apply_unpivot(src, spec, alias.as_ref().map(|a| a.value.as_str()))
+        }
+        TableFactor::TableSample {
+            source,
+            amount,
+            is_percent,
+            ..
+        } => {
+            let src = eval_table_factor(source, corr_row, ctx)?;
+            super::pivot::apply_tablesample(src, amount, *is_percent, ctx)
         }
         TableFactor::TableFunction { name, args, alias } => {
             eval_table_function(name, args, alias.as_ref().map(|a| a.value.as_str()), ctx)

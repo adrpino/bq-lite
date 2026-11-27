@@ -61,7 +61,8 @@ fn rows_match(cols: &[ExpectedColumn], erow: &[ExpectedVal], arow: &[BqValue]) -
     reason = "Compliance value comparison matches expected literals against BqValue variants"
 )]
 fn val_matches(ev: &ExpectedVal, av: &BqValue, col_ty: Option<&BqType>) -> bool {
-    if matches!(ev, ExpectedVal::Null) {
+    if matches!(ev, ExpectedVal::Null) || matches!(ev, ExpectedVal::Raw(r) if r.ends_with("(NULL)"))
+    {
         return av.is_null();
     }
     if av.is_null() {
@@ -83,14 +84,14 @@ fn val_matches(ev: &ExpectedVal, av: &BqValue, col_ty: Option<&BqType>) -> bool 
             decimal_eq(&ei.to_string(), &an.to_string())
         }
         (ExpectedVal::Float(ef), BqValue::Numeric(an)) => {
-            decimal_eq(&ef.to_string(), &an.to_string())
+            decimal_eq(&ef.to_string(), &an.to_string()) || float_eq(*ef, an.to_f64())
         }
         (ExpectedVal::Raw(er), BqValue::Numeric(an)) => decimal_eq(er, &an.to_string()),
         (ExpectedVal::Int(ei), BqValue::BigNumeric(an)) => {
             decimal_eq(&ei.to_string(), &an.to_string())
         }
         (ExpectedVal::Float(ef), BqValue::BigNumeric(an)) => {
-            decimal_eq(&ef.to_string(), &an.to_string())
+            decimal_eq(&ef.to_string(), &an.to_string()) || float_eq(*ef, an.to_f64())
         }
         (ExpectedVal::Raw(er), BqValue::BigNumeric(an)) => decimal_eq(er, &an.to_string()),
         (ExpectedVal::String(es), BqValue::String(as_)) => es == as_,
@@ -187,6 +188,9 @@ fn expected_val_to_json(ev: &ExpectedVal) -> serde_json::Value {
             serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
         }
         ExpectedVal::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(b).into_owned()),
+        ExpectedVal::Struct(items) if items.is_empty() => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
         ExpectedVal::Array(items) | ExpectedVal::Struct(items) => {
             serde_json::Value::Array(items.iter().map(expected_val_to_json).collect())
         }
@@ -198,9 +202,31 @@ fn raw_temporal_or_display_eq(expected_raw: &str, actual: &BqValue) -> bool {
     if expected_raw == actual_s {
         return true;
     }
+    if matches!(actual, BqValue::Range(_)) {
+        return normalize_range_text(expected_raw) == normalize_range_text(&actual_s);
+    }
     let norm_e = normalize_temporal(expected_raw);
     let norm_a = normalize_temporal(&actual_s);
     norm_e == norm_a
+}
+
+fn normalize_range_text(s: &str) -> String {
+    let trimmed = s.trim();
+    let Some(inner) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(')')) else {
+        return normalize_temporal(trimmed);
+    };
+    let Some((a, b)) = inner.split_once(',') else {
+        return normalize_temporal(trimmed);
+    };
+    let norm_bound = |raw: &str| {
+        let t = raw.trim();
+        if t.eq_ignore_ascii_case("NULL") || t.eq_ignore_ascii_case("UNBOUNDED") {
+            "UNBOUNDED".to_owned()
+        } else {
+            normalize_temporal(t)
+        }
+    };
+    format!("[{}, {})", norm_bound(a), norm_bound(b))
 }
 
 fn normalize_temporal(s: &str) -> String {

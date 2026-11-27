@@ -278,3 +278,52 @@ fn build_unpivot_row(
     });
     Ok(Some(EvalRow::new(new_cols)))
 }
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::wildcard_enum_match_arm,
+    reason = "TABLESAMPLE computes row sample count from numeric percentage/count"
+)]
+pub(super) fn apply_tablesample(
+    rows: Vec<EvalRow>,
+    amount_expr: &Expr,
+    is_percent: bool,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<EvalRow>> {
+    let val = eval_expr(amount_expr, &EvalRow::default(), ctx)?;
+    if val.is_null() {
+        return Err(BqError::semantic("TABLESAMPLE size cannot be NULL"));
+    }
+    let amt = match val {
+        BqValue::Int64(n) => n as f64,
+        BqValue::Float64(f) => f,
+        BqValue::Numeric(n) => n.to_f64(),
+        BqValue::BigNumeric(bn) => bn.to_f64(),
+        _ => return Err(BqError::query("TABLESAMPLE size must be numeric")),
+    };
+    if is_percent {
+        if !(0.0..=100.0).contains(&amt) {
+            return Err(BqError::semantic(
+                "TABLESAMPLE PERCENT must be between 0 and 100",
+            ));
+        }
+        if amt <= 0.0 {
+            return Ok(Vec::new());
+        }
+        if amt >= 100.0 {
+            return Ok(rows);
+        }
+        let total = rows.len();
+        let target = ((total as f64) * (amt / 100.0)).round() as usize;
+        Ok(rows.into_iter().take(target.min(total)).collect())
+    } else {
+        if amt < 0.0 {
+            return Err(BqError::semantic("TABLESAMPLE ROWS cannot be negative"));
+        }
+        let total = rows.len();
+        let cap = amt.trunc() as usize;
+        Ok(rows.into_iter().take(cap.min(total)).collect())
+    }
+}

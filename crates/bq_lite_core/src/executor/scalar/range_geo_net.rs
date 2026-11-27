@@ -16,6 +16,8 @@ pub(super) const RANGE_NET_FUNCTIONS: &[&str] = &[
     "RANGE_CONTAINS",
     "RANGE_END",
     "RANGE_INTERSECT",
+    "RANGE_IS_END_UNBOUNDED",
+    "RANGE_IS_START_UNBOUNDED",
     "RANGE_OVERLAPS",
     "RANGE_START",
 ];
@@ -25,6 +27,8 @@ pub(super) fn eval_range_net_fn(name: &str, args: Vec<BqValue>) -> BqResult<Opti
         "RANGE" => eval_range_ctor(args).map(Some),
         "RANGE_START" => eval_range_bound(args, true).map(Some),
         "RANGE_END" => eval_range_bound(args, false).map(Some),
+        "RANGE_IS_START_UNBOUNDED" => eval_range_is_unbounded(args, true).map(Some),
+        "RANGE_IS_END_UNBOUNDED" => eval_range_is_unbounded(args, false).map(Some),
         "RANGE_CONTAINS" => eval_range_contains(args).map(Some),
         "RANGE_OVERLAPS" => eval_range_overlaps(args).map(Some),
         "RANGE_INTERSECT" => eval_range_intersect(args).map(Some),
@@ -78,11 +82,34 @@ fn eval_range_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
     let s_opt = if start.is_null() { None } else { Some(start) };
     let e_opt = if end.is_null() { None } else { Some(end) };
     if let (Some(sv), Some(ev)) = (&s_opt, &e_opt) {
-        if matches!(compare_values(sv, ev)?, Some(Ordering::Greater)) {
-            return Err(BqError::semantic("RANGE start must not exceed end"));
+        if matches!(
+            compare_values(sv, ev)?,
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
+            return Err(BqError::semantic(
+                "RANGE start must be strictly less than end",
+            ));
         }
     }
     Ok(BqValue::Range(Box::new(BqRange::new(rt, s_opt, e_opt)?)))
+}
+
+fn eval_range_is_unbounded(args: Vec<BqValue>, is_start: bool) -> BqResult<BqValue> {
+    let [arg]: [BqValue; 1] = args
+        .try_into()
+        .map_err(|_| BqError::query("RANGE_IS_*_UNBOUNDED expects 1 argument"))?;
+    if arg.is_null() {
+        return Ok(BqValue::Null);
+    }
+    let BqValue::Range(r) = arg else {
+        return Err(BqError::query("RANGE_IS_*_UNBOUNDED expects RANGE"));
+    };
+    let is_unbounded = if is_start {
+        r.start.is_none()
+    } else {
+        r.end.is_none()
+    };
+    Ok(BqValue::Bool(is_unbounded))
 }
 
 fn eval_range_bound(args: Vec<BqValue>, is_start: bool) -> BqResult<BqValue> {
@@ -159,7 +186,7 @@ fn eval_range_intersect(args: Vec<BqValue>) -> BqResult<BqValue> {
         return Err(BqError::query("RANGE_INTERSECT expects (RANGE, RANGE)"));
     };
     if !ranges_overlap(&a, &b)? {
-        return Ok(BqValue::Null);
+        return Err(BqError::semantic("RANGE_INTERSECT ranges do not overlap"));
     }
     let start = match (a.start, b.start) {
         (None, x) | (x, None) => x,

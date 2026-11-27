@@ -333,10 +333,21 @@ fn parse_mul(p: &mut Parser) -> BqResult<Expr> {
 }
 
 fn parse_unary(p: &mut Parser) -> BqResult<Expr> {
+    if p.eat(&TokenKind::Minus) {
+        if let TokenKind::Number(raw) = &p.peek().kind {
+            if raw == "9223372036854775808" || raw.eq_ignore_ascii_case("0x8000000000000000") {
+                p.advance();
+                return Ok(Expr::Literal(crate::ast::Literal::Int(i64::MIN)));
+            }
+        }
+        let inner = parse_unary(p)?;
+        return Ok(Expr::Unary {
+            op: UnaryOp::Minus,
+            expr: Box::new(inner),
+        });
+    }
     let op = if p.eat(&TokenKind::Plus) {
         Some(UnaryOp::Plus)
-    } else if p.eat(&TokenKind::Minus) {
-        Some(UnaryOp::Minus)
     } else if p.eat(&TokenKind::Tilde) {
         Some(UnaryOp::BitNot)
     } else {

@@ -20,12 +20,20 @@ pub(super) fn parse_primary(p: &mut Parser) -> BqResult<Expr> {
             p.advance();
             parse_number_literal(&s, span)
         }
-        TokenKind::String(s) => {
+        TokenKind::String(mut s) => {
             p.advance();
+            while let TokenKind::String(next_s) = &p.peek().kind {
+                s.push_str(next_s);
+                p.advance();
+            }
             Ok(Expr::Literal(Literal::String(s)))
         }
-        TokenKind::Bytes(b) => {
+        TokenKind::Bytes(mut b) => {
             p.advance();
+            while let TokenKind::Bytes(next_b) = &p.peek().kind {
+                b.extend_from_slice(next_b);
+                p.advance();
+            }
             Ok(Expr::Literal(Literal::Bytes(b)))
         }
         TokenKind::Param(name) => {
@@ -188,17 +196,18 @@ fn parse_cast(p: &mut Parser, safe: bool) -> BqResult<Expr> {
     let expr = parse_expr(p)?;
     p.expect_kw("AS")?;
     let ty = parse_data_type(p)?;
-    let format = if p.eat_kw("FORMAT") {
-        if let TokenKind::String(s) = p.advance().kind {
-            Some(s)
+    let (format, time_zone) = if p.eat_kw("FORMAT") {
+        let fmt_expr = parse_expr(p)?;
+        let tz_expr = if p.eat_kw("AT") {
+            p.expect_kw("TIME")?;
+            p.expect_kw("ZONE")?;
+            Some(Box::new(parse_expr(p)?))
         } else {
-            return Err(BqError::syntax(
-                "Expected string format literal after FORMAT",
-                p.current_span(),
-            ));
-        }
+            None
+        };
+        (Some(Box::new(fmt_expr)), tz_expr)
     } else {
-        None
+        (None, None)
     };
     p.expect(&TokenKind::RParen, "')'")?;
     Ok(Expr::Cast {
@@ -206,6 +215,7 @@ fn parse_cast(p: &mut Parser, safe: bool) -> BqResult<Expr> {
         ty,
         safe,
         format,
+        time_zone,
     })
 }
 

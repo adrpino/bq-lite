@@ -48,8 +48,28 @@ impl BqNumeric {
                 "Cannot convert non-finite FLOAT64 ({v}) to NUMERIC"
             )));
         }
-        let s = format!("{v:.9}");
-        s.parse()
+        v.to_string().parse()
+    }
+
+    pub fn sum_slice(vals: &[Self]) -> BqResult<Self> {
+        let mut total = BigInt::zero();
+        for v in vals {
+            total += BigInt::from(v.0);
+        }
+        let raw =
+            i128::try_from(total).map_err(|_| BqError::semantic("NUMERIC overflow in SUM"))?;
+        Self::from_scaled(raw)
+    }
+
+    pub fn avg_slice(vals: &[Self]) -> BqResult<Self> {
+        let mut total = BigInt::zero();
+        for v in vals {
+            total += BigInt::from(v.0);
+        }
+        let count = BigInt::from(vals.len());
+        let avg = div_round_half_away(&total, &count);
+        let raw = i128::try_from(avg).map_err(|_| BqError::semantic("NUMERIC overflow in AVG"))?;
+        Self::from_scaled(raw)
     }
 
     #[must_use]
@@ -171,7 +191,25 @@ impl BqBigNumeric {
                 "Cannot convert non-finite FLOAT64 ({v}) to BIGNUMERIC"
             )));
         }
-        format!("{v:.38}").parse()
+        v.to_string().parse()
+    }
+
+    pub fn sum_slice(vals: &[&Self]) -> BqResult<Self> {
+        let mut total = BigInt::zero();
+        for v in vals {
+            total += &v.0;
+        }
+        Self::from_scaled(total)
+    }
+
+    pub fn avg_slice(vals: &[&Self]) -> BqResult<Self> {
+        let mut total = BigInt::zero();
+        for v in vals {
+            total += &v.0;
+        }
+        let count = BigInt::from(vals.len());
+        let avg = div_round_half_away(&total, &count);
+        Self::from_scaled(avg)
     }
 
     #[must_use]

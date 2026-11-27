@@ -5,6 +5,7 @@ use crate::types::BqValue;
 
 pub(super) const BYTES_EXTRA_FUNCTIONS: &[&str] = &[
     "ASCII",
+    "BIT_COUNT",
     "CODE_POINTS_TO_BYTES",
     "CODE_POINTS_TO_STRING",
     "OCTET_LENGTH",
@@ -16,6 +17,7 @@ pub(super) fn eval_bytes_extra_fn(name: &str, args: &[BqValue]) -> BqResult<Opti
     match name {
         "OCTET_LENGTH" => eval_octet_length(args).map(Some),
         "ASCII" => eval_ascii(args).map(Some),
+        "BIT_COUNT" => eval_bit_count(args).map(Some),
         "UNICODE" => eval_unicode(args).map(Some),
         "TO_CODE_POINTS" => eval_to_code_points(args).map(Some),
         "CODE_POINTS_TO_STRING" => eval_code_points_to_string(args).map(Some),
@@ -240,10 +242,14 @@ pub(super) fn eval_bytes_replace(src: &[u8], from: &[u8], to: &[u8]) -> BqValue 
 }
 
 pub(super) fn eval_bytes_repeat(bytes: &[u8], cnt: i64) -> BqResult<BqValue> {
+    const MAX_OUT: usize = 1_048_576;
     if cnt < 0 {
         return Err(BqError::semantic("REPEAT count cannot be negative"));
     }
-    let times = usize::try_from(cnt).unwrap_or(usize::MAX).min(1_000_000);
+    let times = usize::try_from(cnt).unwrap_or(usize::MAX);
+    if bytes.len().saturating_mul(times) > MAX_OUT {
+        return Err(BqError::semantic("REPEAT output size exceeds limit"));
+    }
     Ok(BqValue::Bytes(bytes.repeat(times)))
 }
 
@@ -290,12 +296,48 @@ fn eval_ascii(args: &[BqValue]) -> BqResult<BqValue> {
     };
     match arg {
         BqValue::Null => Ok(BqValue::Null),
-        BqValue::String(s) => Ok(BqValue::Int64(i64::from(
-            s.as_bytes().first().copied().unwrap_or(0),
-        ))),
+        BqValue::String(s) => {
+            let b = s.as_bytes().first().copied().unwrap_or(0);
+            if b > 127 {
+                return Err(BqError::semantic(
+                    "ASCII argument must start with an ASCII character",
+                ));
+            }
+            Ok(BqValue::Int64(i64::from(b)))
+        }
         BqValue::Bytes(b) => Ok(BqValue::Int64(i64::from(b.first().copied().unwrap_or(0)))),
         other => Err(BqError::query(format!(
             "ASCII expects STRING or BYTES, got {}",
+            other.infer_type()?
+        ))),
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "BIT_COUNT accepts INT64, BYTES, or NULL"
+)]
+fn eval_bit_count(args: &[BqValue]) -> BqResult<BqValue> {
+    let [arg] = args else {
+        return Err(BqError::query("BIT_COUNT expects 1 argument"));
+    };
+    match arg {
+        BqValue::Null => Ok(BqValue::Null),
+        BqValue::Int64(n) => Ok(BqValue::Int64(i64::from(n.count_ones()))),
+        BqValue::Bytes(b) => {
+            let ones: u64 = b.iter().map(|byte| u64::from(byte.count_ones())).sum();
+            Ok(BqValue::Int64(i64::try_from(ones).unwrap_or(i64::MAX)))
+        }
+        BqValue::String(s) => {
+            let ones: u64 = s
+                .as_bytes()
+                .iter()
+                .map(|byte| u64::from(byte.count_ones()))
+                .sum();
+            Ok(BqValue::Int64(i64::try_from(ones).unwrap_or(i64::MAX)))
+        }
+        other => Err(BqError::query(format!(
+            "BIT_COUNT expects INT64 or BYTES, got {}",
             other.infer_type()?
         ))),
     }

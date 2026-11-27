@@ -11,8 +11,8 @@ fn issue_9_json_object_two_array_signature() {
                TO_JSON_STRING(JSON_OBJECT(CAST([] AS ARRAY<STRING>), CAST([] AS ARRAY<INT64>))) AS empty_arrays,
                TO_JSON_STRING(JSON_OBJECT('items', [1, 2])) AS kv_array_val,
                TO_JSON_STRING(JSON_OBJECT('x', 10, 'x', 20)) AS kv_dup_key,
-               JSON_OBJECT(CAST(NULL AS ARRAY<STRING>), [1]) AS null_keys,
-               JSON_OBJECT(['a'], CAST(NULL AS ARRAY<INT64>)) AS null_vals",
+               SAFE.JSON_OBJECT(CAST(NULL AS ARRAY<STRING>), [1]) AS null_keys,
+               SAFE.JSON_OBJECT(['a'], CAST(NULL AS ARRAY<INT64>)) AS null_vals",
         )
         .unwrap();
 
@@ -45,12 +45,18 @@ fn issue_9_json_object_two_array_signature() {
 
     let empty_agg = eng
         .query(
-            "SELECT JSON_OBJECT(ARRAY_AGG(k), ARRAY_AGG(v)) AS obj
+            "SELECT SAFE.JSON_OBJECT(ARRAY_AGG(k), ARRAY_AGG(v)) AS obj
              FROM UNNEST(ARRAY<STRUCT<k STRING, v INT64>>[])",
         )
         .unwrap();
     assert_eq!(empty_agg.columns[0].ty, BqType::Json);
     assert_eq!(empty_agg.rows[0][0], BqValue::Null);
+    assert_eq!(
+        eng.query("SELECT JSON_OBJECT(CAST(NULL AS ARRAY<STRING>), [1])")
+            .unwrap_err()
+            .kind,
+        BqErrorKind::Semantic
+    );
 
     // Mismatched lengths & NULL keys are Semantic errors (SAFE.-suppressible)
     let err_len = eng

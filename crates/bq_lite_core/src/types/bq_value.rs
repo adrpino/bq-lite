@@ -30,20 +30,39 @@ impl BqInterval {
 
 impl fmt::Display for BqInterval {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let years = self.months / 12;
-        let rem_months = self.months % 12;
-        let total_secs = self.micros / 1_000_000;
-        let rem_micros = (self.micros % 1_000_000).abs();
+        let m_sign = if self.months < 0 { "-" } else { "" };
+        let abs_m = self.months.unsigned_abs();
+        let years = abs_m / 12;
+        let rem_months = abs_m % 12;
+
+        let t_sign = if self.micros < 0 { "-" } else { "" };
+        let abs_us = self.micros.unsigned_abs();
+        let total_secs = abs_us / 1_000_000;
+        let rem_us = abs_us % 1_000_000;
         let hours = total_secs / 3600;
         let mins = (total_secs % 3600) / 60;
         let secs = total_secs % 60;
-        write!(
-            f,
-            "{years}-{rem_months} {} {hours}:{:02}:{:02}.{rem_micros:06}",
-            self.days,
-            mins.abs(),
-            secs.abs()
-        )
+
+        if rem_us == 0 {
+            write!(
+                f,
+                "{m_sign}{years}-{rem_months} {} {t_sign}{hours}:{mins}:{secs}",
+                self.days
+            )
+        } else if rem_us % 1_000 == 0 {
+            write!(
+                f,
+                "{m_sign}{years}-{rem_months} {} {t_sign}{hours}:{mins}:{secs}.{:03}",
+                self.days,
+                rem_us / 1_000
+            )
+        } else {
+            write!(
+                f,
+                "{m_sign}{years}-{rem_months} {} {t_sign}{hours}:{mins}:{secs}.{rem_us:06}",
+                self.days
+            )
+        }
     }
 }
 

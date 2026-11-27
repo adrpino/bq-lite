@@ -196,7 +196,7 @@ fn parse_select(p: &mut Parser) -> BqResult<Select> {
         None
     };
 
-    let projection = p.parse_comma_list(parse_select_item)?;
+    let projection = parse_select_list(p)?;
     let from = if p.eat_kw("FROM") {
         parse_from_list(p)?
     } else {
@@ -234,6 +234,35 @@ fn parse_select(p: &mut Parser) -> BqResult<Select> {
         qualify,
         window,
     })
+}
+
+fn parse_select_list(p: &mut Parser) -> BqResult<Vec<SelectItem>> {
+    let mut items = Vec::new();
+    items.push(parse_select_item(p)?);
+    while p.eat(&TokenKind::Comma) {
+        if is_select_list_end(p) {
+            break;
+        }
+        items.push(parse_select_item(p)?);
+    }
+    Ok(items)
+}
+
+fn is_select_list_end(p: &Parser) -> bool {
+    matches!(
+        p.peek().kind,
+        TokenKind::Eof | TokenKind::RParen | TokenKind::Semicolon | TokenKind::Pipe
+    ) || p.is_kw("FROM")
+        || p.is_kw("WHERE")
+        || p.is_kw("GROUP")
+        || p.is_kw("HAVING")
+        || p.is_kw("QUALIFY")
+        || p.is_kw("WINDOW")
+        || p.is_kw("ORDER")
+        || p.is_kw("LIMIT")
+        || p.is_kw("UNION")
+        || p.is_kw("INTERSECT")
+        || p.is_kw("EXCEPT")
 }
 
 pub(super) fn parse_select_item(p: &mut Parser) -> BqResult<SelectItem> {

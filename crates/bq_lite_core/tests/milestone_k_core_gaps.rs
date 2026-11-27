@@ -599,7 +599,7 @@ fn milestone_k_coercion_trig_math_and_datetime_ctors() {
                CAST(1.5 AS BIGNUMERIC), CAST(TIMESTAMP '2026-01-01 12:30:00 UTC' AS TIME),
                CAST(DATE '2026-01-01' AS TIMESTAMP), CAST(DATETIME '2026-01-01 12:00:00' AS TIMESTAMP),
                CAST('{\"a\":1}' AS JSON), CAST([1, 2] AS ARRAY<FLOAT64>),
-               SAFE_CAST('NaN' AS INT64), SAFE_CAST('bad' AS JSON)",
+               SAFE_CAST('NaN' AS INT64), SAFE_CAST(CAST('NaN' AS FLOAT64) AS JSON)",
         )
         .unwrap();
     assert_eq!(qr.rows[0][0], BqValue::Int64(5));
@@ -621,7 +621,7 @@ fn milestone_k_coercion_trig_math_and_datetime_ctors() {
         "SELECT CAST(TRUE AS DATETIME)",
         "SELECT CAST(TRUE AS TIME)",
         "SELECT CAST(TRUE AS TIMESTAMP)",
-        "SELECT CAST(TRUE AS JSON)",
+        "SELECT CAST(CAST('NaN' AS FLOAT64) AS JSON)",
         "SELECT CAST(1 AS ARRAY<INT64>)",
     ];
     for sql in bad_casts {

@@ -92,6 +92,16 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Subscript { expr: e, index, .. } => {
             expr_has_aggregate(e) || expr_has_aggregate(index)
         }
+        Expr::In {
+            expr: e, target, ..
+        } => {
+            expr_has_aggregate(e)
+                || match target {
+                    crate::ast::InTarget::List(items) => items.iter().any(expr_has_aggregate),
+                    crate::ast::InTarget::Unnest(u) => expr_has_aggregate(u),
+                    crate::ast::InTarget::Subquery(_) => false,
+                }
+        }
         Expr::Literal(_)
         | Expr::Ident(_)
         | Expr::CompoundIdent(_)
@@ -100,7 +110,6 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
         | Expr::SystemVar(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
-        | Expr::In { .. }
         | Expr::Interval { .. }
         | Expr::RangeLiteral { .. }
         | Expr::Lambda { .. }

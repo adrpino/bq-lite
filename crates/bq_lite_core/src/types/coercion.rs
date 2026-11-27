@@ -125,12 +125,13 @@ pub fn cast_value(val: BqValue, target: &BqType) -> BqResult<BqValue> {
         BqType::Datetime => cast_to_datetime(val),
         BqType::Time => cast_to_time(val),
         BqType::Timestamp => cast_to_timestamp(val),
-        BqType::Json => cast_to_json(val),
+        BqType::Json => cast_to_json(&val),
+        BqType::Interval => cast_to_interval(val),
         BqType::Array(elem) => cast_to_array(val, elem),
         BqType::Struct(fields) => cast_to_struct(val, fields),
-        BqType::UntypedNull | BqType::Interval | BqType::Geography | BqType::Range(_) => Err(
-            BqError::query(format!("Unsupported CAST target type: {target}")),
-        ),
+        BqType::UntypedNull | BqType::Geography | BqType::Range(_) => Err(BqError::query(format!(
+            "Unsupported CAST target type: {target}"
+        ))),
     }
 }
 
@@ -184,13 +185,40 @@ fn cast_to_int64(val: BqValue) -> BqResult<BqValue> {
             .parse::<i64>()
             .map(BqValue::Int64)
             .map_err(|_| BqError::semantic("NUMERIC out of INT64 range")),
-        BqValue::String(s) => s
-            .trim()
-            .parse::<i64>()
-            .map(BqValue::Int64)
-            .map_err(|_| BqError::semantic(format!("Bad int64 value: '{s}'"))),
+        BqValue::String(s) => parse_i64_str(&s),
         other => unsupported_cast(&other, "INT64"),
     }
+}
+
+fn parse_i64_str(s: &str) -> BqResult<BqValue> {
+    let trimmed = s.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .or_else(|| trimmed.strip_prefix("+0x"))
+        .or_else(|| trimmed.strip_prefix("+0X"))
+    {
+        return i64::from_str_radix(hex, 16)
+            .map(BqValue::Int64)
+            .map_err(|_| BqError::semantic(format!("Bad int64 value: '{s}'")));
+    }
+    if let Some(hex) = trimmed
+        .strip_prefix("-0x")
+        .or_else(|| trimmed.strip_prefix("-0X"))
+    {
+        let abs = u64::from_str_radix(hex, 16)
+            .map_err(|_| BqError::semantic(format!("Bad int64 value: '{s}'")))?;
+        if abs == (i64::MAX as u64) + 1 {
+            return Ok(BqValue::Int64(i64::MIN));
+        }
+        let signed =
+            i64::try_from(abs).map_err(|_| BqError::semantic(format!("Bad int64 value: '{s}'")))?;
+        return Ok(BqValue::Int64(-signed));
+    }
+    trimmed
+        .parse::<i64>()
+        .map(BqValue::Int64)
+        .map_err(|_| BqError::semantic(format!("Bad int64 value: '{s}'")))
 }
 
 #[expect(
@@ -344,17 +372,19 @@ fn cast_to_timestamp(val: BqValue) -> BqResult<BqValue> {
     }
 }
 
+fn cast_to_json(val: &BqValue) -> BqResult<BqValue> {
+    super::json_conv::bq_value_to_json(val, true).map(|j| BqValue::Json(Box::new(j)))
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "Remaining BqValue variants are invalid CAST sources to JSON"
+    reason = "Remaining BqValue variants are invalid CAST sources to INTERVAL"
 )]
-fn cast_to_json(val: BqValue) -> BqResult<BqValue> {
+fn cast_to_interval(val: BqValue) -> BqResult<BqValue> {
     match val {
-        BqValue::Json(j) => Ok(BqValue::Json(j)),
-        BqValue::String(s) => serde_json::from_str::<serde_json::Value>(&s)
-            .map(|v| BqValue::Json(Box::new(v)))
-            .map_err(|e| BqError::semantic(format!("Invalid JSON string: {e}"))),
-        other => unsupported_cast(&other, "JSON"),
+        BqValue::Interval(iv) => Ok(BqValue::Interval(iv)),
+        BqValue::String(s) => super::interval_parse::parse_interval_cast(&s).map(BqValue::Interval),
+        other => unsupported_cast(&other, "INTERVAL"),
     }
 }
 

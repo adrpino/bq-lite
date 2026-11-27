@@ -120,10 +120,11 @@ fn covers_cast_errors_and_datetime_array_casts() {
         ("bad", BqType::Time),
         ("bad", BqType::Datetime),
         ("bad", BqType::Timestamp),
-        ("{bad", BqType::Json),
+        ("bad", BqType::Interval),
     ] {
         assert!(cast_value(BqValue::String(bad.to_owned()), &ty).is_err());
     }
+    assert!(cast_value(BqValue::Float64(f64::NAN), &BqType::Json).is_err());
     assert!(cast_value(
         BqValue::String("2024-01-02 03:04:05+00:00".to_owned()),
         &BqType::Timestamp

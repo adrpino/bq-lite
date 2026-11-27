@@ -150,6 +150,12 @@ pub enum TableFactor {
         spec: UnpivotSpec,
         alias: Option<Ident>,
     },
+    TableSample {
+        source: Box<Self>,
+        method: String,
+        amount: Box<Expr>,
+        is_percent: bool,
+    },
     NestedJoin(Box<TableWithJoins>),
 }
 

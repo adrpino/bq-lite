@@ -131,9 +131,10 @@ fn hash_bq_value(val: &BqValue, h: &mut DefaultHasher) {
         }
         BqValue::Interval(iv) => {
             9_u8.hash(h);
-            iv.months.hash(h);
-            iv.days.hash(h);
-            iv.micros.hash(h);
+            let norm = i128::from(iv.months) * 30 * 86_400_000_000
+                + i128::from(iv.days) * 86_400_000_000
+                + i128::from(iv.micros);
+            norm.hash(h);
         }
         BqValue::Json(j) => {
             10_u8.hash(h);

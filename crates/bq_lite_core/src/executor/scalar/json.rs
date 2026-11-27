@@ -4,8 +4,8 @@ use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
 
 use super::json_path::{
-    format_datetime_iso, format_timestamp_rfc3339, remove_json_path, resolve_json_path,
-    set_json_path, write_bq_json_string,
+    append_json_array_path, insert_json_array_path, remove_json_path, resolve_json_path,
+    resolve_json_query_path, set_json_path, write_bq_json_string,
 };
 
 pub(super) const JSON_FUNCTIONS: &[&str] = &[
@@ -13,10 +13,13 @@ pub(super) const JSON_FUNCTIONS: &[&str] = &[
     "FLOAT64",
     "INT64",
     "JSON_ARRAY",
+    "JSON_ARRAY_APPEND",
+    "JSON_ARRAY_INSERT",
     "JSON_EXTRACT",
     "JSON_EXTRACT_ARRAY",
     "JSON_EXTRACT_SCALAR",
     "JSON_EXTRACT_STRING_ARRAY",
+    "JSON_FLATTEN",
     "JSON_KEYS",
     "JSON_OBJECT",
     "JSON_QUERY",
@@ -50,8 +53,11 @@ pub(super) fn eval_json_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<Bq
         "JSON_ARRAY" => Ok(Some(BqValue::Json(Box::new(JsonValue::Array(
             args.iter().map(bq_to_json).collect(),
         ))))),
+        "JSON_FLATTEN" => eval_json_flatten(&args).map(Some),
         "JSON_KEYS" => eval_json_keys(&args).map(Some),
-        "JSON_SET" | "JSON_REMOVE" => eval_json_mutate(name, args).map(Some),
+        "JSON_SET" | "JSON_REMOVE" | "JSON_ARRAY_INSERT" | "JSON_ARRAY_APPEND" => {
+            eval_json_mutate(name, args).map(Some)
+        }
         "INT64" | "FLOAT64" | "BOOL" | "STRING" => eval_json_typed_accessor(name, args).map(Some),
         _ => Ok(None),
     }
@@ -91,46 +97,8 @@ fn eval_to_json_string(args: &[BqValue]) -> BqResult<BqValue> {
     Ok(BqValue::String(out))
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Remaining BqValue scalar variants serialize via Display string"
-)]
 fn bq_to_json(val: &BqValue) -> JsonValue {
-    match val {
-        BqValue::Null => JsonValue::Null,
-        BqValue::Bool(b) => JsonValue::Bool(*b),
-        BqValue::Int64(n) => JsonValue::Number((*n).into()),
-        BqValue::Float64(f) => float_to_json_value(*f),
-        BqValue::String(s) | BqValue::Geography(s) => JsonValue::String(s.clone()),
-        BqValue::Timestamp(ts) => JsonValue::String(format_timestamp_rfc3339(*ts)),
-        BqValue::Datetime(dt) => JsonValue::String(format_datetime_iso(*dt)),
-        BqValue::Json(j) => (**j).clone(),
-        BqValue::Array(items) => JsonValue::Array(items.iter().map(bq_to_json).collect()),
-        BqValue::Struct(fields) => {
-            let mut map = Map::new();
-            for (idx, f) in fields.iter().enumerate() {
-                let k = f.name.clone().unwrap_or_else(|| format!("f{idx}_"));
-                map.insert(k, bq_to_json(&f.value));
-            }
-            JsonValue::Object(map)
-        }
-        other => JsonValue::String(other.to_string()),
-    }
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Float is verified finite, integral, and within exact IEEE-754 integer range [-2^53, 2^53]"
-)]
-fn float_to_json_value(f: f64) -> JsonValue {
-    const MAX_EXACT_INT: f64 = 9_007_199_254_740_992.0;
-    if f.is_finite()
-        && f.trunc().to_bits() == f.to_bits()
-        && (-MAX_EXACT_INT..=MAX_EXACT_INT).contains(&f)
-    {
-        return JsonValue::Number((f as i64).into());
-    }
-    serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+    crate::types::bq_value_to_json(val, false).unwrap_or(JsonValue::Null)
 }
 
 #[expect(
@@ -162,7 +130,7 @@ fn eval_json_query(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValu
             Err(BqError::query("JSONPath must be STRING"))
         };
     };
-    let Some(target) = resolve_json_path(&doc, &path, legacy_brackets)? else {
+    let Some(target) = resolve_json_query_path(&doc, &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     #[expect(
@@ -170,7 +138,7 @@ fn eval_json_query(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValu
         reason = "Return JSON when input is JSON, STRING otherwise"
     )]
     match doc_v {
-        BqValue::Json(_) => Ok(BqValue::Json(Box::new(target.clone()))),
+        BqValue::Json(_) => Ok(BqValue::Json(Box::new(target))),
         _ => Ok(BqValue::String(target.to_string())),
     }
 }
@@ -295,8 +263,15 @@ fn eval_json_object(args: Vec<BqValue>) -> BqResult<BqValue> {
 }
 
 fn eval_json_object_arrays(keys_v: BqValue, vals_v: BqValue) -> BqResult<BqValue> {
-    if keys_v.is_null() || vals_v.is_null() {
-        return Ok(BqValue::Null);
+    if keys_v.is_null() {
+        return Err(BqError::semantic(
+            "Invalid input to JSON_OBJECT: The keys array cannot be NULL",
+        ));
+    }
+    if vals_v.is_null() {
+        return Err(BqError::semantic(
+            "Invalid input to JSON_OBJECT: The values array cannot be NULL",
+        ));
     }
     let BqValue::Array(keys) = keys_v else {
         return Err(BqError::query(
@@ -345,6 +320,36 @@ fn eval_json_keys(args: &[BqValue]) -> BqResult<BqValue> {
     ))
 }
 
+fn eval_json_flatten(args: &[BqValue]) -> BqResult<BqValue> {
+    let [arg] = args else {
+        return Err(BqError::query("JSON_FLATTEN expects 1 argument"));
+    };
+    if arg.is_null() {
+        return Ok(BqValue::Null);
+    }
+    let BqValue::Json(j) = arg else {
+        return Err(BqError::query("JSON_FLATTEN expects JSON"));
+    };
+    let mut out = Vec::new();
+    flatten_json_rec(j, &mut out);
+    Ok(BqValue::Array(out))
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Non-array JSON values are leaf nodes for JSON_FLATTEN"
+)]
+fn flatten_json_rec(val: &JsonValue, out: &mut Vec<BqValue>) {
+    match val {
+        JsonValue::Array(items) => {
+            for item in items {
+                flatten_json_rec(item, out);
+            }
+        }
+        other => out.push(BqValue::Json(Box::new(other.clone()))),
+    }
+}
+
 fn eval_json_mutate(name: &str, args: Vec<BqValue>) -> BqResult<BqValue> {
     let Some(doc_v) = args.first() else {
         return Err(BqError::query(format!(
@@ -371,14 +376,42 @@ fn eval_json_mutate(name: &str, args: Vec<BqValue>) -> BqResult<BqValue> {
         let mut it = args.into_iter().skip(1);
         while let (Some(p_v), Some(val_v)) = (it.next(), it.next()) {
             if let BqValue::String(p) = p_v {
-                set_json_path(&mut cloned, &p, bq_to_json(&val_v))?;
+                let jv = bq_to_json(&val_v);
+                match name {
+                    "JSON_ARRAY_INSERT" => insert_json_array_path(&mut cloned, &p, jv)?,
+                    "JSON_ARRAY_APPEND" => append_json_array_path(&mut cloned, &p, jv)?,
+                    _ => set_json_path(&mut cloned, &p, jv)?,
+                }
             }
         }
     }
     Ok(BqValue::Json(Box::new(cloned)))
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "JSON float is verified finite, integral, and within exact i64 range before cast"
+)]
+fn json_number_to_i64(n: &serde_json::Number) -> BqResult<BqValue> {
+    if let Some(i) = n.as_i64() {
+        return Ok(BqValue::Int64(i));
+    }
+    if let Some(f) = n.as_f64() {
+        let min_b = -(2.0_f64.powi(63));
+        let max_b = 2.0_f64.powi(63);
+        if f.is_finite() && f.trunc().to_bits() == f.to_bits() && f >= min_b && f < max_b {
+            return Ok(BqValue::Int64(f as i64));
+        }
+    }
+    Err(BqError::semantic("JSON number out of INT64 range"))
+}
+
 fn eval_json_typed_accessor(name: &str, args: Vec<BqValue>) -> BqResult<BqValue> {
+    if name == "STRING" && !args.is_empty() && args.len() <= 2 {
+        if let Some(res) = try_eval_string_temporal(&args)? {
+            return Ok(res);
+        }
+    }
     let [arg]: [BqValue; 1] = args
         .try_into()
         .map_err(|_| BqError::query(format!("{name} expects 1 JSON argument")))?;
@@ -390,10 +423,7 @@ fn eval_json_typed_accessor(name: &str, args: Vec<BqValue>) -> BqResult<BqValue>
         };
     };
     match (name, &*j) {
-        ("INT64", JsonValue::Number(n)) => n
-            .as_i64()
-            .map(BqValue::Int64)
-            .ok_or_else(|| BqError::semantic("JSON number out of INT64 range")),
+        ("INT64", JsonValue::Number(n)) => json_number_to_i64(n),
         ("FLOAT64", JsonValue::Number(n)) => n
             .as_f64()
             .map(BqValue::Float64)
@@ -403,5 +433,30 @@ fn eval_json_typed_accessor(name: &str, args: Vec<BqValue>) -> BqResult<BqValue>
         _ => Err(BqError::semantic(format!(
             "JSON value cannot be converted to {name}"
         ))),
+    }
+}
+
+fn try_eval_string_temporal(args: &[BqValue]) -> BqResult<Option<BqValue>> {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    if args.len() == 2 && (first.is_null() || args.get(1).is_some_and(BqValue::is_null)) {
+        return Ok(Some(BqValue::Null));
+    }
+    match (first, args.get(1)) {
+        (BqValue::Date(d), None) => Ok(Some(BqValue::String(d.format("%Y-%m-%d").to_string()))),
+        (BqValue::Datetime(dt), None) => Ok(Some(BqValue::String(
+            dt.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
+        ))),
+        (BqValue::Time(t), None) => Ok(Some(BqValue::String(t.format("%H:%M:%S%.f").to_string()))),
+        (BqValue::Timestamp(ts), None) => Ok(Some(BqValue::String(
+            ts.format("%Y-%m-%d %H:%M:%S%.f+00").to_string(),
+        ))),
+        (BqValue::Timestamp(ts), Some(BqValue::String(tz_s))) => {
+            let tz = crate::types::BqTimezone::parse(tz_s)?;
+            let formatted = tz.format_timestamp(*ts, "%Y-%m-%d %H:%M:%S%.f%:z");
+            Ok(Some(BqValue::String(formatted)))
+        }
+        _ => Ok(None),
     }
 }

@@ -101,6 +101,35 @@ pub(super) fn parse_table_factor(p: &mut Parser) -> BqResult<TableFactor> {
             };
             continue;
         }
+        if p.eat_kw("TABLESAMPLE") {
+            let method = p.parse_ident()?.value;
+            p.expect(&TokenKind::LParen, "'('")?;
+            let amount = parse_expr(p)?;
+            let unit = p.parse_ident()?.value.to_ascii_uppercase();
+            let is_percent = match unit.as_str() {
+                "PERCENT" => true,
+                "ROWS" => false,
+                _ => {
+                    return Err(BqError::syntax(
+                        "Expected PERCENT or ROWS in TABLESAMPLE",
+                        p.current_span(),
+                    ))
+                }
+            };
+            p.expect(&TokenKind::RParen, "')'")?;
+            if p.eat_kw("REPEATABLE") {
+                p.expect(&TokenKind::LParen, "'('")?;
+                let _seed = parse_expr(p)?;
+                p.expect(&TokenKind::RParen, "')'")?;
+            }
+            factor = TableFactor::TableSample {
+                source: Box::new(factor),
+                method,
+                amount: Box::new(amount),
+                is_percent,
+            };
+            continue;
+        }
         return Ok(factor);
     }
 }

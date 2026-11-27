@@ -11,11 +11,15 @@ use super::bytes_fn::{
 use super::string_fmt::{
     eval_format, eval_from_base64, eval_from_hex, eval_to_base64, eval_to_hex,
 };
-use super::string_instr::eval_instr;
+use super::string_instr::{
+    eval_chr, eval_initcap, eval_instr, eval_parse_numeric_fn, eval_soundex, eval_split_substr,
+    eval_translate,
+};
 
 pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "BYTE_LENGTH",
     "CHAR_LENGTH",
+    "CHR",
     "CONCAT",
     "ENDS_WITH",
     "FORMAT",
@@ -23,11 +27,14 @@ pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "FROM_HEX",
     "INITCAP",
     "INSTR",
+    "LCASE",
     "LEFT",
     "LENGTH",
     "LOWER",
     "LPAD",
     "LTRIM",
+    "PARSE_BIGNUMERIC",
+    "PARSE_NUMERIC",
     "REPEAT",
     "REPLACE",
     "REVERSE",
@@ -35,7 +42,9 @@ pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "RPAD",
     "RTRIM",
     "SAFE_CONVERT_BYTES_TO_STRING",
+    "SOUNDEX",
     "SPLIT",
+    "SPLIT_SUBSTR",
     "STARTS_WITH",
     "STRPOS",
     "SUBSTR",
@@ -44,6 +53,7 @@ pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "TO_HEX",
     "TRANSLATE",
     "TRIM",
+    "UCASE",
     "UPPER",
 ];
 
@@ -53,13 +63,18 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
         "SUBSTR" | "SUBSTRING" => eval_substr(args).map(Some),
         "LENGTH" | "CHAR_LENGTH" => eval_length(args, false).map(Some),
         "BYTE_LENGTH" => eval_length(args, true).map(Some),
-        "LOWER" => eval_case_change(args, "LOWER", true).map(Some),
-        "UPPER" => eval_case_change(args, "UPPER", false).map(Some),
+        "LOWER" | "LCASE" => eval_case_change(args, name, true).map(Some),
+        "UPPER" | "UCASE" => eval_case_change(args, name, false).map(Some),
         "INITCAP" => eval_initcap(args).map(Some),
         "REVERSE" => eval_reverse(args).map(Some),
         "STRPOS" => eval_strpos(args).map(Some),
         "INSTR" => eval_instr(args).map(Some),
+        "CHR" => eval_chr(&args).map(Some),
+        "SOUNDEX" => eval_soundex(&args).map(Some),
         "SPLIT" => eval_split(args).map(Some),
+        "SPLIT_SUBSTR" => eval_split_substr(&args).map(Some),
+        "PARSE_NUMERIC" => eval_parse_numeric_fn(&args, false).map(Some),
+        "PARSE_BIGNUMERIC" => eval_parse_numeric_fn(&args, true).map(Some),
         "TRIM" => eval_trim(args, true, true).map(Some),
         "LTRIM" => eval_trim(args, true, false).map(Some),
         "RTRIM" => eval_trim(args, false, true).map(Some),
@@ -84,7 +99,7 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "CONCAT expects STRING, BYTES, or NULL"
+    reason = "Remaining scalar BqValue variants format via Display for CONCAT"
 )]
 fn eval_concat_fn(args: Vec<BqValue>) -> BqResult<BqValue> {
     if args.is_empty() {
@@ -98,15 +113,35 @@ fn eval_concat_fn(args: Vec<BqValue>) -> BqResult<BqValue> {
         match a {
             BqValue::Null => return Ok(BqValue::Null),
             BqValue::String(s) => out.push_str(&s),
-            other => {
+            BqValue::Array(_) | BqValue::Struct(_) => {
                 return Err(BqError::query(format!(
                     "CONCAT expects STRING or BYTES, got {}",
-                    other.infer_type()?
+                    a.infer_type()?
                 )))
             }
+            BqValue::Float64(f) => out.push_str(&format_float_for_concat(f)),
+            other => out.push_str(&other.to_string()),
         }
     }
     Ok(BqValue::String(out))
+}
+
+fn format_float_for_concat(f: f64) -> String {
+    if !f.is_finite() {
+        return BqValue::Float64(f).to_string();
+    }
+    if f.abs() >= 1e15 || (f != 0.0 && f.abs() < 1e-4) {
+        let s = format!("{f:e}");
+        if let Some((mant, exp)) = s.split_once('e') {
+            let exp_n = exp.parse::<i32>().unwrap_or(0);
+            return if exp_n >= 0 {
+                format!("{mant}e+{exp_n:02}")
+            } else {
+                format!("{mant}e-{:02}", exp_n.unsigned_abs())
+            };
+        }
+    }
+    f.to_string()
 }
 
 #[expect(
@@ -202,33 +237,6 @@ fn eval_substr(args: Vec<BqValue>) -> BqResult<BqValue> {
     let end = start.saturating_add(take).min(total);
     let slice: String = chars.get(start..end).unwrap_or(&[]).iter().collect();
     Ok(BqValue::String(slice))
-}
-
-fn eval_initcap(args: Vec<BqValue>) -> BqResult<BqValue> {
-    let [arg]: [BqValue; 1] = args
-        .try_into()
-        .map_err(|_| BqError::query("INITCAP expects 1 argument"))?;
-    let BqValue::String(s) = arg else {
-        return if arg.is_null() {
-            Ok(BqValue::Null)
-        } else {
-            Err(BqError::query("INITCAP expects STRING"))
-        };
-    };
-    let mut out = String::with_capacity(s.len());
-    let mut new_word = true;
-    for ch in s.chars() {
-        if !ch.is_alphanumeric() {
-            new_word = true;
-            out.push(ch);
-        } else if new_word {
-            out.extend(ch.to_uppercase());
-            new_word = false;
-        } else {
-            out.extend(ch.to_lowercase());
-        }
-    }
-    Ok(BqValue::String(out))
 }
 
 fn eval_strpos(args: Vec<BqValue>) -> BqResult<BqValue> {
@@ -357,6 +365,9 @@ fn eval_pad(args: Vec<BqValue>, left: bool) -> BqResult<BqValue> {
         return Err(BqError::semantic("LPAD/RPAD pattern cannot be empty"));
     }
     let target_len = usize::try_from(target).unwrap_or(usize::MAX);
+    if target_len > 1_048_576 {
+        return Err(BqError::semantic("LPAD/RPAD output size exceeds limit"));
+    }
     let cur_chars: Vec<char> = s.chars().collect();
     if cur_chars.len() >= target_len {
         return Ok(BqValue::String(
@@ -388,32 +399,8 @@ fn eval_replace(args: Vec<BqValue>) -> BqResult<BqValue> {
     Ok(BqValue::String(s.replace(&f, &t)))
 }
 
-fn eval_translate(args: Vec<BqValue>) -> BqResult<BqValue> {
-    let [s, from, to]: [BqValue; 3] = args
-        .try_into()
-        .map_err(|_| BqError::query("TRANSLATE expects 3 arguments"))?;
-    if s.is_null() || from.is_null() || to.is_null() {
-        return Ok(BqValue::Null);
-    }
-    let (BqValue::String(s), BqValue::String(f), BqValue::String(t)) = (s, from, to) else {
-        return Err(BqError::query("TRANSLATE expects STRING arguments"));
-    };
-    let from_chars: Vec<char> = f.chars().collect();
-    let to_chars: Vec<char> = t.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if let Some(pos) = from_chars.iter().position(|&c| c == ch) {
-            if let Some(&rep) = to_chars.get(pos) {
-                out.push(rep);
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(BqValue::String(out))
-}
-
 fn eval_repeat(args: Vec<BqValue>) -> BqResult<BqValue> {
+    const MAX_OUT: usize = 1_048_576;
     let [s, n]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("REPEAT expects 2 arguments"))?;
@@ -429,7 +416,10 @@ fn eval_repeat(args: Vec<BqValue>) -> BqResult<BqValue> {
     if cnt < 0 {
         return Err(BqError::semantic("REPEAT count cannot be negative"));
     }
-    let times = usize::try_from(cnt).unwrap_or(usize::MAX).min(1_000_000);
+    let times = usize::try_from(cnt).unwrap_or(usize::MAX);
+    if text.len().saturating_mul(times) > MAX_OUT {
+        return Err(BqError::semantic("REPEAT output size exceeds limit"));
+    }
     Ok(BqValue::String(text.repeat(times)))
 }
 

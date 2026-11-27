@@ -4,10 +4,187 @@ use crate::ast::{FunctionCall, NullHandling};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::ExecContext;
 use crate::executor::evaluator::{compare_values, eval_expr};
-use crate::types::BqValue;
+use crate::types::coercion::{coerce_value, common_supertype};
+use crate::types::{BqType, BqValue};
 
 use super::agg_builtins::{collect_arg_values, dedup_values};
 use super::exec_util::RowSlice;
+use super::sort::sort_with_order_keys;
+
+pub(super) fn eval_array_concat_agg(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let arg = call
+        .args
+        .first()
+        .ok_or_else(|| BqError::query("ARRAY_CONCAT_AGG requires 1 argument"))?;
+    let mut items = Vec::new();
+    for row in rows.iter() {
+        let val = eval_expr(&arg.expr, row, ctx)?;
+        if val.is_null() {
+            continue;
+        }
+        let keys = call
+            .order_by
+            .iter()
+            .map(|ob| eval_expr(&ob.expr, row, ctx))
+            .collect::<BqResult<Vec<_>>>()?;
+        items.push((val, keys));
+    }
+    if !call.order_by.is_empty() {
+        sort_with_order_keys(&mut items, &call.order_by)?;
+    }
+    if let Some(ref lim_expr) = call.limit {
+        if let BqValue::Int64(n) =
+            eval_expr(lim_expr, &crate::executor::context::EvalRow::default(), ctx)?
+        {
+            let cap = usize::try_from(n.max(0)).unwrap_or(0);
+            items.truncate(cap);
+        }
+    }
+    if items.is_empty() {
+        return Ok(BqValue::Null);
+    }
+    let mut out = Vec::new();
+    for (v, _) in items {
+        let BqValue::Array(arr) = v else {
+            return Err(BqError::query("ARRAY_CONCAT_AGG expects ARRAY arguments"));
+        };
+        out.extend(arr);
+    }
+    Ok(BqValue::Array(out))
+}
+
+pub(super) fn eval_bitwise_bytes_agg(name: &str, vals: Vec<BqValue>) -> BqResult<BqValue> {
+    let mut it = vals.into_iter();
+    let Some(BqValue::Bytes(mut acc)) = it.next() else {
+        return Err(BqError::query(format!("{name} expects INT64 or BYTES")));
+    };
+    for v in it {
+        let BqValue::Bytes(b) = v else {
+            return Err(BqError::query(format!("{name} expects BYTES")));
+        };
+        if b.len() != acc.len() {
+            return Err(BqError::semantic(format!(
+                "{name} BYTES inputs must have equal length"
+            )));
+        }
+        for (a, x) in acc.iter_mut().zip(b.iter()) {
+            match name {
+                "BIT_AND" => *a &= *x,
+                "BIT_OR" => *a |= *x,
+                _ => *a ^= *x,
+            }
+        }
+    }
+    Ok(BqValue::Bytes(acc))
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Values are coerced to NUMERIC/BIGNUMERIC immediately prior to extraction"
+)]
+pub(super) fn sum_collected_values(vals: Vec<BqValue>) -> BqResult<BqValue> {
+    let Some(first) = vals.first() else {
+        return Ok(BqValue::Null);
+    };
+    if matches!(first, BqValue::Interval(_)) {
+        return crate::executor::scalar::sum_intervals(&vals);
+    }
+    let types: Vec<BqType> = vals
+        .iter()
+        .map(BqValue::infer_type)
+        .collect::<BqResult<_>>()?;
+    let supertype = common_supertype(&types)?;
+    if supertype == BqType::Numeric {
+        let nums: Vec<crate::types::BqNumeric> = vals
+            .into_iter()
+            .map(|v| match coerce_value(v, &BqType::Numeric)? {
+                BqValue::Numeric(n) => Ok(n),
+                _ => Err(BqError::internal("expected NUMERIC")),
+            })
+            .collect::<BqResult<_>>()?;
+        return crate::types::BqNumeric::sum_slice(&nums).map(BqValue::Numeric);
+    }
+    if supertype == BqType::BigNumeric {
+        let bnums: Vec<crate::types::BqBigNumeric> = vals
+            .into_iter()
+            .map(|v| match coerce_value(v, &BqType::BigNumeric)? {
+                BqValue::BigNumeric(bn) => Ok(*bn),
+                _ => Err(BqError::internal("expected BIGNUMERIC")),
+            })
+            .collect::<BqResult<_>>()?;
+        let refs: Vec<&crate::types::BqBigNumeric> = bnums.iter().collect();
+        return crate::types::BqBigNumeric::sum_slice(&refs)
+            .map(|v| BqValue::BigNumeric(Box::new(v)));
+    }
+    let mut acc = coerce_value(first.clone(), &supertype)?;
+    for v in vals.into_iter().skip(1) {
+        acc = crate::executor::evaluator::eval_binary(crate::ast::BinaryOp::Add, acc, v)?;
+    }
+    Ok(acc)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "AVG only supports numeric scalar variants"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "GoogleSQL AVG converts integer sums to FLOAT64"
+)]
+pub(super) fn eval_avg(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let vals = collect_arg_values(call, rows, ctx)?;
+    if vals.is_empty() {
+        return Ok(BqValue::Null);
+    }
+    if matches!(vals.first(), Some(BqValue::Interval(_))) {
+        return crate::executor::scalar::avg_intervals(&vals);
+    }
+    let types: Vec<BqType> = vals
+        .iter()
+        .map(BqValue::infer_type)
+        .collect::<BqResult<_>>()?;
+    let supertype = common_supertype(&types)?;
+    if supertype == BqType::Numeric {
+        let nums: Vec<crate::types::BqNumeric> = vals
+            .into_iter()
+            .map(|v| match coerce_value(v, &BqType::Numeric)? {
+                BqValue::Numeric(n) => Ok(n),
+                _ => Err(BqError::internal("expected NUMERIC")),
+            })
+            .collect::<BqResult<_>>()?;
+        return crate::types::BqNumeric::avg_slice(&nums).map(BqValue::Numeric);
+    }
+    if supertype == BqType::BigNumeric {
+        let bnums: Vec<crate::types::BqBigNumeric> = vals
+            .into_iter()
+            .map(|v| match coerce_value(v, &BqType::BigNumeric)? {
+                BqValue::BigNumeric(bn) => Ok(*bn),
+                _ => Err(BqError::internal("expected BIGNUMERIC")),
+            })
+            .collect::<BqResult<_>>()?;
+        let refs: Vec<&crate::types::BqBigNumeric> = bnums.iter().collect();
+        return crate::types::BqBigNumeric::avg_slice(&refs)
+            .map(|v| BqValue::BigNumeric(Box::new(v)));
+    }
+    let count = vals.len();
+    let sum = sum_collected_values(vals)?;
+    match sum {
+        BqValue::Int64(n) => Ok(BqValue::Float64((n as f64) / (count as f64))),
+        BqValue::Float64(f) => Ok(BqValue::Float64(f / (count as f64))),
+        other => Err(BqError::query(format!(
+            "AVG not supported for {}",
+            other.infer_type()?
+        ))),
+    }
+}
 
 const MAX_APPROX_QUANTILES: i64 = 1_000_000;
 

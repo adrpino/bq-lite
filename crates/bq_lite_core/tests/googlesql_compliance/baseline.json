@@ -1,17 +1,17 @@
 {
   "additional_date_time_functions.test": {
-    "passed": 0,
-    "failed": 16,
+    "passed": 16,
+    "failed": 0,
     "skipped": 4
   },
   "aggregation_distinct_queries.test": {
-    "passed": 58,
-    "failed": 29,
+    "passed": 81,
+    "failed": 6,
     "skipped": 71
   },
   "aggregation_having_modifier_queries.test": {
-    "passed": 25,
-    "failed": 9,
+    "passed": 34,
+    "failed": 0,
     "skipped": 9
   },
   "aggregation_order_by_queries.test": {
@@ -20,13 +20,13 @@
     "skipped": 34
   },
   "aggregation_queries.test": {
-    "passed": 88,
-    "failed": 47,
+    "passed": 125,
+    "failed": 10,
     "skipped": 132
   },
   "analytic_any_value.test": {
-    "passed": 7,
-    "failed": 5,
+    "passed": 9,
+    "failed": 3,
     "skipped": 10
   },
   "analytic_array_aggregation.test": {
@@ -55,8 +55,8 @@
     "skipped": 4
   },
   "analytic_count.test": {
-    "passed": 22,
-    "failed": 26,
+    "passed": 38,
+    "failed": 10,
     "skipped": 57
   },
   "analytic_count_if.test": {
@@ -80,8 +80,8 @@
     "skipped": 10
   },
   "analytic_lag.test": {
-    "passed": 18,
-    "failed": 13,
+    "passed": 26,
+    "failed": 5,
     "skipped": 15
   },
   "analytic_last_value.test": {
@@ -90,8 +90,8 @@
     "skipped": 10
   },
   "analytic_lead.test": {
-    "passed": 18,
-    "failed": 13,
+    "passed": 26,
+    "failed": 5,
     "skipped": 15
   },
   "analytic_logical_and.test": {
@@ -105,8 +105,8 @@
     "skipped": 0
   },
   "analytic_min_max.test": {
-    "passed": 14,
-    "failed": 7,
+    "passed": 21,
+    "failed": 0,
     "skipped": 33
   },
   "analytic_nth_value.test": {
@@ -160,8 +160,8 @@
     "skipped": 64
   },
   "any_value_aggregation.test": {
-    "passed": 9,
-    "failed": 2,
+    "passed": 11,
+    "failed": 0,
     "skipped": 4
   },
   "arithmetic_functions.test": {
@@ -170,23 +170,23 @@
     "skipped": 14
   },
   "array_aggregation.test": {
-    "passed": 15,
-    "failed": 13,
+    "passed": 21,
+    "failed": 7,
     "skipped": 126
   },
   "array_constructors.test": {
-    "passed": 7,
-    "failed": 11,
+    "passed": 16,
+    "failed": 2,
     "skipped": 114
   },
   "array_functions.test": {
-    "passed": 64,
-    "failed": 29,
+    "passed": 89,
+    "failed": 4,
     "skipped": 86
   },
   "array_functions_with_lambda.test": {
-    "passed": 2,
-    "failed": 3,
+    "passed": 4,
+    "failed": 1,
     "skipped": 30
   },
   "array_joins.test": {
@@ -195,18 +195,18 @@
     "skipped": 0
   },
   "array_of_arrays.test": {
-    "passed": 0,
-    "failed": 6,
+    "passed": 1,
+    "failed": 5,
     "skipped": 9
   },
   "array_queries.test": {
-    "passed": 3,
-    "failed": 16,
+    "passed": 4,
+    "failed": 15,
     "skipped": 45
   },
   "bytes.test": {
-    "passed": 35,
-    "failed": 21,
+    "passed": 54,
+    "failed": 2,
     "skipped": 6
   },
   "call_sql_tvf.test": {
@@ -215,38 +215,38 @@
     "skipped": 9
   },
   "call_sql_udf.test": {
-    "passed": 16,
-    "failed": 11,
+    "passed": 17,
+    "failed": 10,
     "skipped": 14
   },
   "case_statement_queries.test": {
-    "passed": 43,
-    "failed": 3,
+    "passed": 46,
+    "failed": 0,
     "skipped": 19
   },
   "cast_function.test": {
-    "passed": 67,
-    "failed": 49,
+    "passed": 105,
+    "failed": 11,
     "skipped": 75
   },
   "cast_function_to_json.test": {
-    "passed": 3,
-    "failed": 19,
+    "passed": 21,
+    "failed": 1,
     "skipped": 24
   },
   "civil_time.test": {
-    "passed": 21,
-    "failed": 35,
+    "passed": 47,
+    "failed": 9,
     "skipped": 16
   },
   "comparison_functions.test": {
-    "passed": 68,
-    "failed": 15,
+    "passed": 75,
+    "failed": 8,
     "skipped": 33
   },
   "concat_function.test": {
-    "passed": 1,
-    "failed": 10,
+    "passed": 9,
+    "failed": 2,
     "skipped": 5
   },
   "conditional_evaluation.test": {
@@ -260,8 +260,8 @@
     "skipped": 2
   },
   "date.test": {
-    "passed": 14,
-    "failed": 14,
+    "passed": 27,
+    "failed": 1,
     "skipped": 1
   },
   "dml_delete.test": {
@@ -285,8 +285,8 @@
     "skipped": 12
   },
   "dml_update_struct.test": {
-    "passed": 47,
-    "failed": 2,
+    "passed": 49,
+    "failed": 0,
     "skipped": 6
   },
   "except_intersect_queries.test": {
@@ -305,8 +305,8 @@
     "skipped": 5
   },
   "groupby_queries.test": {
-    "passed": 33,
-    "failed": 6,
+    "passed": 36,
+    "failed": 3,
     "skipped": 46
   },
   "groupby_queries_2.test": {
@@ -335,8 +335,8 @@
     "skipped": 5
   },
   "interval.test": {
-    "passed": 9,
-    "failed": 46,
+    "passed": 48,
+    "failed": 7,
     "skipped": 17
   },
   "is_unknown.test": {
@@ -345,13 +345,13 @@
     "skipped": 0
   },
   "join_queries.test": {
-    "passed": 39,
-    "failed": 12,
+    "passed": 47,
+    "failed": 4,
     "skipped": 10
   },
   "json_queries.test": {
-    "passed": 55,
-    "failed": 24,
+    "passed": 76,
+    "failed": 3,
     "skipped": 63
   },
   "limit_queries.test": {
@@ -365,23 +365,23 @@
     "skipped": 0
   },
   "math_functions.test": {
-    "passed": 0,
-    "failed": 4,
+    "passed": 4,
+    "failed": 0,
     "skipped": 25
   },
   "numeric.test": {
-    "passed": 2,
-    "failed": 6,
+    "passed": 8,
+    "failed": 0,
     "skipped": 1
   },
   "numeric_aggregation_queries.test": {
-    "passed": 55,
-    "failed": 13,
+    "passed": 68,
+    "failed": 0,
     "skipped": 0
   },
   "orderby_numeric_queries.test": {
-    "passed": 0,
-    "failed": 16,
+    "passed": 16,
+    "failed": 0,
     "skipped": 0
   },
   "orderby_queries.test": {
@@ -415,18 +415,18 @@
     "skipped": 1
   },
   "range.test": {
-    "passed": 0,
-    "failed": 8,
+    "passed": 8,
+    "failed": 0,
     "skipped": 1
   },
   "range_constructors.test": {
-    "passed": 7,
-    "failed": 34,
+    "passed": 41,
+    "failed": 0,
     "skipped": 1
   },
   "range_functions.test": {
-    "passed": 17,
-    "failed": 20,
+    "passed": 37,
+    "failed": 0,
     "skipped": 10
   },
   "regexp_functions.test": {
@@ -440,8 +440,8 @@
     "skipped": 0
   },
   "safe_function.test": {
-    "passed": 21,
-    "failed": 16,
+    "passed": 35,
+    "failed": 2,
     "skipped": 21
   },
   "select_distinct.test": {
@@ -455,8 +455,8 @@
     "skipped": 0
   },
   "strings.test": {
-    "passed": 101,
-    "failed": 40,
+    "passed": 132,
+    "failed": 9,
     "skipped": 24
   },
   "struct_positional_accessor.test": {
@@ -475,13 +475,13 @@
     "skipped": 12
   },
   "tablesample.test": {
-    "passed": 0,
-    "failed": 10,
+    "passed": 9,
+    "failed": 1,
     "skipped": 26
   },
   "timezones.test": {
-    "passed": 0,
-    "failed": 8,
+    "passed": 1,
+    "failed": 7,
     "skipped": 0
   },
   "union_distinct_queries.test": {

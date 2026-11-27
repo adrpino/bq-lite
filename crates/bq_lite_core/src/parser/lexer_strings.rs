@@ -164,14 +164,31 @@ fn push_escaped_byte(
     sl: usize,
     sc: usize,
 ) -> BqResult<()> {
-    if is_bytes && matches!(c.peek(), Some('x' | 'X')) {
+    if let (Some(d0), Some(d1), Some(d2)) = (c.peek(), c.peek_n(1), c.peek_n(2)) {
+        if ('0'..='3').contains(&d0) && ('0'..='7').contains(&d1) && ('0'..='7').contains(&d2) {
+            c.advance();
+            c.advance();
+            c.advance();
+            let v = (d0 as u8 - b'0') * 64 + (d1 as u8 - b'0') * 8 + (d2 as u8 - b'0');
+            out.push(v);
+            return Ok(());
+        }
+    }
+    if matches!(c.peek(), Some('x' | 'X')) {
         c.advance();
         let val = parse_hex_n(c, 2, sp, sl, sc)?;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "2 hex digits always fit in u8"
         )]
-        out.push(val as u8);
+        if is_bytes {
+            out.push(val as u8);
+        } else {
+            let ch = char::from_u32(val).ok_or_else(|| {
+                BqError::syntax("Invalid \\x escape code", c.span_from(sp, sl, sc))
+            })?;
+            push_char_bytes(out, ch);
+        }
         return Ok(());
     }
     let ch = scan_escape_char(c, sp, sl, sc)?;

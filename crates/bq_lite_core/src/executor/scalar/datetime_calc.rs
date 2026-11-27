@@ -1,8 +1,10 @@
-use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 
 use crate::error::{BqError, BqResult};
 use crate::types::coercion::cast_value;
-use crate::types::{BqInterval, BqType, BqValue};
+use crate::types::{
+    validate_bq_date, validate_bq_datetime, BqInterval, BqTimezone, BqType, BqValue,
+};
 
 pub(super) fn coerce_date_arg(val: BqValue) -> BqResult<BqValue> {
     if matches!(val, BqValue::String(_)) {
@@ -41,20 +43,28 @@ pub(in crate::executor) fn add_interval_to_date(
     iv: BqInterval,
     add: bool,
 ) -> BqResult<NaiveDate> {
-    let sign = if add { 1 } else { -1 };
-    let total_months = iv.months * sign;
+    let sign = if add { 1_i64 } else { -1_i64 };
+    let total_months = i64::from(iv.months) * sign;
     let d1 = if total_months >= 0 {
-        d.checked_add_months(Months::new(u32::try_from(total_months).unwrap_or(0)))
+        let m = u32::try_from(total_months).map_err(|_| BqError::semantic("DATE overflow"))?;
+        d.checked_add_months(Months::new(m))
     } else {
-        d.checked_sub_months(Months::new(u32::try_from(-total_months).unwrap_or(0)))
+        let m = u32::try_from(total_months.unsigned_abs())
+            .map_err(|_| BqError::semantic("DATE overflow"))?;
+        d.checked_sub_months(Months::new(m))
     }
     .ok_or_else(|| BqError::semantic("DATE overflow"))?;
-    let total_days = i64::from(iv.days) * i64::from(sign);
-    d1.checked_add_signed(Duration::days(total_days))
-        .ok_or_else(|| BqError::semantic("DATE overflow"))
+    let total_days = i64::from(iv.days) * sign;
+    let d2 = d1
+        .checked_add_signed(Duration::days(total_days))
+        .ok_or_else(|| BqError::semantic("DATE overflow"))?;
+    validate_bq_date(d2)
 }
 
 pub(super) fn eval_date_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Datetime(_))) {
+        return eval_datetime_add_sub(args, add);
+    }
     let [d_val, iv_val]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("DATE_ADD/SUB expects 2 arguments"))?;
@@ -69,6 +79,9 @@ pub(super) fn eval_date_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<BqVal
 }
 
 pub(super) fn eval_datetime_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Timestamp(_))) {
+        return eval_timestamp_add_sub(args, add);
+    }
     let [dt_val, iv_val]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("DATETIME_ADD/SUB expects 2 arguments"))?;
@@ -84,7 +97,10 @@ pub(super) fn eval_datetime_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<B
     let d = add_interval_to_date(dt.date(), iv, add)?;
     let base = NaiveDateTime::new(d, dt.time());
     let micros = if add { iv.micros } else { -iv.micros };
-    Ok(BqValue::Datetime(base + Duration::microseconds(micros)))
+    let out = base
+        .checked_add_signed(Duration::microseconds(micros))
+        .ok_or_else(|| BqError::semantic("DATETIME overflow"))?;
+    validate_bq_datetime(out).map(BqValue::Datetime)
 }
 
 pub(super) fn eval_timestamp_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<BqValue> {
@@ -106,7 +122,81 @@ pub(super) fn eval_timestamp_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<
     Ok(BqValue::Timestamp(ts + delta))
 }
 
+fn parse_week_start_weekday(part_upper: &str) -> Option<Weekday> {
+    if part_upper == "WEEK" {
+        return Some(Weekday::Sun);
+    }
+    if part_upper == "ISOWEEK" {
+        return Some(Weekday::Mon);
+    }
+    let inner = part_upper.strip_prefix("WEEK(")?.strip_suffix(')')?;
+    match inner.trim() {
+        "SUNDAY" => Some(Weekday::Sun),
+        "MONDAY" => Some(Weekday::Mon),
+        "TUESDAY" => Some(Weekday::Tue),
+        "WEDNESDAY" => Some(Weekday::Wed),
+        "THURSDAY" => Some(Weekday::Thu),
+        "FRIDAY" => Some(Weekday::Fri),
+        "SATURDAY" => Some(Weekday::Sat),
+        _ => None,
+    }
+}
+
+fn trunc_date_part(d: NaiveDate, part_upper: &str, raw_part: &str) -> BqResult<NaiveDate> {
+    if let Some(start_wd) = parse_week_start_weekday(part_upper) {
+        let cur = i64::from(d.weekday().num_days_from_sunday());
+        let st = i64::from(start_wd.num_days_from_sunday());
+        let back = (cur - st).rem_euclid(7);
+        return Ok(d - Duration::days(back));
+    }
+    match part_upper {
+        "DAY" => Ok(d),
+        "MONTH" => Ok(NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d)),
+        "QUARTER" => {
+            let q_month = ((d.month() - 1) / 3) * 3 + 1;
+            Ok(NaiveDate::from_ymd_opt(d.year(), q_month, 1).unwrap_or(d))
+        }
+        "YEAR" => Ok(NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d)),
+        "ISOYEAR" => {
+            Ok(NaiveDate::from_isoywd_opt(d.iso_week().year(), 1, Weekday::Mon).unwrap_or(d))
+        }
+        _ => Err(BqError::query(format!(
+            "Unsupported DATE_TRUNC part '{raw_part}'"
+        ))),
+    }
+}
+
+fn date_diff_part(da: NaiveDate, db: NaiveDate, part_upper: &str, raw_part: &str) -> BqResult<i64> {
+    if parse_week_start_weekday(part_upper).is_some() {
+        let ta = trunc_date_part(da, part_upper, raw_part)?;
+        let tb = trunc_date_part(db, part_upper, raw_part)?;
+        return Ok((ta - tb).num_days() / 7);
+    }
+    match part_upper {
+        "DAY" => Ok((da - db).num_days()),
+        "MONTH" => Ok(i64::from(
+            (da.year() - db.year()) * 12
+                + (i32::try_from(da.month()).unwrap_or(0) - i32::try_from(db.month()).unwrap_or(0)),
+        )),
+        "QUARTER" => Ok(i64::from(
+            (da.year() - db.year()) * 4
+                + (i32::try_from((da.month() - 1) / 3).unwrap_or(0)
+                    - i32::try_from((db.month() - 1) / 3).unwrap_or(0)),
+        )),
+        "YEAR" => Ok(i64::from(da.year() - db.year())),
+        "ISOYEAR" => Ok(i64::from(da.iso_week().year() - db.iso_week().year())),
+        _ => Err(BqError::query(format!(
+            "Unsupported DATE_DIFF part '{raw_part}'"
+        ))),
+    }
+}
+
 pub(super) fn eval_date_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Datetime(_)))
+        || matches!(args.get(1), Some(BqValue::Datetime(_)))
+    {
+        return eval_datetime_diff(args);
+    }
     let [a, b, part]: [BqValue; 3] = args
         .try_into()
         .map_err(|_| BqError::query("DATE_DIFF expects 3 arguments"))?;
@@ -117,25 +207,16 @@ pub(super) fn eval_date_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
     let (BqValue::Date(da), BqValue::Date(db), BqValue::String(p)) = (a, b, part) else {
         return Err(BqError::query("DATE_DIFF expects (DATE, DATE, PART)"));
     };
-    let diff = match p.to_ascii_uppercase().as_str() {
-        "DAY" => (da - db).num_days(),
-        "WEEK" => (da - db).num_weeks(),
-        "MONTH" => i64::from(
-            (da.year() - db.year()) * 12
-                + (i32::try_from(da.month()).unwrap_or(0) - i32::try_from(db.month()).unwrap_or(0)),
-        ),
-        "QUARTER" => i64::from(
-            (da.year() - db.year()) * 4
-                + (i32::try_from((da.month() - 1) / 3).unwrap_or(0)
-                    - i32::try_from((db.month() - 1) / 3).unwrap_or(0)),
-        ),
-        "YEAR" => i64::from(da.year() - db.year()),
-        _ => return Err(BqError::query(format!("Unsupported DATE_DIFF part '{p}'"))),
-    };
-    Ok(BqValue::Int64(diff))
+    let upper = p.to_ascii_uppercase();
+    date_diff_part(da, db, &upper, &p).map(BqValue::Int64)
 }
 
 pub(super) fn eval_datetime_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Timestamp(_)))
+        || matches!(args.get(1), Some(BqValue::Timestamp(_)))
+    {
+        return eval_timestamp_diff(args);
+    }
     let [a, b, part]: [BqValue; 3] = args
         .try_into()
         .map_err(|_| BqError::query("DATETIME_DIFF expects 3 arguments"))?;
@@ -148,7 +229,17 @@ pub(super) fn eval_datetime_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
             "DATETIME_DIFF expects (DATETIME, DATETIME, PART)",
         ));
     };
-    diff_duration(da - db, &p)
+    let upper = p.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "DAY" | "MONTH" | "QUARTER" | "YEAR" | "ISOYEAR"
+    ) || parse_week_start_weekday(&upper).is_some()
+    {
+        return date_diff_part(da.date(), db.date(), &upper, &p).map(BqValue::Int64);
+    }
+    let ta = trunc_naive_datetime(da, &p)?;
+    let tb = trunc_naive_datetime(db, &p)?;
+    diff_duration(ta - tb, &p)
 }
 
 pub(super) fn eval_timestamp_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
@@ -181,6 +272,9 @@ fn diff_duration(dur: Duration, part: &str) -> BqResult<BqValue> {
 }
 
 pub(super) fn eval_date_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Datetime(_))) {
+        return eval_datetime_trunc(args);
+    }
     let [d_val, part]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("DATE_TRUNC expects 2 arguments"))?;
@@ -191,22 +285,13 @@ pub(super) fn eval_date_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
     let (BqValue::Date(d), BqValue::String(p)) = (d_val, part) else {
         return Err(BqError::query("DATE_TRUNC expects (DATE, PART)"));
     };
-    let out = match p.to_ascii_uppercase().as_str() {
-        "DAY" => d,
-        "WEEK" => d - Duration::days(i64::from(d.weekday().num_days_from_sunday())),
-        "ISOWEEK" => d - Duration::days(i64::from(d.weekday().num_days_from_monday())),
-        "MONTH" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
-        "QUARTER" => {
-            let q_month = ((d.month() - 1) / 3) * 3 + 1;
-            NaiveDate::from_ymd_opt(d.year(), q_month, 1).unwrap_or(d)
-        }
-        "YEAR" => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
-        _ => return Err(BqError::query(format!("Unsupported DATE_TRUNC part '{p}'"))),
-    };
-    Ok(BqValue::Date(out))
+    trunc_date_part(d, &p.to_ascii_uppercase(), &p).map(BqValue::Date)
 }
 
 pub(super) fn eval_datetime_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if matches!(args.first(), Some(BqValue::Timestamp(_))) {
+        return eval_timestamp_trunc(args);
+    }
     let [dt_val, part]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("DATETIME_TRUNC expects 2 arguments"))?;
@@ -228,32 +313,36 @@ pub(super) fn eval_timestamp_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
     let mut it = args.into_iter();
     let ts_val = it.next().unwrap_or(BqValue::Null);
     let part = it.next().unwrap_or(BqValue::Null);
-    if ts_val.is_null() {
+    let zone_val = it.next();
+    if ts_val.is_null() || zone_val.as_ref().is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
     let ts_val = coerce_timestamp_arg(ts_val)?;
     let (BqValue::Timestamp(ts), BqValue::String(p)) = (ts_val, part) else {
         return Err(BqError::query("TIMESTAMP_TRUNC expects (TIMESTAMP, PART)"));
     };
-    let dt = trunc_naive_datetime(ts.naive_utc(), &p)?;
-    Ok(BqValue::Timestamp(
-        DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc),
-    ))
+    let tz = match zone_val {
+        Some(BqValue::String(tz_s)) => BqTimezone::parse(&tz_s)?,
+        Some(_) => return Err(BqError::query("TIMESTAMP_TRUNC timezone must be STRING")),
+        None => BqTimezone::Utc,
+    };
+    let local_dt = tz.utc_to_local(ts);
+    let trunc_local = trunc_naive_datetime(local_dt, &p)?;
+    tz.local_to_utc(trunc_local).map(BqValue::Timestamp)
 }
 
 fn trunc_naive_datetime(dt: NaiveDateTime, part: &str) -> BqResult<NaiveDateTime> {
-    use chrono::Timelike;
     let zero_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default();
-    match part.to_ascii_uppercase().as_str() {
-        "YEAR" => Ok(NaiveDateTime::new(
-            NaiveDate::from_ymd_opt(dt.year(), 1, 1).unwrap_or_else(|| dt.date()),
-            zero_time,
-        )),
-        "MONTH" => Ok(NaiveDateTime::new(
-            NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap_or_else(|| dt.date()),
-            zero_time,
-        )),
-        "DAY" => Ok(NaiveDateTime::new(dt.date(), zero_time)),
+    let upper = part.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "DAY" | "MONTH" | "QUARTER" | "YEAR" | "ISOYEAR"
+    ) || parse_week_start_weekday(&upper).is_some()
+    {
+        let d = trunc_date_part(dt.date(), &upper, part)?;
+        return Ok(NaiveDateTime::new(d, zero_time));
+    }
+    match upper.as_str() {
         "HOUR" => Ok(NaiveDateTime::new(
             dt.date(),
             NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap_or(zero_time),
@@ -266,83 +355,27 @@ fn trunc_naive_datetime(dt: NaiveDateTime, part: &str) -> BqResult<NaiveDateTime
             dt.date(),
             NaiveTime::from_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap_or(zero_time),
         )),
+        "MILLISECOND" => Ok(NaiveDateTime::new(
+            dt.date(),
+            NaiveTime::from_hms_milli_opt(
+                dt.hour(),
+                dt.minute(),
+                dt.second(),
+                dt.nanosecond() / 1_000_000,
+            )
+            .unwrap_or(zero_time),
+        )),
+        "MICROSECOND" => Ok(NaiveDateTime::new(
+            dt.date(),
+            NaiveTime::from_hms_micro_opt(
+                dt.hour(),
+                dt.minute(),
+                dt.second(),
+                dt.nanosecond() / 1_000,
+            )
+            .unwrap_or(zero_time),
+        )),
         _ => Err(BqError::query(format!("Unsupported TRUNC part '{part}'"))),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "TIMESTAMP_* expects INT64 or NULL"
-)]
-pub(super) fn eval_ts_epoch(args: Vec<BqValue>, mult_micros: i64) -> BqResult<BqValue> {
-    let [arg]: [BqValue; 1] = args
-        .try_into()
-        .map_err(|_| BqError::query("TIMESTAMP_* expects 1 argument"))?;
-    match arg {
-        BqValue::Null => Ok(BqValue::Null),
-        BqValue::Int64(n) => {
-            let micros = n
-                .checked_mul(mult_micros)
-                .ok_or_else(|| BqError::semantic("TIMESTAMP overflow"))?;
-            DateTime::from_timestamp_micros(micros)
-                .map(BqValue::Timestamp)
-                .ok_or_else(|| BqError::semantic("TIMESTAMP out of range"))
-        }
-        _ => Err(BqError::query("TIMESTAMP_* expects INT64")),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "UNIX_* expects TIMESTAMP or NULL"
-)]
-pub(super) fn eval_unix_epoch(args: Vec<BqValue>, div_micros: i64) -> BqResult<BqValue> {
-    let [arg]: [BqValue; 1] = args
-        .try_into()
-        .map_err(|_| BqError::query("UNIX_* expects 1 argument"))?;
-    match arg {
-        BqValue::Null => Ok(BqValue::Null),
-        BqValue::Timestamp(ts) => Ok(BqValue::Int64(ts.timestamp_micros() / div_micros)),
-        _ => Err(BqError::query("UNIX_* expects TIMESTAMP")),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "UNIX_DATE expects DATE or NULL"
-)]
-pub(super) fn eval_unix_date(args: Vec<BqValue>) -> BqResult<BqValue> {
-    let [arg]: [BqValue; 1] = args
-        .try_into()
-        .map_err(|_| BqError::query("UNIX_DATE expects 1 argument"))?;
-    match arg {
-        BqValue::Null => Ok(BqValue::Null),
-        BqValue::Date(d) => {
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(d);
-            Ok(BqValue::Int64((d - epoch).num_days()))
-        }
-        _ => Err(BqError::query("UNIX_DATE expects DATE")),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "DATE_FROM_UNIX_DATE expects INT64 or NULL"
-)]
-pub(super) fn eval_date_from_unix(args: Vec<BqValue>) -> BqResult<BqValue> {
-    let [arg]: [BqValue; 1] = args
-        .try_into()
-        .map_err(|_| BqError::query("DATE_FROM_UNIX_DATE expects 1 argument"))?;
-    match arg {
-        BqValue::Null => Ok(BqValue::Null),
-        BqValue::Int64(days) => {
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default();
-            epoch
-                .checked_add_signed(Duration::days(days))
-                .map(BqValue::Date)
-                .ok_or_else(|| BqError::semantic("DATE_FROM_UNIX_DATE out of range"))
-        }
-        _ => Err(BqError::query("DATE_FROM_UNIX_DATE expects INT64")),
     }
 }
 
@@ -363,45 +396,44 @@ pub(super) fn eval_last_day(args: &[BqValue]) -> BqResult<BqValue> {
         BqValue::Datetime(dt) => dt.date(),
         _ => return Err(BqError::query("LAST_DAY expects DATE or DATETIME")),
     };
-    let next_month = d
-        .with_day(1)
-        .and_then(|start| start.checked_add_months(Months::new(1)))
-        .and_then(|nm| nm.pred_opt())
-        .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?;
-    Ok(BqValue::Date(next_month))
-}
-
-pub(super) fn eval_generate_date_array(args: Vec<BqValue>) -> BqResult<BqValue> {
-    if args.len() < 2 || args.len() > 3 {
-        return Err(BqError::query(
-            "GENERATE_DATE_ARRAY expects 2 or 3 arguments",
-        ));
-    }
-    let mut it = args.into_iter();
-    let start_v = it.next().unwrap_or(BqValue::Null);
-    let end_v = it.next().unwrap_or(BqValue::Null);
-    let step_v = it.next();
-    if start_v.is_null() || end_v.is_null() {
-        return Ok(BqValue::Null);
-    }
-    let (start_v, end_v) = (coerce_date_arg(start_v)?, coerce_date_arg(end_v)?);
-    let (BqValue::Date(start), BqValue::Date(end)) = (start_v, end_v) else {
-        return Err(BqError::query("GENERATE_DATE_ARRAY expects DATE bounds"));
+    let part = match args.get(1) {
+        None => "MONTH".to_owned(),
+        Some(BqValue::String(s)) => s.to_ascii_uppercase(),
+        Some(_) => return Err(BqError::query("LAST_DAY part must be a date part")),
     };
-    let step = match step_v {
-        Some(BqValue::Interval(iv)) => iv,
-        None => BqInterval::new(0, 1, 0),
-        _ => return Err(BqError::query("GENERATE_DATE_ARRAY step must be INTERVAL")),
+    let res = if parse_week_start_weekday(&part).is_some() {
+        let start = trunc_date_part(d, &part, &part)?;
+        start
+            .checked_add_signed(Duration::days(6))
+            .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?
+    } else {
+        match part.as_str() {
+            "MONTH" => d
+                .with_day(1)
+                .and_then(|start| start.checked_add_months(Months::new(1)))
+                .and_then(|nm| nm.pred_opt())
+                .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?,
+            "QUARTER" => {
+                let q_start_m = ((d.month() - 1) / 3) * 3 + 1;
+                NaiveDate::from_ymd_opt(d.year(), q_start_m, 1)
+                    .and_then(|start| start.checked_add_months(Months::new(3)))
+                    .and_then(|nq| nq.pred_opt())
+                    .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?
+            }
+            "YEAR" => NaiveDate::from_ymd_opt(d.year(), 12, 31)
+                .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?,
+            "ISOYEAR" => {
+                let next_iso = d.iso_week().year() + 1;
+                NaiveDate::from_isoywd_opt(next_iso, 1, Weekday::Mon)
+                    .and_then(|s| s.pred_opt())
+                    .ok_or_else(|| BqError::semantic("LAST_DAY overflow"))?
+            }
+            _ => {
+                return Err(BqError::query(format!(
+                    "Unsupported LAST_DAY part '{part}'"
+                )))
+            }
+        }
     };
-    if step.months == 0 && step.days == 0 {
-        return Err(BqError::semantic("GENERATE_DATE_ARRAY step cannot be zero"));
-    }
-    let forward = step.months > 0 || (step.months == 0 && step.days > 0);
-    let mut out = Vec::new();
-    let mut cur = start;
-    while (if forward { cur <= end } else { cur >= end }) && out.len() < 100_000 {
-        out.push(BqValue::Date(cur));
-        cur = add_interval_to_date(cur, step, true)?;
-    }
-    Ok(BqValue::Array(out))
+    validate_bq_date(res).map(BqValue::Date)
 }

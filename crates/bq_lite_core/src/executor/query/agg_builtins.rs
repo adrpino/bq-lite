@@ -5,10 +5,12 @@ use crate::ast::{FunctionCall, HavingKind, NullHandling};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::{compare_values, eval_expr, values_distinct_eq};
-use crate::types::coercion::{coerce_value, common_supertype};
-use crate::types::{BqType, BqValue};
+use crate::types::BqValue;
 
-use super::agg_approx::{eval_approx_count_distinct, eval_approx_quantiles, eval_stat_agg};
+use super::agg_approx::{
+    eval_approx_count_distinct, eval_approx_quantiles, eval_array_concat_agg, eval_avg,
+    eval_bitwise_bytes_agg, eval_stat_agg, sum_collected_values,
+};
 use super::exec_util::{hash_single_value, RowSlice};
 use super::sort::sort_with_order_keys;
 
@@ -17,6 +19,7 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "APPROX_COUNT_DISTINCT",
     "APPROX_QUANTILES",
     "ARRAY_AGG",
+    "ARRAY_CONCAT_AGG",
     "AVG",
     "BIT_AND",
     "BIT_OR",
@@ -67,6 +70,7 @@ pub(super) fn eval_aggregate_call(
         "APPROX_COUNT_DISTINCT" => eval_approx_count_distinct(call, rows, ctx),
         "APPROX_QUANTILES" => eval_approx_quantiles(call, rows, ctx),
         "ARRAY_AGG" => eval_array_agg(call, rows, ctx),
+        "ARRAY_CONCAT_AGG" => eval_array_concat_agg(call, rows, ctx),
         "STRING_AGG" => eval_string_agg(call, rows, ctx),
         "LOGICAL_AND" => eval_logical(call, rows, ctx, true),
         "LOGICAL_OR" => eval_logical(call, rows, ctx, false),
@@ -155,65 +159,17 @@ fn eval_countif(
     let mut count = 0_i64;
     for row in rows.iter() {
         if matches!(eval_expr(&arg.expr, row, ctx)?, BqValue::Bool(true)) {
+            if call.distinct {
+                return Ok(BqValue::Int64(1));
+            }
             count += 1;
         }
     }
     Ok(BqValue::Int64(count))
 }
 
-fn sum_collected_values(vals: Vec<BqValue>) -> BqResult<BqValue> {
-    let Some(first) = vals.first() else {
-        return Ok(BqValue::Null);
-    };
-    let types: Vec<BqType> = vals
-        .iter()
-        .map(BqValue::infer_type)
-        .collect::<BqResult<_>>()?;
-    let supertype = common_supertype(&types)?;
-    let mut acc = coerce_value(first.clone(), &supertype)?;
-    for v in vals.into_iter().skip(1) {
-        acc = crate::executor::evaluator::eval_binary(crate::ast::BinaryOp::Add, acc, v)?;
-    }
-    Ok(acc)
-}
-
 fn eval_sum(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     sum_collected_values(collect_arg_values(call, rows, ctx)?)
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "AVG only supports numeric scalar variants"
-)]
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "GoogleSQL AVG converts integer sums to FLOAT64"
-)]
-fn eval_avg(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
-    let vals = collect_arg_values(call, rows, ctx)?;
-    if vals.is_empty() {
-        return Ok(BqValue::Null);
-    }
-    let count = vals.len();
-    let sum = sum_collected_values(vals)?;
-    match sum {
-        BqValue::Int64(n) => Ok(BqValue::Float64((n as f64) / (count as f64))),
-        BqValue::Float64(f) => Ok(BqValue::Float64(f / (count as f64))),
-        BqValue::Numeric(n) => n
-            .checked_div(crate::types::BqNumeric::from_i64(
-                i64::try_from(count).unwrap_or(i64::MAX),
-            ))
-            .map(BqValue::Numeric),
-        BqValue::BigNumeric(bn) => bn
-            .checked_div(&crate::types::BqBigNumeric::from_i64(
-                i64::try_from(count).unwrap_or(i64::MAX),
-            ))
-            .map(|v| BqValue::BigNumeric(Box::new(v))),
-        other => Err(BqError::query(format!(
-            "AVG not supported for {}",
-            other.infer_type()?
-        ))),
-    }
 }
 
 fn eval_min_max(
@@ -473,6 +429,9 @@ fn eval_bitwise_agg(
     let vals = collect_arg_values(call, rows, ctx)?;
     if vals.is_empty() {
         return Ok(BqValue::Null);
+    }
+    if matches!(vals.first(), Some(BqValue::Bytes(_))) {
+        return eval_bitwise_bytes_agg(name, vals);
     }
     let mut ints = Vec::with_capacity(vals.len());
     for v in vals {

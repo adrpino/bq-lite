@@ -8,22 +8,35 @@ Every function listed as `implemented` in a table below must exist in the corres
 | Function | Status | Notes |
 |---|---|---|
 | `ABS` | `implemented` | Absolute value |
+| `ADD_MONTHS` | `implemented` | Adds months to `DATE` or `DATETIME` preserving end-of-month |
+| `ARRAY_AVG` | `implemented` | Average of numeric or `INTERVAL` array elements |
 | `ARRAY_CONCAT` | `implemented` | Concatenates arrays |
+| `ARRAY_DISTINCT` | `implemented` | Deduplicates array elements preserving order |
 | `ARRAY_FILTER` | `implemented` | Filters array via lambda predicate |
+| `ARRAY_FIND` | `implemented` | Finds first/last matching element or lambda match |
 | `ARRAY_FIRST` | `implemented` | First element or error on empty |
+| `ARRAY_FIRST_N` | `implemented` | First `N` elements of an array |
+| `ARRAY_INCLUDES` | `implemented` | Checks if array contains element or lambda match |
+| `ARRAY_INCLUDES_ALL` | `implemented` | Checks if array contains all search elements |
+| `ARRAY_INCLUDES_ANY` | `implemented` | Checks if array contains any search element |
+| `ARRAY_IS_DISTINCT` | `implemented` | Checks if all array elements are distinct |
 | `ARRAY_LAST` | `implemented` | Last element or error on empty |
+| `ARRAY_LAST_N` | `implemented` | Last `N` elements of an array |
 | `ARRAY_LENGTH` | `implemented` | Length of `ARRAY` |
+| `ARRAY_OFFSET` | `implemented` | 0-based offset of first/last matching element or lambda match |
 | `ARRAY_REVERSE` | `implemented` | Reverses elements |
 | `ARRAY_SLICE` | `implemented` | Slices `[start, end]` inclusive |
 | `ARRAY_TO_STRING` | `implemented` | Joins array elements |
 | `ARRAY_TRANSFORM` | `implemented` | Maps array elements via lambda |
 | `ASCII` | `implemented` | ASCII code of first byte |
+| `BIT_COUNT` | `implemented` | Number of set bits in `INT64` or `BYTES` |
 | `BOOL` | `implemented` | Extracts `BOOL` from `JSON` |
 | `BYTE_LENGTH` | `implemented` | UTF-8 byte count |
 | `CBRT` | `implemented` | Cube root |
 | `CEIL` | `implemented` | Ceiling |
 | `CEILING` | `implemented` | Alias for `CEIL` |
 | `CHAR_LENGTH` | `implemented` | Character count |
+| `CHR` | `implemented` | Converts Unicode code point to `STRING` |
 | `COALESCE` | `implemented` | First non-`NULL` argument |
 | `CODE_POINTS_TO_BYTES` | `implemented` | Converts `ARRAY<INT64>` byte code points to `BYTES` |
 | `CODE_POINTS_TO_STRING` | `implemented` | Converts `ARRAY<INT64>` Unicode code points to `STRING` |
@@ -45,6 +58,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `DATETIME_DIFF` | `implemented` | Difference between `DATETIME`s |
 | `DATETIME_SUB` | `implemented` | Subtracts `INTERVAL` from `DATETIME` |
 | `DATETIME_TRUNC` | `implemented` | Truncates `DATETIME` to part |
+| `DEGREES` | `implemented` | Converts radians to degrees |
 | `DIV` | `implemented` | Integer division |
 | `ENDS_WITH` | `implemented` | Suffix check |
 | `ERROR` | `implemented` | Raises semantic error |
@@ -61,6 +75,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `FROM_HEX` | `implemented` | Hex decode to `BYTES` |
 | `GENERATE_ARRAY` | `implemented` | Integer sequence array |
 | `GENERATE_DATE_ARRAY` | `implemented` | Date sequence array |
+| `GENERATE_TIMESTAMP_ARRAY` | `implemented` | Timestamp sequence array |
 | `GENERATE_UUID` | `implemented` | Random UUID v4 |
 | `GREATEST` | `implemented` | Maximum of arguments |
 | `IEEE_DIVIDE` | `implemented` | IEEE-754 division |
@@ -72,10 +87,13 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `INSTR` | `implemented` | Substring search |
 | `INT64` | `implemented` | Extracts `INT64` from `JSON` |
 | `JSON_ARRAY` | `implemented` | Builds `JSON` array |
+| `JSON_ARRAY_APPEND` | `implemented` | Appends values to JSON array at path |
+| `JSON_ARRAY_INSERT` | `implemented` | Inserts values into JSON array at path |
 | `JSON_EXTRACT` | `implemented` | Legacy JSON extract |
 | `JSON_EXTRACT_ARRAY` | `implemented` | Legacy JSON array extract |
 | `JSON_EXTRACT_SCALAR` | `implemented` | Legacy JSON scalar extract |
 | `JSON_EXTRACT_STRING_ARRAY` | `implemented` | Legacy JSON string array extract |
+| `JSON_FLATTEN` | `implemented` | Recursively flattens JSON arrays to `ARRAY<JSON>` |
 | `JSON_KEYS` | `implemented` | Top-level keys of JSON object |
 | `JSON_OBJECT` | `implemented` | Builds `JSON` object |
 | `JSON_QUERY` | `implemented` | JSON fragment query |
@@ -88,7 +106,8 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `JUSTIFY_DAYS` | `implemented` | Normalizes 30-day chunks into months |
 | `JUSTIFY_HOURS` | `implemented` | Normalizes 24-hour chunks into days |
 | `JUSTIFY_INTERVAL` | `implemented` | Normalizes hours, days, and months |
-| `LAST_DAY` | `implemented` | Last day of month |
+| `LAST_DAY` | `implemented` | Last day of date part (`MONTH`, `YEAR`, `QUARTER`, `WEEK`, `ISOWEEK`, `ISOYEAR`) |
+| `LCASE` | `implemented` | Alias for `LOWER` |
 | `LEAST` | `implemented` | Minimum of arguments |
 | `LEFT` | `implemented` | Left prefix characters or bytes |
 | `LENGTH` | `implemented` | Character or byte length |
@@ -101,34 +120,42 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `MAKE_INTERVAL` | `implemented` | Constructs `INTERVAL` from date/time components |
 | `MD5` | `implemented` | MD5 digest (`BYTES`) |
 | `MOD` | `implemented` | Integer modulo |
+| `MONTHS_BETWEEN` | `implemented` | Fractional months between two `DATE`/`DATETIME` values |
 | `NET.HOST` | `implemented` | Extracts host from URL |
 | `NET.IP_FROM_STRING` | `implemented` | Parses IPv4/IPv6 string to `BYTES` |
 | `NET.IP_TO_STRING` | `implemented` | Formats IP `BYTES` as string |
 | `NET.PUBLIC_SUFFIX` | `implemented` | Extracts public suffix |
 | `NET.REG_DOMAIN` | `implemented` | Extracts registrable domain |
 | `NET.SAFE_IP_FROM_STRING` | `implemented` | Null-safe IP string parser |
+| `NEXT_DAY` | `implemented` | Next occurrence of named weekday after `DATE`/`DATETIME` |
 | `NULLIF` | `implemented` | Returns `NULL` if equal |
 | `OCTET_LENGTH` | `implemented` | Byte length of `STRING` or `BYTES` |
+| `PARSE_BIGNUMERIC` | `implemented` | Parses formatted string into `BIGNUMERIC` |
 | `PARSE_DATE` | `implemented` | Parses `DATE` |
 | `PARSE_DATETIME` | `implemented` | Parses `DATETIME` |
 | `PARSE_JSON` | `implemented` | Parses JSON string |
+| `PARSE_NUMERIC` | `implemented` | Parses formatted string into `NUMERIC` |
 | `PARSE_TIME` | `implemented` | Parses `TIME` |
 | `PARSE_TIMESTAMP` | `implemented` | Parses `TIMESTAMP` |
 | `POW` | `implemented` | Power |
 | `POWER` | `implemented` | Alias for `POW` |
+| `RADIANS` | `implemented` | Converts degrees to radians |
 | `RAND` | `implemented` | Uniform random `[0, 1)` |
 | `RANGE` | `implemented` | Constructs `RANGE<T>` |
 | `RANGE_BUCKET` | `implemented` | Histogram bucket index |
 | `RANGE_CONTAINS` | `implemented` | Checks point or subrange containment |
 | `RANGE_END` | `implemented` | Exclusive upper bound of `RANGE` |
 | `RANGE_INTERSECT` | `implemented` | Intersection of overlapping `RANGE`s |
+| `RANGE_IS_END_UNBOUNDED` | `implemented` | Returns `TRUE` if `RANGE` upper bound is `UNBOUNDED` |
+| `RANGE_IS_START_UNBOUNDED` | `implemented` | Returns `TRUE` if `RANGE` lower bound is `UNBOUNDED` |
 | `RANGE_OVERLAPS` | `implemented` | Overlap check for `RANGE`s |
 | `RANGE_START` | `implemented` | Inclusive lower bound of `RANGE` |
-| `REGEXP_CONTAINS` | `implemented` | Regex match test |
-| `REGEXP_EXTRACT` | `implemented` | Regex group extract |
-| `REGEXP_EXTRACT_ALL` | `implemented` | All regex matches |
-| `REGEXP_INSTR` | `implemented` | Regex 1-based position |
-| `REGEXP_REPLACE` | `implemented` | Regex replacement |
+| `REGEXP_CONTAINS` | `implemented` | Regex match test (`STRING` or `BYTES`) |
+| `REGEXP_EXTRACT` | `implemented` | Regex group extract (`STRING` or `BYTES`) |
+| `REGEXP_EXTRACT_ALL` | `implemented` | All regex matches (`STRING` or `BYTES`) |
+| `REGEXP_INSTR` | `implemented` | Regex 1-based position (`STRING` or `BYTES`) |
+| `REGEXP_MATCH` | `implemented` | Full-string regex match (`STRING` or `BYTES`) |
+| `REGEXP_REPLACE` | `implemented` | Regex replacement (`STRING` or `BYTES`) |
 | `REGEXP_SUBSTR` | `implemented` | Alias for `REGEXP_EXTRACT` |
 | `REPEAT` | `implemented` | Repeats string |
 | `REPLACE` | `implemented` | Substring replacement |
@@ -149,7 +176,9 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `SHA256` | `implemented` | SHA-256 digest (`BYTES`) |
 | `SHA512` | `implemented` | SHA-512 digest (`BYTES`) |
 | `SIGN` | `implemented` | Sign (`-1`, `0`, `1`) |
+| `SOUNDEX` | `implemented` | American Soundex code |
 | `SPLIT` | `implemented` | Splits string into `ARRAY` |
+| `SPLIT_SUBSTR` | `implemented` | Substring of delimited segments |
 | `SQRT` | `implemented` | Square root |
 | `ST_ASTEXT` | `implemented` | Converts `GEOGRAPHY` to WKT |
 | `ST_CONTAINS` | `implemented` | Geography containment check |
@@ -184,6 +213,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `TRANSLATE` | `implemented` | Character translation |
 | `TRIM` | `implemented` | Whitespace/char trim |
 | `TRUNC` | `implemented` | Truncates float/numeric |
+| `UCASE` | `implemented` | Alias for `UPPER` |
 | `UNICODE` | `implemented` | Unicode code point of first character |
 | `UNIX_DATE` | `implemented` | Days since 1970-01-01 |
 | `UNIX_MICROS` | `implemented` | Epoch microseconds |
@@ -199,10 +229,11 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `APPROX_COUNT_DISTINCT` | `implemented` | Approximate distinct count |
 | `APPROX_QUANTILES` | `implemented` | Approximate quantile array (`NULL` on empty input) |
 | `ARRAY_AGG` | `implemented` | Supports `DISTINCT`, `IGNORE NULLS`, `ORDER BY`, `LIMIT` |
-| `AVG` | `implemented` | Numeric average |
-| `BIT_AND` | `implemented` | Bitwise AND aggregate |
-| `BIT_OR` | `implemented` | Bitwise OR aggregate |
-| `BIT_XOR` | `implemented` | Bitwise XOR aggregate |
+| `ARRAY_CONCAT_AGG` | `implemented` | Concatenates arrays across group (`ORDER BY`, `LIMIT`) |
+| `AVG` | `implemented` | Numeric and `INTERVAL` average |
+| `BIT_AND` | `implemented` | Bitwise AND aggregate (`INT64` and `BYTES`) |
+| `BIT_OR` | `implemented` | Bitwise OR aggregate (`INT64` and `BYTES`) |
+| `BIT_XOR` | `implemented` | Bitwise XOR aggregate (`INT64` and `BYTES`) |
 | `COUNT` | `implemented` | Supports `*` and `DISTINCT` |
 | `COUNTIF` | `implemented` | Conditional count |
 | `LOGICAL_AND` | `implemented` | Boolean AND aggregate |

@@ -1,23 +1,7 @@
-use serde_json::Value as JsonValue;
+use serde_json::{Map, Value as JsonValue};
 
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
-
-pub(super) fn format_timestamp_rfc3339(ts: chrono::DateTime<chrono::Utc>) -> String {
-    if ts.timestamp_subsec_nanos() == 0 {
-        return ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    }
-    let raw = ts.format("%Y-%m-%dT%H:%M:%S.%6f").to_string();
-    format!("{}Z", raw.trim_end_matches('0').trim_end_matches('.'))
-}
-
-pub(super) fn format_datetime_iso(dt: chrono::NaiveDateTime) -> String {
-    if dt.and_utc().timestamp_subsec_nanos() == 0 {
-        return dt.format("%Y-%m-%dT%H:%M:%S").to_string();
-    }
-    let raw = dt.format("%Y-%m-%dT%H:%M:%S.%6f").to_string();
-    raw.trim_end_matches('0').trim_end_matches('.').to_owned()
-}
 
 pub(super) fn write_bq_json_string(
     val: &BqValue,
@@ -174,6 +158,94 @@ pub(super) fn resolve_json_path<'a>(
     Ok(Some(cur))
 }
 
+/// Resolves `JSON_QUERY` with optional `lax` / `lax recursive` modifiers.
+pub(super) fn resolve_json_query_path(
+    doc: &JsonValue,
+    path: &str,
+    legacy_brackets: bool,
+) -> BqResult<Option<JsonValue>> {
+    let trimmed = path.trim_start();
+    if legacy_brackets || trimmed.starts_with('$') {
+        return Ok(resolve_json_path(doc, path, legacy_brackets)?.cloned());
+    }
+    let Some(dollar_pos) = trimmed.find('$') else {
+        return Err(BqError::semantic(format!(
+            "JSONPath must start with '$': '{path}'"
+        )));
+    };
+    let prefix = trimmed.get(..dollar_pos).unwrap_or("");
+    let rest = trimmed.get(dollar_pos..).unwrap_or("");
+    let mut lax = false;
+    let mut recursive = false;
+    for kw in prefix.split_whitespace() {
+        if kw.eq_ignore_ascii_case("lax") {
+            if lax {
+                return Err(BqError::semantic("Duplicate 'lax' modifier in JSONPath"));
+            }
+            lax = true;
+        } else if kw.eq_ignore_ascii_case("recursive") {
+            if recursive {
+                return Err(BqError::semantic(
+                    "Duplicate 'recursive' modifier in JSONPath",
+                ));
+            }
+            recursive = true;
+        } else {
+            return Err(BqError::semantic(format!(
+                "Invalid JSONPath modifier '{kw}'"
+            )));
+        }
+    }
+    if recursive && !lax {
+        return Err(BqError::semantic(
+            "JSONPath 'recursive' modifier requires 'lax'",
+        ));
+    }
+    let segs = parse_json_path(rest, false)?;
+    let mut current: Vec<&JsonValue> = vec![doc];
+    for seg in &segs {
+        let mut next = Vec::new();
+        for node in current {
+            step_lax(node, seg, recursive, &mut next);
+        }
+        current = next;
+    }
+    let out: Vec<JsonValue> = current.into_iter().cloned().collect();
+    Ok(Some(JsonValue::Array(out)))
+}
+
+fn step_lax<'a>(node: &'a JsonValue, seg: &PathSeg, recursive: bool, out: &mut Vec<&'a JsonValue>) {
+    match (node, seg) {
+        (JsonValue::Object(m), PathSeg::Key(k)) => {
+            if let Some(v) = m.get(k) {
+                out.push(v);
+            }
+        }
+        (JsonValue::Array(arr), PathSeg::Key(_)) => {
+            for el in arr {
+                if recursive {
+                    step_lax(el, seg, true, out);
+                } else if let JsonValue::Object(m) = el {
+                    if let PathSeg::Key(k) = seg {
+                        if let Some(v) = m.get(k) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        (JsonValue::Array(arr), PathSeg::Idx(i)) => {
+            if let Some(v) = arr.get(*i) {
+                out.push(v);
+            }
+        }
+        (other, PathSeg::Idx(0)) => {
+            out.push(other);
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> BqResult<()> {
     let segs = parse_json_path(path, false)?;
     if segs.is_empty() {
@@ -182,14 +254,20 @@ pub(super) fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> 
     }
     let mut cur = doc;
     let last_idx = segs.len() - 1;
-    for (i, seg) in segs.into_iter().enumerate() {
+    for i in 0..=last_idx {
+        let Some(seg) = segs.get(i) else {
+            break;
+        };
         if i == last_idx {
             match (cur, seg) {
                 (JsonValue::Object(m), PathSeg::Key(k)) => {
-                    m.insert(k, val);
+                    m.insert(k.clone(), val);
                 }
-                (JsonValue::Array(a), PathSeg::Idx(idx)) if idx < a.len() => {
-                    if let Some(slot) = a.get_mut(idx) {
+                (JsonValue::Array(a), PathSeg::Idx(idx)) => {
+                    while a.len() <= *idx {
+                        a.push(JsonValue::Null);
+                    }
+                    if let Some(slot) = a.get_mut(*idx) {
                         *slot = val;
                     }
                 }
@@ -197,16 +275,35 @@ pub(super) fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> 
             }
             return Ok(());
         }
+        let next_is_idx = matches!(segs.get(i + 1), Some(PathSeg::Idx(_)));
         match (cur, seg) {
             (JsonValue::Object(m), PathSeg::Key(k)) => {
-                if let Some(next) = m.get_mut(&k) {
+                if !m.contains_key(k) {
+                    let placeholder = if next_is_idx {
+                        JsonValue::Array(Vec::new())
+                    } else {
+                        JsonValue::Object(Map::new())
+                    };
+                    m.insert(k.clone(), placeholder);
+                }
+                if let Some(next) = m.get_mut(k) {
                     cur = next;
                 } else {
                     return Ok(());
                 }
             }
             (JsonValue::Array(a), PathSeg::Idx(idx)) => {
-                if let Some(next) = a.get_mut(idx) {
+                while a.len() <= *idx {
+                    a.push(JsonValue::Null);
+                }
+                if let Some(next) = a.get_mut(*idx) {
+                    if next.is_null() {
+                        *next = if next_is_idx {
+                            JsonValue::Array(Vec::new())
+                        } else {
+                            JsonValue::Object(Map::new())
+                        };
+                    }
                     cur = next;
                 } else {
                     return Ok(());
@@ -218,31 +315,49 @@ pub(super) fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> 
     Ok(())
 }
 
+pub(super) fn insert_json_array_path(
+    doc: &mut JsonValue,
+    path: &str,
+    val: JsonValue,
+) -> BqResult<()> {
+    let segs = parse_json_path(path, false)?;
+    let Some((PathSeg::Idx(idx), prefix)) = segs.split_last() else {
+        return Ok(());
+    };
+    let Some(JsonValue::Array(arr)) = navigate_mut(doc, prefix) else {
+        return Ok(());
+    };
+    if *idx >= arr.len() {
+        while arr.len() < *idx {
+            arr.push(JsonValue::Null);
+        }
+        arr.push(val);
+    } else {
+        arr.insert(*idx, val);
+    }
+    Ok(())
+}
+
+pub(super) fn append_json_array_path(
+    doc: &mut JsonValue,
+    path: &str,
+    val: JsonValue,
+) -> BqResult<()> {
+    let segs = parse_json_path(path, false)?;
+    if let Some(JsonValue::Array(arr)) = navigate_mut(doc, &segs) {
+        arr.push(val);
+    }
+    Ok(())
+}
+
 pub(super) fn remove_json_path(doc: &mut JsonValue, path: &str) -> BqResult<()> {
     let segs = parse_json_path(path, false)?;
-    let mut cur = doc;
     let Some((last, prefix)) = segs.split_last() else {
         return Ok(());
     };
-    for seg in prefix {
-        match (cur, seg) {
-            (JsonValue::Object(m), PathSeg::Key(k)) => {
-                if let Some(next) = m.get_mut(k) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            (JsonValue::Array(a), PathSeg::Idx(idx)) => {
-                if let Some(next) = a.get_mut(*idx) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            _ => return Ok(()),
-        }
-    }
+    let Some(cur) = navigate_mut(doc, prefix) else {
+        return Ok(());
+    };
     match (cur, last) {
         (JsonValue::Object(m), PathSeg::Key(k)) => {
             m.remove(k);
@@ -253,6 +368,17 @@ pub(super) fn remove_json_path(doc: &mut JsonValue, path: &str) -> BqResult<()> 
         _ => {}
     }
     Ok(())
+}
+
+fn navigate_mut<'a>(mut cur: &'a mut JsonValue, segs: &[PathSeg]) -> Option<&'a mut JsonValue> {
+    for seg in segs {
+        cur = match (cur, seg) {
+            (JsonValue::Object(m), PathSeg::Key(k)) => m.get_mut(k)?,
+            (JsonValue::Array(a), PathSeg::Idx(idx)) => a.get_mut(*idx)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
 }
 
 fn parse_json_path(path: &str, legacy_brackets: bool) -> BqResult<Vec<PathSeg>> {
@@ -301,14 +427,14 @@ fn parse_bracket_seg(
     while chars.peek().is_some_and(char::is_ascii_whitespace) {
         chars.next();
     }
-    if chars.peek() == Some(&'\'') {
-        if !legacy_brackets {
+    if matches!(chars.peek(), Some('\'' | '"')) {
+        let quote = chars.next().unwrap_or('\'');
+        if quote == '\'' && !legacy_brackets {
             return Err(BqError::semantic(format!(
                 "Invalid token in JSONPath '{path}'"
             )));
         }
-        chars.next();
-        let key = parse_quoted_key(chars, '\'', path)?;
+        let key = parse_quoted_key(chars, quote, path)?;
         while chars.peek().is_some_and(char::is_ascii_whitespace) {
             chars.next();
         }
@@ -333,11 +459,16 @@ fn parse_bracket_seg(
             "Unterminated bracket segment in JSONPath '{path}'"
         )));
     }
-    let idx = inner
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| BqError::semantic(format!("Invalid array index in JSONPath '{path}'")))?;
-    Ok(PathSeg::Idx(idx))
+    let trimmed = inner.trim();
+    if let Ok(idx) = trimmed.parse::<usize>() {
+        return Ok(PathSeg::Idx(idx));
+    }
+    if legacy_brackets && !trimmed.is_empty() {
+        return Ok(PathSeg::Key(trimmed.to_owned()));
+    }
+    Err(BqError::semantic(format!(
+        "Invalid array index in JSONPath '{path}'"
+    )))
 }
 
 fn parse_quoted_key(

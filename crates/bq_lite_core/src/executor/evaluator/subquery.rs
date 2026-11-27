@@ -219,6 +219,7 @@ pub(super) fn eval_extract_value(
             };
             extract_datetime_part(&upper, part, local_dt, true)
         }
+        BqValue::Interval(iv) => crate::executor::scalar::extract_interval_part(&upper, part, iv),
         other => Err(BqError::query(format!(
             "EXTRACT not supported for {}",
             other.infer_type()?

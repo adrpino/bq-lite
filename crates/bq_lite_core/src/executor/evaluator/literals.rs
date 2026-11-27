@@ -1,9 +1,10 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 use crate::ast::Literal;
 use crate::error::{BqError, BqResult};
 use crate::types::{
-    check_max_6_frac_digits, parse_timestamp_str, BqBigNumeric, BqNumeric, BqValue,
+    check_max_6_frac_digits, parse_naive_datetime, parse_time_str, parse_timestamp_str,
+    validate_bq_date, BqBigNumeric, BqNumeric, BqValue,
 };
 
 pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
@@ -19,14 +20,16 @@ pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
         Literal::String(s) => Ok(BqValue::String(s.clone())),
         Literal::Bytes(b) => Ok(BqValue::Bytes(b.clone())),
         Literal::Date(s) => NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-            .map(BqValue::Date)
-            .map_err(|_| BqError::query(format!("Invalid DATE literal: '{s}'"))),
-        Literal::Datetime(s) => parse_datetime_lit(s).map(BqValue::Datetime),
+            .map_err(|_| BqError::query(format!("Invalid DATE literal: '{s}'")))
+            .and_then(validate_bq_date)
+            .map(BqValue::Date),
+        Literal::Datetime(s) => {
+            check_max_6_frac_digits(s.trim())?;
+            parse_datetime_lit(s).map(BqValue::Datetime)
+        }
         Literal::Time(s) => {
-            let trimmed = s.trim();
-            check_max_6_frac_digits(trimmed)?;
-            NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f")
-                .or_else(|_| NaiveTime::parse_from_str(trimmed, "%H:%M:%S"))
+            check_max_6_frac_digits(s.trim())?;
+            parse_time_str(s)
                 .map(BqValue::Time)
                 .map_err(|_| BqError::query(format!("Invalid TIME literal: '{s}'")))
         }
@@ -38,19 +41,7 @@ pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
 }
 
 fn parse_datetime_lit(s: &str) -> BqResult<NaiveDateTime> {
-    let trimmed = s.trim();
-    check_max_6_frac_digits(trimmed)?;
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
-            return Ok(dt);
-        }
-    }
-    Err(BqError::query(format!("Invalid DATETIME literal: '{s}'")))
+    parse_naive_datetime(s).map_err(|_| BqError::query(format!("Invalid DATETIME literal: '{s}'")))
 }
 
 fn parse_timestamp_lit(s: &str) -> BqResult<DateTime<Utc>> {
@@ -154,4 +145,134 @@ pub(super) fn compare_arrays(
         }
     }
     Ok(Some(ax.len().cmp(&ay.len())))
+}
+
+pub(super) fn eval_range_literal(
+    elem_type: &crate::ast::DataTypeAst,
+    start: &crate::ast::Expr,
+    end: &crate::ast::Expr,
+    row: &crate::executor::context::EvalRow,
+    ctx: &crate::executor::context::ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let bq_ty = elem_type.to_bq_type()?;
+    let rt = match bq_ty {
+        crate::types::BqType::Date => crate::types::RangeElementType::Date,
+        crate::types::BqType::Datetime => crate::types::RangeElementType::Datetime,
+        crate::types::BqType::Timestamp => crate::types::RangeElementType::Timestamp,
+        crate::types::BqType::Range(inner) => inner,
+        crate::types::BqType::UntypedNull
+        | crate::types::BqType::Bool
+        | crate::types::BqType::Int64
+        | crate::types::BqType::Float64
+        | crate::types::BqType::Numeric
+        | crate::types::BqType::BigNumeric
+        | crate::types::BqType::String
+        | crate::types::BqType::Bytes
+        | crate::types::BqType::Time
+        | crate::types::BqType::Interval
+        | crate::types::BqType::Json
+        | crate::types::BqType::Geography
+        | crate::types::BqType::Array(_)
+        | crate::types::BqType::Struct(_) => {
+            return Err(BqError::query(
+                "RANGE literal requires DATE/DATETIME/TIMESTAMP element type",
+            ))
+        }
+    };
+    let s_raw = super::eval_expr(start, row, ctx)?;
+    let e_raw = super::eval_expr(end, row, ctx)?;
+    let target = rt.to_bq_type();
+    let s_opt = if s_raw.is_null() {
+        None
+    } else {
+        Some(crate::types::coercion::cast_value(s_raw, &target)?)
+    };
+    let e_opt = if e_raw.is_null() {
+        None
+    } else {
+        Some(crate::types::coercion::cast_value(e_raw, &target)?)
+    };
+    if let (Some(sv), Some(ev)) = (&s_opt, &e_opt) {
+        if matches!(
+            super::ops::compare_values(sv, ev)?,
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ) {
+            return Err(BqError::semantic(
+                "RANGE start must be strictly less than end",
+            ));
+        }
+    }
+    Ok(BqValue::Range(Box::new(crate::types::BqRange::new(
+        rt, s_opt, e_opt,
+    )?)))
+}
+
+pub(super) fn validate_type_params(
+    val: &BqValue,
+    ast_ty: &crate::ast::DataTypeAst,
+) -> BqResult<()> {
+    use crate::ast::DataTypeAst;
+    if val.is_null() {
+        return Ok(());
+    }
+    match (val, ast_ty) {
+        (BqValue::String(s), DataTypeAst::String { max_len: Some(max) }) => {
+            let len = u64::try_from(s.chars().count()).unwrap_or(u64::MAX);
+            if len > *max {
+                return Err(BqError::semantic(format!(
+                    "STRING({max}) has maximum length {max} but got a value with length {len}"
+                )));
+            }
+        }
+        (BqValue::Bytes(b), DataTypeAst::Bytes { max_len: Some(max) }) => {
+            let len = u64::try_from(b.len()).unwrap_or(u64::MAX);
+            if len > *max {
+                return Err(BqError::semantic(format!(
+                    "BYTES({max}) has maximum length {max} but got a value with length {len}"
+                )));
+            }
+        }
+        (
+            BqValue::Numeric(n),
+            DataTypeAst::Numeric {
+                precision: Some(p),
+                scale,
+            },
+        ) => check_decimal_precision(&n.to_string(), *p, scale.unwrap_or(0), "NUMERIC")?,
+        (
+            BqValue::BigNumeric(bn),
+            DataTypeAst::BigNumeric {
+                precision: Some(p),
+                scale,
+            },
+        ) => check_decimal_precision(&bn.to_string(), *p, scale.unwrap_or(0), "BIGNUMERIC")?,
+        (BqValue::Array(items), DataTypeAst::Array(elem_ty)) => {
+            for item in items {
+                validate_type_params(item, elem_ty)?;
+            }
+        }
+        (BqValue::Struct(fields), DataTypeAst::Struct(field_tys)) => {
+            for (fv, ft) in fields.iter().zip(field_tys.iter()) {
+                validate_type_params(&fv.value, &ft.ty)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_decimal_precision(raw: &str, precision: u32, scale: u32, name: &str) -> BqResult<()> {
+    let unsigned = raw.trim().trim_start_matches(['+', '-']);
+    let int_part = unsigned
+        .split('.')
+        .next()
+        .unwrap_or("0")
+        .trim_start_matches('0');
+    let max_int_digits = usize::try_from(precision.saturating_sub(scale)).unwrap_or(0);
+    if int_part.len() > max_int_digits {
+        return Err(BqError::semantic(format!(
+            "{name}({precision}, {scale}) precision overflow for '{raw}'"
+        )));
+    }
+    Ok(())
 }

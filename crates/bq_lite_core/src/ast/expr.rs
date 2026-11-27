@@ -165,7 +165,8 @@ pub enum Expr {
         expr: Box<Self>,
         ty: DataTypeAst,
         safe: bool,
-        format: Option<String>,
+        format: Option<Box<Self>>,
+        time_zone: Option<Box<Self>>,
     },
     Case {
         operand: Option<Box<Self>>,

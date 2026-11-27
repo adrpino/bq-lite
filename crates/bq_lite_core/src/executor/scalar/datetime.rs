@@ -1,17 +1,18 @@
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use chrono_tz::Tz;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
 use crate::error::{BqError, BqResult};
 use crate::executor::context::ExecContext;
-use crate::types::BqValue;
+use crate::types::{parse_timestamp_str, validate_bq_date, BqTimezone, BqValue};
 
 use super::datetime_calc::{
-    eval_date_add_sub, eval_date_diff, eval_date_from_unix, eval_date_trunc, eval_datetime_add_sub,
-    eval_datetime_diff, eval_datetime_trunc, eval_generate_date_array, eval_last_day,
-    eval_timestamp_add_sub, eval_timestamp_diff, eval_timestamp_trunc, eval_ts_epoch,
+    eval_date_add_sub, eval_date_diff, eval_date_trunc, eval_datetime_add_sub, eval_datetime_diff,
+    eval_datetime_trunc, eval_last_day, eval_timestamp_add_sub, eval_timestamp_diff,
+    eval_timestamp_trunc,
+};
+use super::datetime_fmt::{
+    eval_date_from_unix, eval_format_dt, eval_generate_date_array, eval_parse_dt, eval_ts_epoch,
     eval_unix_date, eval_unix_epoch,
 };
-use super::datetime_fmt::{eval_format_dt, eval_parse_dt};
 
 pub(super) const DATETIME_FUNCTIONS: &[&str] = &[
     "CURRENT_DATE",
@@ -62,8 +63,8 @@ pub(super) fn eval_datetime_fn(
     match name {
         "CURRENT_TIMESTAMP" => Ok(Some(BqValue::Timestamp(ctx.now))),
         "CURRENT_DATE" => eval_current_date(&args, ctx).map(Some),
-        "CURRENT_DATETIME" => Ok(Some(BqValue::Datetime(ctx.now.naive_utc()))),
-        "CURRENT_TIME" => Ok(Some(BqValue::Time(ctx.now.time()))),
+        "CURRENT_DATETIME" => eval_current_datetime(&args, ctx).map(Some),
+        "CURRENT_TIME" => eval_current_time(&args, ctx).map(Some),
         "DATE" => eval_date_ctor(args).map(Some),
         "DATETIME" => eval_datetime_ctor(&args).map(Some),
         "TIME" => eval_time_ctor(args).map(Some),
@@ -101,13 +102,39 @@ pub(super) fn eval_datetime_fn(
 }
 
 fn eval_current_date(args: &[BqValue], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
-    if let Some(BqValue::String(tz_name)) = args.first() {
-        let tz: Tz = tz_name
-            .parse()
-            .map_err(|_| BqError::semantic(format!("Invalid timezone '{tz_name}'")))?;
-        return Ok(BqValue::Date(ctx.now.with_timezone(&tz).date_naive()));
+    match args.first() {
+        None => Ok(BqValue::Date(ctx.now.date_naive())),
+        Some(BqValue::Null) => Ok(BqValue::Null),
+        Some(BqValue::String(tz_name)) => {
+            let tz = BqTimezone::parse(tz_name)?;
+            Ok(BqValue::Date(tz.utc_to_local(ctx.now).date()))
+        }
+        Some(_) => Err(BqError::query("CURRENT_DATE timezone must be STRING")),
     }
-    Ok(BqValue::Date(ctx.now.date_naive()))
+}
+
+fn eval_current_datetime(args: &[BqValue], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+    match args.first() {
+        None => Ok(BqValue::Datetime(ctx.now.naive_utc())),
+        Some(BqValue::Null) => Ok(BqValue::Null),
+        Some(BqValue::String(tz_name)) => {
+            let tz = BqTimezone::parse(tz_name)?;
+            Ok(BqValue::Datetime(tz.utc_to_local(ctx.now)))
+        }
+        Some(_) => Err(BqError::query("CURRENT_DATETIME timezone must be STRING")),
+    }
+}
+
+fn eval_current_time(args: &[BqValue], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+    match args.first() {
+        None => Ok(BqValue::Time(ctx.now.time())),
+        Some(BqValue::Null) => Ok(BqValue::Null),
+        Some(BqValue::String(tz_name)) => {
+            let tz = BqTimezone::parse(tz_name)?;
+            Ok(BqValue::Time(tz.utc_to_local(ctx.now).time()))
+        }
+        Some(_) => Err(BqError::query("CURRENT_TIME timezone must be STRING")),
+    }
 }
 
 #[expect(
@@ -131,12 +158,12 @@ fn eval_date_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
             u32::try_from(d).unwrap_or(0),
         )
         .ok_or_else(|| BqError::semantic("Invalid DATE components"))?;
-        return Ok(BqValue::Date(date));
+        return validate_bq_date(date).map(BqValue::Date);
     }
     let Some(first) = args.first() else {
         return Err(BqError::query("DATE expects 1 to 3 arguments"));
     };
-    if first.is_null() {
+    if first.is_null() || args.get(1).is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
     match first {
@@ -144,10 +171,22 @@ fn eval_date_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
         BqValue::Datetime(dt) => Ok(BqValue::Date(dt.date())),
         BqValue::Timestamp(ts) => {
             if let Some(BqValue::String(tz_s)) = args.get(1) {
-                let tz: Tz = tz_s
-                    .parse()
-                    .map_err(|_| BqError::semantic(format!("Invalid timezone '{tz_s}'")))?;
-                Ok(BqValue::Date(ts.with_timezone(&tz).date_naive()))
+                let tz = BqTimezone::parse(tz_s)?;
+                Ok(BqValue::Date(tz.utc_to_local(*ts).date()))
+            } else {
+                Ok(BqValue::Date(ts.date_naive()))
+            }
+        }
+        BqValue::String(s) => {
+            if let Ok(v) =
+                crate::types::coercion::cast_value(first.clone(), &crate::types::BqType::Date)
+            {
+                return Ok(v);
+            }
+            let ts = parse_timestamp_str(s)?;
+            if let Some(BqValue::String(tz_s)) = args.get(1) {
+                let tz = BqTimezone::parse(tz_s)?;
+                Ok(BqValue::Date(tz.utc_to_local(ts).date()))
             } else {
                 Ok(BqValue::Date(ts.date_naive()))
             }
@@ -156,22 +195,47 @@ fn eval_date_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "DATETIME(y,m,d,h,min,s) requires INT64 arguments"
+)]
 fn eval_datetime_ctor(args: &[BqValue]) -> BqResult<BqValue> {
     let Some(first) = args.first() else {
         return Err(BqError::query("DATETIME expects at least 1 argument"));
     };
-    if first.is_null() {
+    if args.iter().any(BqValue::is_null) {
         return Ok(BqValue::Null);
+    }
+    if args.len() == 6 {
+        let vals: Vec<i64> = args
+            .iter()
+            .map(|v| match v {
+                BqValue::Int64(n) => Ok(*n),
+                _ => Err(BqError::query("DATETIME(y,m,d,h,min,s) expects INT64")),
+            })
+            .collect::<BqResult<_>>()?;
+        let d = NaiveDate::from_ymd_opt(
+            i32::try_from(vals.first().copied().unwrap_or(0)).unwrap_or(0),
+            u32::try_from(vals.get(1).copied().unwrap_or(0)).unwrap_or(0),
+            u32::try_from(vals.get(2).copied().unwrap_or(0)).unwrap_or(0),
+        )
+        .ok_or_else(|| BqError::semantic("Invalid DATETIME date components"))?;
+        let d = validate_bq_date(d)?;
+        let t = NaiveTime::from_hms_opt(
+            u32::try_from(vals.get(3).copied().unwrap_or(99)).unwrap_or(99),
+            u32::try_from(vals.get(4).copied().unwrap_or(99)).unwrap_or(99),
+            u32::try_from(vals.get(5).copied().unwrap_or(99)).unwrap_or(99),
+        )
+        .ok_or_else(|| BqError::semantic("Invalid DATETIME time components"))?;
+        return Ok(BqValue::Datetime(NaiveDateTime::new(d, t)));
     }
     if let (Some(BqValue::Date(d)), Some(BqValue::Time(t))) = (args.first(), args.get(1)) {
         return Ok(BqValue::Datetime(NaiveDateTime::new(*d, *t)));
     }
     if let BqValue::Timestamp(ts) = first {
         if let Some(BqValue::String(tz_s)) = args.get(1) {
-            let tz: Tz = tz_s
-                .parse()
-                .map_err(|_| BqError::semantic(format!("Invalid timezone '{tz_s}'")))?;
-            return Ok(BqValue::Datetime(ts.with_timezone(&tz).naive_local()));
+            let tz = BqTimezone::parse(tz_s)?;
+            return Ok(BqValue::Datetime(tz.utc_to_local(*ts)));
         }
         return Ok(BqValue::Datetime(ts.naive_utc()));
     }
@@ -179,6 +243,9 @@ fn eval_datetime_ctor(args: &[BqValue]) -> BqResult<BqValue> {
 }
 
 fn eval_time_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if args.iter().any(BqValue::is_null) {
+        return Ok(BqValue::Null);
+    }
     if args.len() == 3 {
         let [BqValue::Int64(h), BqValue::Int64(m), BqValue::Int64(s)]: [BqValue; 3] = args
             .try_into()
@@ -195,27 +262,57 @@ fn eval_time_ctor(args: Vec<BqValue>) -> BqResult<BqValue> {
         return Ok(BqValue::Time(t));
     }
     let Some(first) = args.first() else {
-        return Err(BqError::query("TIME expects 1 or 3 arguments"));
+        return Err(BqError::query("TIME expects 1 to 3 arguments"));
     };
+    if let BqValue::Timestamp(ts) = first {
+        if let Some(BqValue::String(tz_s)) = args.get(1) {
+            let tz = BqTimezone::parse(tz_s)?;
+            return Ok(BqValue::Time(tz.utc_to_local(*ts).time()));
+        }
+        return Ok(BqValue::Time(ts.time()));
+    }
+    if let BqValue::String(s) = first {
+        if let Ok(v) =
+            crate::types::coercion::cast_value(first.clone(), &crate::types::BqType::Time)
+        {
+            return Ok(v);
+        }
+        let ts = parse_timestamp_str(s)?;
+        if let Some(BqValue::String(tz_s)) = args.get(1) {
+            let tz = BqTimezone::parse(tz_s)?;
+            return Ok(BqValue::Time(tz.utc_to_local(ts).time()));
+        }
+        return Ok(BqValue::Time(ts.time()));
+    }
     crate::types::coercion::cast_value(first.clone(), &crate::types::BqType::Time)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Non-temporal TIMESTAMP inputs fall through to cast_value"
+)]
 fn eval_timestamp_ctor(args: &[BqValue]) -> BqResult<BqValue> {
     let Some(first) = args.first() else {
         return Err(BqError::query("TIMESTAMP expects 1 or 2 arguments"));
     };
-    if first.is_null() {
+    if args.iter().any(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
-    if let (BqValue::Datetime(dt), Some(BqValue::String(tz_s))) = (first, args.get(1)) {
-        let tz: Tz = tz_s
-            .parse()
-            .map_err(|_| BqError::semantic(format!("Invalid timezone '{tz_s}'")))?;
-        let local = dt
-            .and_local_timezone(tz)
-            .single()
-            .ok_or_else(|| BqError::semantic("Ambiguous or invalid local datetime for timezone"))?;
-        return Ok(BqValue::Timestamp(local.with_timezone(&Utc)));
+    if let Some(BqValue::String(tz_s)) = args.get(1) {
+        let tz = BqTimezone::parse(tz_s)?;
+        match first {
+            BqValue::Datetime(dt) => return tz.local_to_utc(*dt).map(BqValue::Timestamp),
+            BqValue::Date(d) => {
+                let dt = d.and_hms_opt(0, 0, 0).unwrap_or_default();
+                return tz.local_to_utc(dt).map(BqValue::Timestamp);
+            }
+            BqValue::String(s) => {
+                if let Ok(dt) = crate::types::parse_naive_datetime(s) {
+                    return tz.local_to_utc(dt).map(BqValue::Timestamp);
+                }
+            }
+            _ => {}
+        }
     }
     crate::types::coercion::cast_value(first.clone(), &crate::types::BqType::Timestamp)
 }

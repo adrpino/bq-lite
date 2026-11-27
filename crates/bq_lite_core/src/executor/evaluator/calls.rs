@@ -19,12 +19,22 @@ pub(super) fn eval_function_expr(
     }
     let fn_name = call.name.normalized_parts().join(".");
     let upper = fn_name.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "ARRAY_TRANSFORM" | "ARRAY_FILTER" | "ARRAY_INCLUDES" | "ARRAY_FIND" | "ARRAY_OFFSET"
+    ) && call
+        .args
+        .get(1)
+        .is_some_and(|a| matches!(a.expr, Expr::Lambda { .. }))
+    {
+        return super::lambda::eval_array_lambda_call(&upper, call, row, ctx);
+    }
     let short_res = match upper.as_str() {
-        "ARRAY_TRANSFORM" | "ARRAY_FILTER" => Some(eval_array_lambda(&upper, call, row, ctx)),
         "IF" => Some(eval_if_short_circuit(call, row, ctx)),
         "COALESCE" => Some(eval_coalesce_short_circuit(call, row, ctx)),
         "IFNULL" => Some(eval_ifnull_short_circuit(call, row, ctx)),
         "NULLIF" => Some(eval_nullif_typed(call, row, ctx)),
+        "RANGE" => Some(eval_range_call_typed(call, row, ctx)),
         _ => None,
     };
     if let Some(res) = short_res {
@@ -35,42 +45,13 @@ pub(super) fn eval_function_expr(
         };
     }
     if upper == "MAKE_INTERVAL" && call.args.iter().any(|a| a.name.is_some()) {
-        let mut slots = vec![BqValue::Int64(0); 6];
-        for (idx, arg) in call.args.iter().enumerate() {
-            let val = eval_expr(&arg.expr, row, ctx)?;
-            let pos = if let Some(ref nm) = arg.name {
-                match nm.value.to_ascii_lowercase().as_str() {
-                    "year" => 0,
-                    "month" => 1,
-                    "day" => 2,
-                    "hour" => 3,
-                    "minute" => 4,
-                    "second" => 5,
-                    other => {
-                        return Err(BqError::query(format!(
-                            "Unknown MAKE_INTERVAL parameter '{other}'"
-                        )))
-                    }
-                }
-            } else {
-                idx
-            };
-            if let Some(slot) = slots.get_mut(pos) {
-                *slot = val;
-            }
-        }
-        return match eval_scalar_builtin(&fn_name, slots, ctx) {
-            Ok(Some(v)) => Ok(v),
-            Ok(None) => Ok(BqValue::Null),
-            Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
-            Err(err) => Err(err),
-        };
+        return super::lambda::eval_make_interval_named(&fn_name, call, row, ctx);
     }
     let mut args = Vec::with_capacity(call.args.len());
     for (idx, arg) in call.args.iter().enumerate() {
         if is_date_part_arg_pos(&upper, idx) {
-            if let Expr::Ident(id) = &arg.expr {
-                args.push(BqValue::String(id.value.clone()));
+            if let Some(part_str) = extract_date_part_arg(&arg.expr) {
+                args.push(BqValue::String(part_str));
                 continue;
             }
         }
@@ -103,6 +84,31 @@ pub(in crate::executor) fn is_date_part_arg_pos(upper_fn: &str, idx: usize) -> b
 
 #[expect(
     clippy::wildcard_enum_match_arm,
+    reason = "Only Ident and WEEK(dow) function calls represent date parts"
+)]
+fn extract_date_part_arg(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(id) => Some(id.value.clone()),
+        Expr::Function(fc)
+            if fc.name.normalized_parts().len() == 1
+                && fc
+                    .name
+                    .normalized_parts()
+                    .first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("WEEK"))
+                && fc.args.len() == 1 =>
+        {
+            if let Some(Expr::Ident(dow)) = fc.args.first().map(|a| &a.expr) {
+                return Some(format!("WEEK({})", dow.value.to_ascii_uppercase()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
     reason = "Only BOOL and NULL are valid IF conditions"
 )]
 fn eval_if_short_circuit(
@@ -125,6 +131,46 @@ fn eval_if_short_circuit(
         }
     };
     coerce_to_expr_supertype(val, &[&t_arg.expr, &f_arg.expr], row, ctx)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only Date, Datetime, and Timestamp are valid RANGE element types"
+)]
+fn eval_range_call_typed(
+    call: &FunctionCall,
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let [s_arg, e_arg] = call.args.as_slice() else {
+        return Err(BqError::query("RANGE expects 2 arguments"));
+    };
+    let start = eval_expr(&s_arg.expr, row, ctx)?;
+    let end = eval_expr(&e_arg.expr, row, ctx)?;
+    if start.is_null() && end.is_null() {
+        let t1 = crate::executor::query::infer_expr_type_public(&s_arg.expr, row, ctx);
+        let t2 = crate::executor::query::infer_expr_type_public(&e_arg.expr, row, ctx);
+        let inferred = if matches!(t1, BqType::UntypedNull) {
+            t2
+        } else {
+            t1
+        };
+        let rt = match inferred {
+            BqType::Date => crate::types::RangeElementType::Date,
+            BqType::Datetime => crate::types::RangeElementType::Datetime,
+            BqType::Timestamp => crate::types::RangeElementType::Timestamp,
+            _ => {
+                return Err(BqError::query(
+                    "RANGE(NULL, NULL) requires explicit RANGE<T> literal",
+                ))
+            }
+        };
+        return Ok(BqValue::Range(Box::new(crate::types::BqRange::new(
+            rt, None, None,
+        )?)));
+    }
+    eval_scalar_builtin("RANGE", vec![start, end], ctx)?
+        .ok_or_else(|| BqError::internal("RANGE scalar missing"))
 }
 
 fn eval_coalesce_short_circuit(
@@ -177,60 +223,6 @@ fn eval_nullif_typed(
         a
     };
     coerce_to_expr_supertype(val, &[&a_arg.expr, &b_arg.expr], row, ctx)
-}
-
-fn eval_array_lambda(
-    upper_fn: &str,
-    call: &FunctionCall,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let [arr_arg, lambda_arg] = call.args.as_slice() else {
-        return Err(BqError::query(format!(
-            "{upper_fn} expects 2 arguments (array, lambda)"
-        )));
-    };
-    let arr_val = eval_expr(&arr_arg.expr, row, ctx)?;
-    if arr_val.is_null() {
-        return Ok(BqValue::Null);
-    }
-    let BqValue::Array(items) = arr_val else {
-        return Err(BqError::query(format!(
-            "{upper_fn} first argument must be ARRAY"
-        )));
-    };
-    let Expr::Lambda { params, body } = &lambda_arg.expr else {
-        return Err(BqError::query(format!(
-            "{upper_fn} second argument must be a lambda expression"
-        )));
-    };
-    if params.is_empty() || params.len() > 2 {
-        return Err(BqError::query(format!(
-            "{upper_fn} lambda expects 1 or 2 parameters"
-        )));
-    }
-    let mut out = Vec::new();
-    for (idx, item) in items.into_iter().enumerate() {
-        let mut sub_ctx = ctx.with_outer(row);
-        if let Some(p0) = params.first() {
-            sub_ctx
-                .vars
-                .insert(p0.value.to_ascii_lowercase(), item.clone());
-        }
-        if let Some(p1) = params.get(1) {
-            let off = i64::try_from(idx).unwrap_or(i64::MAX);
-            sub_ctx
-                .vars
-                .insert(p1.value.to_ascii_lowercase(), BqValue::Int64(off));
-        }
-        let val = eval_expr(body, row, &sub_ctx)?;
-        if upper_fn == "ARRAY_TRANSFORM" {
-            out.push(val);
-        } else if matches!(val, BqValue::Bool(true)) {
-            out.push(item);
-        }
-    }
-    Ok(BqValue::Array(out))
 }
 
 pub(in crate::executor) fn lookup_udf_return_type(

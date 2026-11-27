@@ -337,6 +337,7 @@ pub(super) fn infer_table_factor_schema(
                 .first()
                 .map_or_else(EvalRow::default, null_out_eval_row))
         }
+        TableFactor::TableSample { source, .. } => infer_table_factor_schema(source, corr_row, ctx),
         TableFactor::NestedJoin(twj) => {
             let mut acc = infer_table_factor_schema(&twj.relation, corr_row, ctx)?;
             for j in &twj.joins {

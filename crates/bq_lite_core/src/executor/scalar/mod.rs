@@ -1,3 +1,4 @@
+mod array_extra;
 mod array_util;
 mod bytes_fn;
 mod datetime;
@@ -6,6 +7,7 @@ mod datetime_extra;
 mod datetime_fmt;
 mod farmhash;
 mod geo_search;
+mod interval;
 mod json;
 mod json_path;
 mod math_hash;
@@ -19,9 +21,11 @@ use crate::error::BqResult;
 use crate::executor::context::ExecContext;
 use crate::types::BqValue;
 
-pub(in crate::executor) use datetime_calc::add_interval_to_date;
-pub(in crate::executor) use datetime_extra::{
-    parse_compound_interval, single_unit_interval, timestamp_to_tz_naive,
+pub(in crate::executor) use crate::types::{parse_compound_interval, single_unit_interval};
+pub(in crate::executor) use datetime_extra::timestamp_to_tz_naive;
+pub(in crate::executor) use interval::{
+    avg_intervals, eval_temporal_interval_arith, extract_interval_part, interval_div_f64,
+    interval_div_i64, interval_neg, sum_intervals,
 };
 
 /// Returns all registered scalar built-in function names (sorted/canonical uppercase).
@@ -33,8 +37,10 @@ pub fn registered_scalar_functions() -> Vec<&'static str> {
     all.extend_from_slice(regex_fn::REGEX_FUNCTIONS);
     all.extend_from_slice(datetime::DATETIME_FUNCTIONS);
     all.extend_from_slice(datetime_extra::DATETIME_EXTRA_FUNCTIONS);
+    all.extend_from_slice(interval::INTERVAL_FUNCTIONS);
     all.extend_from_slice(math_hash::MATH_HASH_FUNCTIONS);
     all.extend_from_slice(array_util::ARRAY_UTIL_FUNCTIONS);
+    all.extend_from_slice(array_extra::ARRAY_EXTRA_FUNCTIONS);
     all.extend_from_slice(json::JSON_FUNCTIONS);
     all.extend_from_slice(range_geo_net::RANGE_NET_FUNCTIONS);
     all.extend_from_slice(geo_search::GEO_SEARCH_FUNCTIONS);
@@ -72,10 +78,16 @@ pub(super) fn eval_scalar_builtin(
     if let Some(v) = datetime_extra::eval_datetime_extra_fn(&upper, &args)? {
         return Ok(Some(v));
     }
+    if let Some(v) = interval::eval_interval_fn(&upper, &args)? {
+        return Ok(Some(v));
+    }
     if let Some(v) = math_hash::eval_math_hash_fn(&upper, args.clone())? {
         return Ok(Some(v));
     }
     if let Some(v) = array_util::eval_array_util_fn(&upper, args.clone())? {
+        return Ok(Some(v));
+    }
+    if let Some(v) = array_extra::eval_array_extra_fn(&upper, args.clone())? {
         return Ok(Some(v));
     }
     if let Some(v) = json::eval_json_fn(&upper, args.clone())? {

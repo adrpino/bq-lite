@@ -11,7 +11,12 @@ pub(in crate::executor) fn eval_unary(op: UnaryOp, val: BqValue) -> BqResult<BqV
     }
     match (op, val) {
         (UnaryOp::Not, BqValue::Bool(b)) => Ok(BqValue::Bool(!b)),
-        (UnaryOp::Plus, v) if v.infer_type()?.is_numeric() => Ok(v),
+        (UnaryOp::Plus, v) if v.infer_type()?.is_numeric() || matches!(v, BqValue::Interval(_)) => {
+            Ok(v)
+        }
+        (UnaryOp::Minus, BqValue::Interval(iv)) => {
+            crate::executor::scalar::interval_neg(iv).map(BqValue::Interval)
+        }
         (UnaryOp::Minus, BqValue::Int64(n)) => n
             .checked_neg()
             .map(BqValue::Int64)
@@ -154,6 +159,17 @@ fn eval_concat(left: BqValue, right: BqValue) -> BqResult<BqValue> {
             a.extend(b);
             Ok(BqValue::Array(a))
         }
+        (l, r)
+            if !matches!(
+                l,
+                BqValue::Array(_) | BqValue::Struct(_) | BqValue::Bytes(_)
+            ) && !matches!(
+                r,
+                BqValue::Array(_) | BqValue::Struct(_) | BqValue::Bytes(_)
+            ) =>
+        {
+            Ok(BqValue::String(format!("{l}{r}")))
+        }
         (l, r) => Err(BqError::query(format!(
             "Cannot concatenate {} and {}",
             l.infer_type()?,
@@ -166,13 +182,16 @@ fn eval_arith(op: BinaryOp, left: BqValue, right: BqValue) -> BqResult<BqValue> 
     if op == BinaryOp::Div {
         return eval_div(left, right);
     }
+    if matches!(left, BqValue::Interval(_)) || matches!(right, BqValue::Interval(_)) {
+        return crate::executor::scalar::eval_temporal_interval_arith(op, &left, &right);
+    }
     let supertype = common_supertype(&[left.infer_type()?, right.infer_type()?]);
     if let Ok(st) = supertype {
         let l = coerce_value(left, &st)?;
         let r = coerce_value(right, &st)?;
         return eval_numeric_arith(op, l, r);
     }
-    eval_temporal_interval_arith(op, &left, &right)
+    crate::executor::scalar::eval_temporal_interval_arith(op, &left, &right)
 }
 
 #[expect(
@@ -209,50 +228,28 @@ fn eval_numeric_arith(op: BinaryOp, l: BqValue, r: BqValue) -> BqResult<BqValue>
 }
 
 #[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only Add/Sub are valid temporal interval operators"
-)]
-fn eval_temporal_interval_arith(
-    op: BinaryOp,
-    left: &BqValue,
-    right: &BqValue,
-) -> BqResult<BqValue> {
-    let add = match op {
-        BinaryOp::Add => true,
-        BinaryOp::Sub => false,
-        _ => return Err(BqError::query("Invalid temporal interval operator")),
-    };
-    match (left, right) {
-        (BqValue::Date(d), BqValue::Interval(iv)) => {
-            crate::executor::scalar::add_interval_to_date(*d, *iv, add).map(BqValue::Date)
-        }
-        (BqValue::Datetime(dt), BqValue::Interval(iv)) => {
-            let d = crate::executor::scalar::add_interval_to_date(dt.date(), *iv, add)?;
-            let base = chrono::NaiveDateTime::new(d, dt.time());
-            let micros = if add { iv.micros } else { -iv.micros };
-            Ok(BqValue::Datetime(
-                base + chrono::Duration::microseconds(micros),
-            ))
-        }
-        (BqValue::Timestamp(ts), BqValue::Interval(iv)) => {
-            let sign = if add { 1_i64 } else { -1_i64 };
-            let delta = chrono::Duration::days(i64::from(iv.days) * sign)
-                + chrono::Duration::microseconds(iv.micros * sign);
-            Ok(BqValue::Timestamp(*ts + delta))
-        }
-        _ => Err(BqError::query(format!(
-            "Unsupported arithmetic between {} and {}",
-            left.infer_type()?,
-            right.infer_type()?
-        ))),
-    }
-}
-
-#[expect(
     clippy::cast_precision_loss,
     reason = "GoogleSQL `/` on INT64 operands returns FLOAT64"
 )]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only INT64 and FLOAT64 are valid INTERVAL divisors"
+)]
 fn eval_div(left: BqValue, right: BqValue) -> BqResult<BqValue> {
+    if let BqValue::Interval(iv) = left {
+        return match right {
+            BqValue::Int64(k) => {
+                crate::executor::scalar::interval_div_i64(iv, k).map(BqValue::Interval)
+            }
+            BqValue::Float64(k) => {
+                crate::executor::scalar::interval_div_f64(iv, k).map(BqValue::Interval)
+            }
+            other => Err(BqError::query(format!(
+                "Cannot divide INTERVAL by {}",
+                other.infer_type()?
+            ))),
+        };
+    }
     let lt = left.infer_type()?;
     let rt = right.infer_type()?;
     let target =
@@ -418,6 +415,9 @@ pub(in crate::executor) fn sql_values_equal(a: &BqValue, b: &BqValue) -> BqResul
             }
             Ok(if saw_null { None } else { Some(true) })
         }
+        (BqValue::Interval(ia), BqValue::Interval(ib)) => Ok(Some(
+            super::literals::interval_sort_key(*ia) == super::literals::interval_sort_key(*ib),
+        )),
         _ => Ok(Some(ca == cb)),
     }
 }

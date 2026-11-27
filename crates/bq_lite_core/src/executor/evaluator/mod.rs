@@ -1,4 +1,6 @@
 mod calls;
+mod cast_fmt;
+mod lambda;
 mod literals;
 mod ops;
 mod subquery;
@@ -48,6 +50,10 @@ pub(super) fn like_match_values(text: &str, pattern: &str) -> bool {
     literals::eval_like(text, pattern)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Single dispatch table over all Expr AST variants"
+)]
 pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     match expr {
         Expr::Literal(lit) => literals::eval_literal(lit),
@@ -76,7 +82,17 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             negated,
             target,
         } => eval_in_expr(expr, *negated, target, row, ctx),
-        Expr::Cast { expr, ty, safe, .. } => eval_cast_expr(expr, ty, *safe, row, ctx),
+        Expr::Cast {
+            expr,
+            ty,
+            safe,
+            format,
+            time_zone,
+        } => eval_cast_expr(
+            (expr, ty, *safe, format.as_deref(), time_zone.as_deref()),
+            row,
+            ctx,
+        ),
         Expr::Case {
             operand,
             whens,
@@ -121,67 +137,12 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             elem_type,
             start,
             end,
-        } => eval_range_literal(elem_type, start, end, row, ctx),
+        } => literals::eval_range_literal(elem_type, start, end, row, ctx),
         Expr::Star | Expr::QualifiedStar(_) => Err(BqError::query("Unexpected '*' in expression")),
         Expr::Lambda { .. } => Err(BqError::query(
             "Lambda expression is only valid inside ARRAY_TRANSFORM / ARRAY_FILTER",
         )),
     }
-}
-
-fn eval_range_literal(
-    elem_type: &crate::ast::DataTypeAst,
-    start: &Expr,
-    end: &Expr,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let bq_ty = elem_type.to_bq_type()?;
-    let rt = match bq_ty {
-        crate::types::BqType::Date => crate::types::RangeElementType::Date,
-        crate::types::BqType::Datetime => crate::types::RangeElementType::Datetime,
-        crate::types::BqType::Timestamp => crate::types::RangeElementType::Timestamp,
-        crate::types::BqType::Range(inner) => inner,
-        crate::types::BqType::UntypedNull
-        | crate::types::BqType::Bool
-        | crate::types::BqType::Int64
-        | crate::types::BqType::Float64
-        | crate::types::BqType::Numeric
-        | crate::types::BqType::BigNumeric
-        | crate::types::BqType::String
-        | crate::types::BqType::Bytes
-        | crate::types::BqType::Time
-        | crate::types::BqType::Interval
-        | crate::types::BqType::Json
-        | crate::types::BqType::Geography
-        | crate::types::BqType::Array(_)
-        | crate::types::BqType::Struct(_) => {
-            return Err(BqError::query(
-                "RANGE literal requires DATE/DATETIME/TIMESTAMP element type",
-            ))
-        }
-    };
-    let s_raw = eval_expr(start, row, ctx)?;
-    let e_raw = eval_expr(end, row, ctx)?;
-    let target = rt.to_bq_type();
-    let s_opt = if s_raw.is_null() {
-        None
-    } else {
-        Some(cast_value(s_raw, &target)?)
-    };
-    let e_opt = if e_raw.is_null() {
-        None
-    } else {
-        Some(cast_value(e_raw, &target)?)
-    };
-    if let (Some(sv), Some(ev)) = (&s_opt, &e_opt) {
-        if matches!(compare_values(sv, ev)?, Some(std::cmp::Ordering::Greater)) {
-            return Err(BqError::semantic("RANGE start must not exceed end"));
-        }
-    }
-    Ok(BqValue::Range(Box::new(crate::types::BqRange::new(
-        rt, s_opt, e_opt,
-    )?)))
 }
 
 fn eval_binary_expr(
@@ -203,8 +164,30 @@ fn eval_binary_expr(
         let rb = to_opt_bool(&r)?;
         return Ok(combine_logical(op, lb, rb));
     }
-    let l = eval_expr(left, row, ctx)?;
-    let r = eval_expr(right, row, ctx)?;
+    let mut l = eval_expr(left, row, ctx)?;
+    let mut r = eval_expr(right, row, ctx)?;
+    if matches!(
+        op,
+        crate::ast::BinaryOp::Eq
+            | crate::ast::BinaryOp::Neq
+            | crate::ast::BinaryOp::Lt
+            | crate::ast::BinaryOp::Lte
+            | crate::ast::BinaryOp::Gt
+            | crate::ast::BinaryOp::Gte
+    ) {
+        let is_lit_str = |e: &Expr| matches!(e, Expr::Literal(crate::ast::Literal::String(_)));
+        let is_temporal = |v: &BqValue| {
+            matches!(
+                v,
+                BqValue::Date(_) | BqValue::Datetime(_) | BqValue::Time(_) | BqValue::Timestamp(_)
+            )
+        };
+        if is_lit_str(right) && is_temporal(&l) {
+            r = cast_value(r, &l.infer_type()?)?;
+        } else if is_lit_str(left) && is_temporal(&r) {
+            l = cast_value(l, &r.infer_type()?)?;
+        }
+    }
     eval_binary(op, l, r)
 }
 
@@ -281,6 +264,13 @@ fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqR
         if let Some(struct_val) = outer.resolve_range_var_struct(name) {
             return Ok(struct_val);
         }
+    }
+    match name.to_ascii_uppercase().as_str() {
+        "CURRENT_DATE" => return Ok(BqValue::Date(ctx.now.date_naive())),
+        "CURRENT_DATETIME" => return Ok(BqValue::Datetime(ctx.now.naive_utc())),
+        "CURRENT_TIME" => return Ok(BqValue::Time(ctx.now.time())),
+        "CURRENT_TIMESTAMP" => return Ok(BqValue::Timestamp(ctx.now)),
+        _ => {}
     }
     Err(BqError::query(format!("Unrecognized name: {name}")))
 }
@@ -394,15 +384,21 @@ fn eval_like_expr(
 }
 
 fn eval_cast_expr(
-    expr: &Expr,
-    ty: &crate::ast::DataTypeAst,
-    safe: bool,
+    cast: (
+        &Expr,
+        &crate::ast::DataTypeAst,
+        bool,
+        Option<&Expr>,
+        Option<&Expr>,
+    ),
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
+    let (expr, ty, safe, format, time_zone) = cast;
     let val = eval_expr(expr, row, ctx)?;
-    let target = ty.to_bq_type()?;
-    match cast_value(val, &target) {
+    let fmt_val = format.map(|f| eval_expr(f, row, ctx)).transpose()?;
+    let tz_val = time_zone.map(|z| eval_expr(z, row, ctx)).transpose()?;
+    match cast_fmt::eval_cast_with_format(val, ty, fmt_val, tz_val) {
         Ok(v) => Ok(v),
         Err(err) if safe && err.is_safe_suppressible() => Ok(BqValue::Null),
         Err(err) => Err(err),
