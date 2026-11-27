@@ -219,3 +219,114 @@ impl<'a> ExecContext<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod memory_guard_tests {
+    use super::*;
+    use crate::catalog::{ColumnSchema, DatasetMeta, TableKind, TableMeta, TableRef};
+    use crate::executor::query::{eval_from_clause_public, project_eval_rows_public};
+    use crate::executor::result::QueryColumn;
+    use crate::parser::parse_query;
+
+    #[test]
+    fn hot_row_types_stay_within_size_budgets() {
+        assert!(
+            size_of::<BqValue>() <= 40,
+            "BqValue bloated to {} bytes (budget <= 40)",
+            size_of::<BqValue>()
+        );
+        assert!(
+            size_of::<RowBinding>() <= 112,
+            "RowBinding bloated to {} bytes (budget <= 112)",
+            size_of::<RowBinding>()
+        );
+    }
+
+    #[test]
+    fn row_bindings_share_arc_str_metadata_and_ctes_share_arc() {
+        let mut catalog = Catalog::new("local");
+        catalog
+            .create_dataset("local", DatasetMeta::new("ds", "US"), true)
+            .unwrap();
+        let tref = TableRef::new("local", "ds", "t");
+        let now = Utc::now();
+        let meta = TableMeta {
+            name: "t".to_owned(),
+            kind: TableKind::Table,
+            columns: vec![
+                ColumnSchema::new("id", BqType::Int64),
+                ColumnSchema::new("label", BqType::String),
+            ],
+            partition_by: None,
+            cluster_by: Vec::new(),
+            view_query: None,
+            created_at: now,
+            updated_at: now,
+            options: BTreeMap::new(),
+            description: None,
+            friendly_name: None,
+            labels: BTreeMap::new(),
+            view_sql: None,
+            expiration_ms: None,
+            external_uris: Vec::new(),
+            external_format: None,
+        };
+        catalog.put_table(&tref, meta, true, false).unwrap();
+        let mut storage = StorageEngine::new();
+        storage.create_table(&tref);
+        storage
+            .insert_rows(
+                &tref,
+                vec![
+                    vec![BqValue::Int64(1), BqValue::String("a".to_owned())],
+                    vec![BqValue::Int64(2), BqValue::String("b".to_owned())],
+                ],
+            )
+            .unwrap();
+
+        let mut ctx = ExecContext::new(&catalog, &storage);
+        let qr = QueryResult::new(
+            vec![QueryColumn::new("id", BqType::Int64)],
+            vec![vec![BqValue::Int64(1)], vec![BqValue::Int64(2)]],
+        );
+
+        // 1. EvalRow::from_query_result shares Arc<str> name and qualifier across rows.
+        let from_qr = EvalRow::from_query_result(Some("q"), &qr);
+        assert!(Arc::ptr_eq(
+            &from_qr[0].cols[0].name,
+            &from_qr[1].cols[0].name
+        ));
+        assert!(Arc::ptr_eq(
+            from_qr[0].cols[0].qualifier.as_ref().unwrap(),
+            from_qr[1].cols[0].qualifier.as_ref().unwrap()
+        ));
+
+        // 2. Concrete table scan & projection share Arc<str> across rows.
+        let parsed = parse_query("SELECT id, label AS lbl FROM ds.t").unwrap();
+        let crate::ast::SetExpr::Select(sel) = &parsed.body else {
+            panic!("expected SELECT");
+        };
+        let scanned = eval_from_clause_public(&sel.from, &ctx).unwrap();
+        assert!(Arc::ptr_eq(
+            &scanned[0].cols[0].name,
+            &scanned[1].cols[0].name
+        ));
+        assert!(Arc::ptr_eq(
+            scanned[0].cols[0].qualifier.as_ref().unwrap(),
+            scanned[1].cols[0].qualifier.as_ref().unwrap()
+        ));
+        let projected = project_eval_rows_public(sel, &scanned, &ctx).unwrap();
+        assert!(Arc::ptr_eq(
+            &projected[0].cols[1].name,
+            &projected[1].cols[1].name
+        ));
+
+        // 3. ExecContext::with_outer shares Arc<QueryResult> CTEs without deep-cloning.
+        ctx.ctes.insert("big".to_owned(), Arc::new(qr));
+        let sub = ctx.with_outer(&scanned[0]);
+        assert!(Arc::ptr_eq(
+            ctx.ctes.get("big").unwrap(),
+            sub.ctes.get("big").unwrap()
+        ));
+    }
+}
