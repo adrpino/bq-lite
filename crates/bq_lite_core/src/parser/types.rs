@@ -36,6 +36,7 @@ fn parse_data_type_inner(p: &mut Parser) -> BqResult<DataTypeAst> {
         "RANGE" => parse_range_type(p),
         "ARRAY" => parse_array_type(p),
         "STRUCT" => parse_struct_type(p),
+        "TABLE" => parse_table_type(p),
         _ => Err(BqError::syntax(
             format!("Unknown data type: '{}'", ident.value),
             span,
@@ -101,6 +102,26 @@ fn parse_struct_type(p: &mut Parser) -> BqResult<DataTypeAst> {
     }
     p.expect_gt_angle()?;
     Ok(DataTypeAst::Struct(fields))
+}
+
+fn parse_table_type(p: &mut Parser) -> BqResult<DataTypeAst> {
+    if !p.check(&TokenKind::Lt) {
+        return Ok(DataTypeAst::Table(Vec::new()));
+    }
+    p.expect(&TokenKind::Lt, "'<'")?;
+    if p.at_gt_angle() {
+        p.expect_gt_angle()?;
+        return Ok(DataTypeAst::Table(Vec::new()));
+    }
+    let mut fields = Vec::new();
+    loop {
+        fields.push(parse_struct_field(p)?);
+        if !p.eat(&TokenKind::Comma) {
+            break;
+        }
+    }
+    p.expect_gt_angle()?;
+    Ok(DataTypeAst::Table(fields))
 }
 
 fn parse_struct_field(p: &mut Parser) -> BqResult<StructFieldAst> {

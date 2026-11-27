@@ -17,6 +17,25 @@ use crate::types::BqValue;
 
 use super::table::{build_columns, eval_options};
 
+#[derive(Clone, Copy)]
+enum SupportedFormat {
+    Csv,
+    Json,
+    Parquet,
+}
+
+fn parse_supported_format(format: &str, kind_label: &str) -> BqResult<SupportedFormat> {
+    let upper = format.to_ascii_uppercase();
+    match upper.as_str() {
+        "CSV" => Ok(SupportedFormat::Csv),
+        "NEWLINE_DELIMITED_JSON" | "JSON" => Ok(SupportedFormat::Json),
+        "PARQUET" => Ok(SupportedFormat::Parquet),
+        _ => Err(BqError::unimplemented(format!(
+            "{kind_label} with format '{upper}' are not supported locally"
+        ))),
+    }
+}
+
 pub(super) fn exec_create_external_table(
     stmt: &CreateTableStmt,
     tref: &TableRef,
@@ -27,14 +46,19 @@ pub(super) fn exec_create_external_table(
     let mut columns = build_columns(&stmt.columns)?;
     let options = eval_options(&stmt.options, catalog, storage, bindings)?;
     let format = extract_opt_string(&options, "format").unwrap_or_else(|| "CSV".to_owned());
+    let _ = parse_supported_format(&format, "External tables")?;
     let uris = extract_opt_uris(&options)?;
     if uris.is_empty() {
         return Err(BqError::invalid_argument(
             "CREATE EXTERNAL TABLE requires uris option",
         ));
     }
+    for uri in &uris {
+        let _ = resolve_uri_local(uri)?;
+    }
     if columns.is_empty() {
-        let (detected, _) = load_files_with_schema(&uris, &format, &columns, &options)?;
+        let (detected, _) =
+            load_files_with_schema(&uris, &format, &columns, &options, "External tables")?;
         columns = detected;
     }
     let now = Utc::now();
@@ -64,7 +88,13 @@ type LoadedExternalData = (Vec<ColumnSchema>, Vec<Vec<BqValue>>);
 
 pub(in crate::executor) fn load_external_rows(meta: &TableMeta) -> BqResult<LoadedExternalData> {
     let format = meta.external_format.as_deref().unwrap_or("CSV");
-    load_files_with_schema(&meta.external_uris, format, &meta.columns, &meta.options)
+    load_files_with_schema(
+        &meta.external_uris,
+        format,
+        &meta.columns,
+        &meta.options,
+        "External tables",
+    )
 }
 
 pub(super) fn exec_load_data(
@@ -92,7 +122,8 @@ pub(super) fn exec_load_data(
         build_columns(&stmt.columns)?
     };
 
-    let (cols, rows) = load_files_with_schema(&uris, &format, &declared_cols, &options)?;
+    let (cols, rows) =
+        load_files_with_schema(&uris, &format, &declared_cols, &options, "LOAD DATA jobs")?;
     if catalog.get_table(&tref).is_err() {
         let now = Utc::now();
         let meta = TableMeta {
@@ -129,6 +160,7 @@ fn load_files_with_schema(
     format: &str,
     existing_cols: &[ColumnSchema],
     options: &BTreeMap<String, BqValue>,
+    kind_label: &str,
 ) -> BqResult<LoadedExternalData> {
     let mut cols = existing_cols.to_vec();
     let mut all_rows = Vec::new();
@@ -140,12 +172,14 @@ fn load_files_with_schema(
         .and_then(|s| s.as_bytes().first().copied())
         .unwrap_or(b',');
 
+    let parsed_fmt = parse_supported_format(format, kind_label)?;
+
     for uri in uris {
         let path = resolve_uri_local(uri)?;
         let bytes = std::fs::read(&path)
             .map_err(|e| BqError::not_found(format!("Failed to read '{uri}': {e}")))?;
-        match format.to_ascii_uppercase().as_str() {
-            "CSV" => {
+        match parsed_fmt {
+            SupportedFormat::Csv => {
                 let mut opts = CsvLoadOptions {
                     skip_leading_rows: skip_opt,
                     field_delimiter: delim,
@@ -158,23 +192,18 @@ fn load_files_with_schema(
                 }
                 all_rows.extend(load_csv_with_options(&bytes, &cols, &opts)?);
             }
-            "NEWLINE_DELIMITED_JSON" | "JSON" => {
+            SupportedFormat::Json => {
                 if cols.is_empty() {
                     cols = autodetect_ndjson_schema(&bytes)?;
                 }
                 all_rows.extend(load_ndjson(&bytes, &cols)?);
             }
-            "PARQUET" => {
+            SupportedFormat::Parquet => {
                 let (pq_cols, pq_rows) = load_parquet(&bytes)?;
                 if cols.is_empty() {
                     cols = pq_cols;
                 }
                 all_rows.extend(pq_rows);
-            }
-            other => {
-                return Err(BqError::unimplemented(format!(
-                    "External/LOAD format '{other}' is not implemented"
-                )))
             }
         }
     }
@@ -182,6 +211,12 @@ fn load_files_with_schema(
 }
 
 fn resolve_uri_local(uri: &str) -> BqResult<PathBuf> {
+    let lower = uri.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Err(BqError::unimplemented(format!(
+            "Remote HTTP/HTTPS external URI '{uri}' is not supported locally"
+        )));
+    }
     let expanded = uri.replace('*', "000000000000");
     if let Some(rel) = expanded.strip_prefix("gs://") {
         if rel.contains("..") || rel.is_empty() {

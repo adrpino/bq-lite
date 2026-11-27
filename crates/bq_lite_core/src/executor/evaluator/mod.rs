@@ -20,6 +20,30 @@ use subquery::{
     eval_array_subquery, eval_extract, eval_in_expr, eval_scalar_subquery, eval_subscript,
 };
 
+pub(super) fn eval_subscript_values(
+    base: BqValue,
+    kind: crate::ast::ArrayAccessKind,
+    idx_val: BqValue,
+) -> BqResult<BqValue> {
+    subquery::eval_subscript_values(base, kind, idx_val)
+}
+
+pub(super) fn eval_extract_value(part: &str, val: BqValue) -> BqResult<BqValue> {
+    subquery::eval_extract_value(part, val)
+}
+
+pub(super) fn eval_in_values(
+    lhs: &BqValue,
+    negated: bool,
+    candidates: &[BqValue],
+) -> BqResult<BqValue> {
+    subquery::eval_in_values(lhs, negated, candidates)
+}
+
+pub(super) fn like_match_values(text: &str, pattern: &str) -> bool {
+    literals::eval_like(text, pattern)
+}
+
 pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     match expr {
         Expr::Literal(lit) => literals::eval_literal(lit),

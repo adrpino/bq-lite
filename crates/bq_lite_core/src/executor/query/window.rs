@@ -144,6 +144,7 @@ pub(super) fn execute_grouped_with_windows(
         projected.push(project_grouped_row(
             &rewritten,
             &bucket.rows,
+            schema_row,
             &bucket.keys(),
             ctx,
         )?);

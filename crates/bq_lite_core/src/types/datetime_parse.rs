@@ -46,7 +46,9 @@ pub(super) fn parse_naive_datetime(s: &str) -> BqResult<NaiveDateTime> {
 pub(super) fn parse_timestamp_str(s: &str) -> BqResult<DateTime<Utc>> {
     let trimmed = s.trim();
     check_max_6_frac_digits(trimmed)?;
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+    let normalized = normalize_tz_offset(trimmed);
+    let cand = normalized.as_str();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(cand) {
         return Ok(dt.with_timezone(&Utc));
     }
     for fmt in [
@@ -57,19 +59,64 @@ pub(super) fn parse_timestamp_str(s: &str) -> BqResult<DateTime<Utc>> {
         "%Y-%m-%dT%H:%M:%S%.f%#z",
         "%Y-%m-%dT%H:%M:%S%#z",
     ] {
-        if let Ok(dt) = DateTime::parse_from_str(trimmed, fmt) {
+        if let Ok(dt) = DateTime::parse_from_str(cand, fmt) {
             return Ok(dt.with_timezone(&Utc));
         }
     }
-    let no_utc = trimmed
+    let no_utc = cand
         .strip_suffix(" UTC")
-        .or_else(|| trimmed.strip_suffix(" utc"))
-        .or_else(|| trimmed.strip_suffix('Z'))
-        .unwrap_or(trimmed);
+        .or_else(|| cand.strip_suffix(" utc"))
+        .or_else(|| cand.strip_suffix('Z'))
+        .unwrap_or(cand);
     if let Ok(dt) = parse_naive_datetime(no_utc) {
         return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
     }
     Err(BqError::semantic(format!(
         "Invalid TIMESTAMP string: '{s}'"
     )))
+}
+
+/// Normalizes `BigQuery` timezone offsets (`+H`, `+HH`, `+H:MM`, `+HH:MM`, `+HHMM`, with optional
+/// leading whitespace before the sign) into `±HH:MM`.
+fn normalize_tz_offset(s: &str) -> String {
+    let Some(sep_pos) = s.find([' ', 'T', 't']) else {
+        return s.to_owned();
+    };
+    let tail = s.get(sep_pos + 1..).unwrap_or("");
+    let Some(rel_sign) = tail.rfind(['+', '-']) else {
+        return s.to_owned();
+    };
+    let sign_idx = sep_pos + 1 + rel_sign;
+    let prefix = s.get(..sign_idx).unwrap_or("").trim_end();
+    let sign = s.get(sign_idx..=sign_idx).unwrap_or("+");
+    let off = s.get(sign_idx + 1..).unwrap_or("");
+    let bytes = off.as_bytes();
+    match bytes {
+        [h] if h.is_ascii_digit() => format!("{prefix}{sign}0{off}:00"),
+        [h1, h2] if h1.is_ascii_digit() && h2.is_ascii_digit() => {
+            format!("{prefix}{sign}{off}:00")
+        }
+        [h, b':', m1, m2] if h.is_ascii_digit() && m1.is_ascii_digit() && m2.is_ascii_digit() => {
+            format!("{prefix}{sign}0{off}")
+        }
+        [h1, h2, b':', m1, m2]
+            if h1.is_ascii_digit()
+                && h2.is_ascii_digit()
+                && m1.is_ascii_digit()
+                && m2.is_ascii_digit() =>
+        {
+            format!("{prefix}{sign}{off}")
+        }
+        [h1, h2, m1, m2]
+            if h1.is_ascii_digit()
+                && h2.is_ascii_digit()
+                && m1.is_ascii_digit()
+                && m2.is_ascii_digit() =>
+        {
+            let hh = off.get(..2).unwrap_or("00");
+            let mm = off.get(2..4).unwrap_or("00");
+            format!("{prefix}{sign}{hh}:{mm}")
+        }
+        _ => s.to_owned(),
+    }
 }

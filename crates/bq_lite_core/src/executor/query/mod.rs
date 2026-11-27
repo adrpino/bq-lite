@@ -1,4 +1,5 @@
 mod agg;
+mod agg_approx;
 mod agg_builtins;
 mod agg_eval;
 mod from;
@@ -11,6 +12,7 @@ mod project;
 mod schema;
 mod set_ops;
 mod sort;
+mod tvf;
 mod type_infer;
 mod window;
 mod window_fns;

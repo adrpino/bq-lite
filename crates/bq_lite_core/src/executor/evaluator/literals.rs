@@ -2,7 +2,9 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
 use crate::ast::Literal;
 use crate::error::{BqError, BqResult};
-use crate::types::{check_max_6_frac_digits, BqBigNumeric, BqNumeric, BqValue};
+use crate::types::{
+    check_max_6_frac_digits, parse_timestamp_str, BqBigNumeric, BqNumeric, BqValue,
+};
 
 pub(super) fn eval_literal(lit: &Literal) -> BqResult<BqValue> {
     match lit {
@@ -54,18 +56,8 @@ fn parse_datetime_lit(s: &str) -> BqResult<NaiveDateTime> {
 fn parse_timestamp_lit(s: &str) -> BqResult<DateTime<Utc>> {
     let trimmed = s.trim();
     check_max_6_frac_digits(trimmed)?;
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    if let Some(without_utc) = trimmed.strip_suffix(" UTC") {
-        if let Ok(dt) = parse_datetime_lit(without_utc) {
-            return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
-        }
-    }
-    if let Ok(dt) = parse_datetime_lit(trimmed) {
-        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
-    }
-    Err(BqError::query(format!("Invalid TIMESTAMP literal: '{s}'")))
+    parse_timestamp_str(trimmed)
+        .map_err(|_| BqError::query(format!("Invalid TIMESTAMP literal: '{s}'")))
 }
 
 /// Evaluates `LIKE` with `%`, `_`, and `\` backslash escape support.

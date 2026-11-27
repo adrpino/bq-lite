@@ -51,7 +51,12 @@ pub(in crate::executor) fn infer_expr_type(
         | Expr::In { .. }
         | Expr::Exists(_) => BqType::Bool,
         Expr::Cast { ty, .. } => ty.to_bq_type().unwrap_or(BqType::String),
-        Expr::Extract { .. } => BqType::Int64,
+        Expr::Extract { part, .. } => match part.value.to_ascii_uppercase().as_str() {
+            "DATE" => BqType::Date,
+            "TIME" => BqType::Time,
+            "DATETIME" => BqType::Datetime,
+            _ => BqType::Int64,
+        },
         Expr::Interval { .. } => BqType::Interval,
         Expr::Case { .. }
         | Expr::ArrayLiteral { .. }
@@ -230,10 +235,29 @@ fn infer_binary_type(
 fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecContext<'_>) -> BqType {
     let upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
     match upper.as_str() {
-        "COUNT" | "COUNTIF" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "LENGTH"
-        | "CHAR_LENGTH" | "BYTE_LENGTH" | "STRPOS" | "INSTR" | "ARRAY_LENGTH" | "UNIX_SECONDS"
-        | "UNIX_MILLIS" | "UNIX_MICROS" | "UNIX_DATE" | "DATE_DIFF" | "DATETIME_DIFF"
-        | "TIMESTAMP_DIFF" | "TIME_DIFF" | "FARM_FINGERPRINT" | "RANGE_BUCKET" => BqType::Int64,
+        "COUNT"
+        | "COUNTIF"
+        | "APPROX_COUNT_DISTINCT"
+        | "ROW_NUMBER"
+        | "RANK"
+        | "DENSE_RANK"
+        | "NTILE"
+        | "LENGTH"
+        | "CHAR_LENGTH"
+        | "BYTE_LENGTH"
+        | "STRPOS"
+        | "INSTR"
+        | "ARRAY_LENGTH"
+        | "UNIX_SECONDS"
+        | "UNIX_MILLIS"
+        | "UNIX_MICROS"
+        | "UNIX_DATE"
+        | "DATE_DIFF"
+        | "DATETIME_DIFF"
+        | "TIMESTAMP_DIFF"
+        | "TIME_DIFF"
+        | "FARM_FINGERPRINT"
+        | "RANGE_BUCKET" => BqType::Int64,
         "AVG" | "PERCENT_RANK" | "CUME_DIST" | "IEEE_DIVIDE" | "SAFE_DIVIDE" | "SQRT" | "POW"
         | "POWER" | "LN" | "LOG" | "LOG10" | "EXP" | "RAND" | "STDDEV" | "STDDEV_POP"
         | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "ST_DISTANCE" => BqType::Float64,
@@ -272,7 +296,7 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
             .args
             .first()
             .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx)),
-        "IFNULL" | "NULLIF" | "IF" | "COALESCE" | "ARRAY_AGG" => {
+        "IFNULL" | "NULLIF" | "IF" | "COALESCE" | "ARRAY_AGG" | "APPROX_QUANTILES" => {
             infer_polymorphic_fn_type(&upper, call, row, ctx)
         }
         _ => lookup_udf_return_type(&call.name, ctx).unwrap_or(BqType::String),
@@ -314,7 +338,7 @@ fn infer_polymorphic_fn_type(
                 .collect();
             common_supertype(&tys).unwrap_or(BqType::UntypedNull)
         }
-        "ARRAY_AGG" => {
+        "ARRAY_AGG" | "APPROX_QUANTILES" => {
             let el = call
                 .args
                 .first()

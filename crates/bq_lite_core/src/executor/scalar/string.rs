@@ -29,6 +29,7 @@ pub(super) const STRING_FUNCTIONS: &[&str] = &[
     "RIGHT",
     "RPAD",
     "RTRIM",
+    "SAFE_CONVERT_BYTES_TO_STRING",
     "SPLIT",
     "STARTS_WITH",
     "STRPOS",
@@ -71,7 +72,28 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
         "FROM_BASE64" => eval_from_base64(args).map(Some),
         "TO_HEX" => eval_to_hex(args).map(Some),
         "FROM_HEX" => eval_from_hex(args).map(Some),
+        "SAFE_CONVERT_BYTES_TO_STRING" => eval_safe_convert_bytes_to_string(&args).map(Some),
         _ => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "SAFE_CONVERT_BYTES_TO_STRING accepts BYTES or NULL"
+)]
+fn eval_safe_convert_bytes_to_string(args: &[BqValue]) -> BqResult<BqValue> {
+    let [arg] = args else {
+        return Err(BqError::query(
+            "SAFE_CONVERT_BYTES_TO_STRING expects 1 argument",
+        ));
+    };
+    match arg {
+        BqValue::Null => Ok(BqValue::Null),
+        BqValue::Bytes(b) => Ok(BqValue::String(String::from_utf8_lossy(b).into_owned())),
+        other => Err(BqError::query(format!(
+            "SAFE_CONVERT_BYTES_TO_STRING expects BYTES, got {}",
+            other.infer_type()?
+        ))),
     }
 }
 

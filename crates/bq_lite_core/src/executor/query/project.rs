@@ -79,7 +79,7 @@ pub(super) fn has_untyped_null(ty: &BqType) -> bool {
     }
 }
 
-fn merge_inferred_type(raw: BqType, inferred: BqType) -> BqType {
+pub(super) fn merge_inferred_type(raw: BqType, inferred: BqType) -> BqType {
     if matches!(raw, BqType::UntypedNull) {
         return inferred;
     }

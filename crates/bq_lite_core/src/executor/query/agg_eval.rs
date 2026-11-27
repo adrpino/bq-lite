@@ -1,11 +1,13 @@
-use crate::ast::{BinaryOp, Expr, UnaryOp, WhenBranch};
+use crate::ast::{BinaryOp, Expr, InTarget, StructFieldExpr, UnaryOp, WhenBranch};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::{
-    access_struct_field, combine_logical, eval_binary, eval_expr, eval_is_test, to_opt_bool,
+    access_struct_field, combine_logical, eval_binary, eval_expr, eval_extract_value,
+    eval_in_values, eval_is_test, eval_subscript_values, like_match_values, to_opt_bool,
     values_equal,
 };
-use crate::types::BqValue;
+use crate::executor::query::execute_query;
+use crate::types::{BqStructFieldValue, BqValue};
 
 use super::agg::GroupedKeys;
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
@@ -29,21 +31,7 @@ pub(super) fn eval_grouped_expr(
     match expr {
         Expr::Function(call) if call.over.is_none() => eval_grouped_fn(call, bucket, keys, ctx),
         Expr::Binary { left, op, right } => {
-            if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                let l = eval_grouped_expr(left, bucket, keys, ctx)?;
-                let lb = to_opt_bool(&l)?;
-                if (*op == BinaryOp::And && lb == Some(false))
-                    || (*op == BinaryOp::Or && lb == Some(true))
-                {
-                    return Ok(BqValue::Bool(lb.unwrap_or(false)));
-                }
-                let r = eval_grouped_expr(right, bucket, keys, ctx)?;
-                let rb = to_opt_bool(&r)?;
-                return Ok(combine_logical(*op, lb, rb));
-            }
-            let l = eval_grouped_expr(left, bucket, keys, ctx)?;
-            let r = eval_grouped_expr(right, bucket, keys, ctx)?;
-            eval_binary(*op, l, r)
+            eval_grouped_binary(left, *op, right, bucket, keys, ctx)
         }
         Expr::Is { expr: inner, test } => {
             let v = eval_grouped_expr(inner, bucket, keys, ctx)?;
@@ -84,11 +72,207 @@ pub(super) fn eval_grouped_expr(
             let base = eval_grouped_expr(inner, bucket, keys, ctx)?;
             access_struct_field(&base, &field.value)
         }
+        Expr::Subscript {
+            expr: inner,
+            kind,
+            index,
+        } => {
+            let base = eval_grouped_expr(inner, bucket, keys, ctx)?;
+            let idx_val = eval_grouped_expr(index, bucket, keys, ctx)?;
+            eval_subscript_values(base, *kind, idx_val)
+        }
+        Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::In { .. }
+        | Expr::Extract { .. }
+        | Expr::ArrayLiteral { .. }
+        | Expr::StructLiteral { .. } => eval_grouped_compound(expr, bucket, keys, ctx),
+        Expr::Ident(id) => eval_grouped_ident(expr, &id.value, bucket, keys, ctx),
         _ => {
             let sample = bucket.first().cloned().unwrap_or_default();
             eval_expr(expr, &sample, ctx)
         }
     }
+}
+
+fn eval_grouped_ident(
+    expr: &Expr,
+    name: &str,
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    if let Some(aliases) = keys.select_aliases {
+        if let Some(aliased) = aliases.get(&name.to_ascii_lowercase()) {
+            let next_keys = GroupedKeys {
+                active: keys.active,
+                rolled_up: keys.rolled_up,
+                select_aliases: None,
+            };
+            return eval_grouped_expr(aliased, bucket, &next_keys, ctx);
+        }
+    }
+    let sample = bucket.first().cloned().unwrap_or_default();
+    eval_expr(expr, &sample, ctx)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only compound grouped expression variants are dispatched here"
+)]
+fn eval_grouped_compound(
+    expr: &Expr,
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    match expr {
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let v = eval_grouped_expr(inner, bucket, keys, ctx)?;
+            let lo = eval_grouped_expr(low, bucket, keys, ctx)?;
+            let hi = eval_grouped_expr(high, bucket, keys, ctx)?;
+            let ge = to_opt_bool(&eval_binary(BinaryOp::Gte, v.clone(), lo)?)?;
+            let le = to_opt_bool(&eval_binary(BinaryOp::Lte, v, hi)?)?;
+            let res = combine_logical(BinaryOp::And, ge, le);
+            if *negated {
+                eval_unary_val(UnaryOp::Not, res)
+            } else {
+                Ok(res)
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            negated,
+            pattern,
+        } => eval_grouped_like(inner, *negated, pattern, bucket, keys, ctx),
+        Expr::In {
+            expr: inner,
+            negated,
+            target,
+        } => eval_grouped_in(inner, *negated, target, bucket, keys, ctx),
+        Expr::Extract { part, expr: inner } => {
+            let val = eval_grouped_expr(inner, bucket, keys, ctx)?;
+            eval_extract_value(&part.value, val)
+        }
+        Expr::ArrayLiteral { elements, .. } => {
+            let mut items = Vec::with_capacity(elements.len());
+            for el in elements {
+                items.push(eval_grouped_expr(el, bucket, keys, ctx)?);
+            }
+            Ok(BqValue::Array(items))
+        }
+        Expr::StructLiteral { fields, .. } => eval_grouped_struct(fields, bucket, keys, ctx),
+        _ => Ok(BqValue::Null),
+    }
+}
+
+fn eval_grouped_like(
+    inner: &Expr,
+    negated: bool,
+    pattern: &Expr,
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let lv = eval_grouped_expr(inner, bucket, keys, ctx)?;
+    let pv = eval_grouped_expr(pattern, bucket, keys, ctx)?;
+    if lv.is_null() || pv.is_null() {
+        return Ok(BqValue::Null);
+    }
+    let (BqValue::String(s), BqValue::String(p)) = (lv, pv) else {
+        return Err(BqError::query("LIKE operands must be STRING"));
+    };
+    let matched = like_match_values(&s, &p);
+    Ok(BqValue::Bool(if negated { !matched } else { matched }))
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "UNNEST target must be Null or Array"
+)]
+fn eval_grouped_in(
+    inner: &Expr,
+    negated: bool,
+    target: &InTarget,
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let lhs = eval_grouped_expr(inner, bucket, keys, ctx)?;
+    let candidates = match target {
+        InTarget::List(exprs) => exprs
+            .iter()
+            .map(|e| eval_grouped_expr(e, bucket, keys, ctx))
+            .collect::<BqResult<Vec<_>>>()?,
+        InTarget::Unnest(arr_expr) => match eval_grouped_expr(arr_expr, bucket, keys, ctx)? {
+            BqValue::Null => Vec::new(),
+            BqValue::Array(items) => items,
+            other => {
+                return Err(BqError::query(format!(
+                    "UNNEST expects ARRAY, got {}",
+                    other.infer_type()?
+                )))
+            }
+        },
+        InTarget::Subquery(q) => {
+            let sample = bucket.first().cloned().unwrap_or_default();
+            let sub_ctx = ctx.with_outer(&sample);
+            let res = execute_query(q, &sub_ctx)?;
+            if res.columns.len() != 1 {
+                return Err(BqError::query("IN subquery must return exactly 1 column"));
+            }
+            res.rows
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .collect()
+        }
+    };
+    eval_in_values(&lhs, negated, &candidates)
+}
+
+fn eval_grouped_struct(
+    fields: &[StructFieldExpr],
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        let value = eval_grouped_expr(&f.expr, bucket, keys, ctx)?;
+        out.push(BqStructFieldValue {
+            name: f.name.as_ref().map(|n| n.value.clone()),
+            value,
+        });
+    }
+    Ok(BqValue::Struct(out))
+}
+
+fn eval_grouped_binary(
+    left: &Expr,
+    op: BinaryOp,
+    right: &Expr,
+    bucket: &[EvalRow],
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+        let l = eval_grouped_expr(left, bucket, keys, ctx)?;
+        let lb = to_opt_bool(&l)?;
+        if (op == BinaryOp::And && lb == Some(false)) || (op == BinaryOp::Or && lb == Some(true)) {
+            return Ok(BqValue::Bool(lb.unwrap_or(false)));
+        }
+        let r = eval_grouped_expr(right, bucket, keys, ctx)?;
+        let rb = to_opt_bool(&r)?;
+        return Ok(combine_logical(op, lb, rb));
+    }
+    let l = eval_grouped_expr(left, bucket, keys, ctx)?;
+    let r = eval_grouped_expr(right, bucket, keys, ctx)?;
+    eval_binary(op, l, r)
 }
 
 fn eval_grouped_fn(
@@ -102,15 +286,22 @@ fn eval_grouped_fn(
         return eval_grouping_fn(call, keys);
     }
     if is_aggregate_name(&name) {
-        return eval_aggregate_call(call, bucket, ctx);
+        return match eval_aggregate_call(call, bucket, ctx) {
+            Ok(val) => Ok(val),
+            Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
+            Err(err) => Err(err),
+        };
     }
     let args = call
         .args
         .iter()
         .map(|a| eval_grouped_expr(&a.expr, bucket, keys, ctx))
         .collect::<BqResult<Vec<_>>>()?;
-    if let Some(val) = crate::executor::scalar::eval_scalar_builtin(&name, args, ctx)? {
-        return Ok(val);
+    match crate::executor::scalar::eval_scalar_builtin(&name, args, ctx) {
+        Ok(Some(val)) => return Ok(val),
+        Ok(None) => {}
+        Err(err) if call.safe_prefix && err.is_safe_suppressible() => return Ok(BqValue::Null),
+        Err(err) => return Err(err),
     }
     Err(BqError::unimplemented(format!(
         "Function '{name}' is not implemented"

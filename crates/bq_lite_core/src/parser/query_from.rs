@@ -1,12 +1,11 @@
 use crate::ast::{
-    Expr, Ident, Join, JoinConstraint, JoinKind, PivotSpec, TableFactor, TableWithJoins,
-    UnpivotSpec,
+    Expr, FunctionArg, Ident, Join, JoinConstraint, JoinKind, PivotSpec, Query, Select, SelectItem,
+    SetExpr, TableFactor, TableWithJoins, UnpivotSpec,
 };
 use crate::error::{BqError, BqResult};
 
 use super::cursor::Parser;
 use super::expr::parse_expr;
-use super::expr_postfix::parse_function_arg;
 use super::query::{parse_optional_alias, parse_query};
 use super::token::TokenKind;
 
@@ -121,7 +120,7 @@ fn parse_base_table_factor(p: &mut Parser) -> BqResult<TableFactor> {
         let args = if p.check(&TokenKind::RParen) {
             Vec::new()
         } else {
-            p.parse_comma_list(parse_function_arg)?
+            p.parse_comma_list(parse_tvf_arg)?
         };
         p.expect(&TokenKind::RParen, "')'")?;
         let alias = parse_optional_alias(p)?;
@@ -146,6 +145,59 @@ fn parse_base_table_factor(p: &mut Parser) -> BqResult<TableFactor> {
         system_time,
         tablesample_percent,
     })
+}
+
+fn parse_tvf_arg(p: &mut Parser) -> BqResult<FunctionArg> {
+    let is_named = matches!(
+        p.peek().kind,
+        TokenKind::Ident(_) | TokenKind::QuotedIdent(_)
+    ) && matches!(p.peek_n(1).kind, TokenKind::FatArrow);
+    let name = if is_named {
+        let id = p.parse_ident()?;
+        p.advance();
+        Some(id)
+    } else {
+        None
+    };
+    if p.eat_kw("TABLE") {
+        let tbl_name = p.parse_table_object_name()?;
+        let query = Query {
+            with: None,
+            body: SetExpr::Select(Box::new(Select {
+                distinct: false,
+                as_kind: None,
+                projection: vec![SelectItem::Wildcard {
+                    qualifier: None,
+                    except: Vec::new(),
+                    replace: Vec::new(),
+                }],
+                from: vec![TableWithJoins {
+                    relation: TableFactor::Table {
+                        name: tbl_name,
+                        alias: None,
+                        system_time: None,
+                        tablesample_percent: None,
+                    },
+                    joins: Vec::new(),
+                }],
+                where_clause: None,
+                group_by: None,
+                having: None,
+                qualify: None,
+                window: Vec::new(),
+            })),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            pipe_ops: Vec::new(),
+        };
+        return Ok(FunctionArg {
+            name,
+            expr: Expr::Subquery(Box::new(query)),
+        });
+    }
+    let expr = parse_expr(p)?;
+    Ok(FunctionArg { name, expr })
 }
 
 fn parse_optional_tablesample(p: &mut Parser) -> BqResult<Option<Box<Expr>>> {

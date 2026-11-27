@@ -11,3 +11,9 @@ pub use numeric::{BqBigNumeric, BqNumeric, BIGNUMERIC_SCALE, NUMERIC_SCALE};
 pub(crate) fn check_max_6_frac_digits(s: &str) -> crate::error::BqResult<()> {
     datetime_parse::check_max_6_frac_digits(s)
 }
+
+pub(crate) fn parse_timestamp_str(
+    s: &str,
+) -> crate::error::BqResult<chrono::DateTime<chrono::Utc>> {
+    datetime_parse::parse_timestamp_str(s)
+}

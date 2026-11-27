@@ -18,6 +18,7 @@ pub(super) struct GroupedBucket {
 pub(super) struct GroupedKeys<'a> {
     pub active: &'a [(Expr, BqValue)],
     pub rolled_up: &'a [Expr],
+    pub select_aliases: Option<&'a BTreeMap<String, Expr>>,
 }
 
 impl GroupedBucket {
@@ -25,13 +26,16 @@ impl GroupedBucket {
         GroupedKeys {
             active: &self.active_keys,
             rolled_up: &self.rolled_up_keys,
+            select_aliases: None,
         }
     }
 }
 
 use super::agg_builtins::is_aggregate_name;
 use super::agg_eval::eval_grouped_expr;
+use super::project::{has_untyped_null, merge_inferred_type};
 use super::project_eval_rows;
+use super::type_infer::infer_expr_type;
 
 #[must_use]
 pub(super) fn select_uses_grouping(select: &Select) -> bool {
@@ -118,7 +122,13 @@ pub(super) fn execute_grouped_select(
     let buckets = execute_grouped_buckets(select, rows, schema_row, ctx)?;
     let mut result_rows = Vec::with_capacity(buckets.len());
     for b in &buckets {
-        result_rows.push(project_grouped_row(select, &b.rows, &b.keys(), ctx)?);
+        result_rows.push(project_grouped_row(
+            select,
+            &b.rows,
+            schema_row,
+            &b.keys(),
+            ctx,
+        )?);
     }
     Ok(result_rows)
 }
@@ -171,6 +181,7 @@ pub(super) fn execute_grouped_buckets(
                 let keys = GroupedKeys {
                     active: &active_pairs,
                     rolled_up: &rolled_full,
+                    select_aliases: Some(&alias_map),
                 };
                 let hval = eval_grouped_expr(having, &bucket, &keys, ctx)?;
                 if !matches!(hval, BqValue::Bool(true)) {
@@ -374,16 +385,23 @@ fn bucket_rows(
 pub(super) fn project_grouped_row(
     select: &Select,
     bucket: &[EvalRow],
+    schema_row: &EvalRow,
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<EvalRow> {
     let mut cols = Vec::new();
     let mut anon_idx = 0_usize;
+    let effective_row = bucket.first().unwrap_or(schema_row);
     for item in &select.projection {
         match item {
             SelectItem::Expr { expr, alias } => {
                 let val = eval_grouped_expr(expr, bucket, keys, ctx)?;
-                let ty = val.infer_type()?;
+                let raw_ty = val.infer_type()?;
+                let ty = if has_untyped_null(&raw_ty) {
+                    merge_inferred_type(raw_ty, infer_expr_type(expr, effective_row, ctx))
+                } else {
+                    raw_ty
+                };
                 let name = alias
                     .as_ref()
                     .map(|a| a.value.clone())

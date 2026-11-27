@@ -3,12 +3,13 @@ use crate::catalog::TableKind;
 use crate::error::BqResult;
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::infer_expr_col_name;
-use crate::executor::metadata::try_eval_information_schema;
+use crate::executor::metadata::{try_eval_information_schema, try_infer_tables_meta_schema};
 use crate::executor::result::QueryColumn;
 use crate::types::coercion::common_supertype;
 use crate::types::{BqType, BqValue};
 
 use super::from::eval_table_factor_standalone;
+use super::tvf::eval_table_function_schema;
 use super::type_infer::infer_expr_type;
 
 pub(in crate::executor) fn infer_query_columns(
@@ -314,9 +315,10 @@ pub(super) fn infer_table_factor_schema(
                 offset_name,
             ))
         }
-        TableFactor::TableFunction { .. }
-        | TableFactor::Pivot { .. }
-        | TableFactor::Unpivot { .. } => {
+        TableFactor::TableFunction { name, args, alias } => {
+            eval_table_function_schema(name, args, alias.as_ref().map(|a| a.value.as_str()), ctx)
+        }
+        TableFactor::Pivot { .. } | TableFactor::Unpivot { .. } => {
             let sample = eval_table_factor_standalone(factor, ctx)?;
             Ok(sample
                 .first()
@@ -375,6 +377,9 @@ fn infer_table_ref_schema(
     alias: Option<&str>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<EvalRow> {
+    if let Some(meta_row) = try_infer_tables_meta_schema(name, alias, ctx.catalog)? {
+        return Ok(meta_row);
+    }
     if let Some(info_rows) = try_eval_information_schema(
         name,
         alias,
@@ -464,25 +469,15 @@ fn infer_concrete_table_schema(
 }
 
 pub(super) fn null_out_eval_row(row: &EvalRow) -> EvalRow {
+    let zero = |c: &RowBinding| RowBinding {
+        qualifier: c.qualifier.clone(),
+        name: c.name.clone(),
+        ty: c.ty.clone(),
+        value: BqValue::Null,
+    };
     EvalRow::with_pseudo(
-        row.cols
-            .iter()
-            .map(|c| RowBinding {
-                qualifier: c.qualifier.clone(),
-                name: c.name.clone(),
-                ty: c.ty.clone(),
-                value: BqValue::Null,
-            })
-            .collect(),
-        row.pseudo_cols
-            .iter()
-            .map(|c| RowBinding {
-                qualifier: c.qualifier.clone(),
-                name: c.name.clone(),
-                ty: c.ty.clone(),
-                value: BqValue::Null,
-            })
-            .collect(),
+        row.cols.iter().map(zero).collect(),
+        row.pseudo_cols.iter().map(zero).collect(),
     )
 }
 

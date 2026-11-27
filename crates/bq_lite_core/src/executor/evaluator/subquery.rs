@@ -47,6 +47,14 @@ pub(super) fn eval_in_expr(
                 .collect()
         }
     };
+    eval_in_values(&lhs, negated, &candidates)
+}
+
+pub(super) fn eval_in_values(
+    lhs: &BqValue,
+    negated: bool,
+    candidates: &[BqValue],
+) -> BqResult<BqValue> {
     if lhs.is_null() {
         return Ok(if candidates.is_empty() {
             BqValue::Bool(negated)
@@ -56,7 +64,7 @@ pub(super) fn eval_in_expr(
     }
     let mut saw_null = false;
     for cand in candidates {
-        match ops::sql_values_equal(&lhs, &cand)? {
+        match ops::sql_values_equal(lhs, cand)? {
             Some(true) => return Ok(BqValue::Bool(!negated)),
             Some(false) => {}
             None => saw_null = true,
@@ -78,6 +86,14 @@ pub(super) fn eval_subscript(
 ) -> BqResult<BqValue> {
     let base = eval_expr(expr, row, ctx)?;
     let idx_val = eval_expr(index, row, ctx)?;
+    eval_subscript_values(base, kind, idx_val)
+}
+
+pub(super) fn eval_subscript_values(
+    base: BqValue,
+    kind: ArrayAccessKind,
+    idx_val: BqValue,
+) -> BqResult<BqValue> {
     if base.is_null() || idx_val.is_null() {
         return Ok(BqValue::Null);
     }
@@ -128,10 +144,6 @@ pub(super) fn eval_subscript(
     }
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "EXTRACT supports Date and Timestamp variants"
-)]
 pub(super) fn eval_extract(
     part: &str,
     expr: &Expr,
@@ -139,37 +151,87 @@ pub(super) fn eval_extract(
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let val = eval_expr(expr, row, ctx)?;
+    eval_extract_value(part, val)
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "EXTRACT supports Date, Datetime, Time, and Timestamp variants"
+)]
+pub(super) fn eval_extract_value(part: &str, val: BqValue) -> BqResult<BqValue> {
     if val.is_null() {
         return Ok(BqValue::Null);
     }
     let upper = part.to_ascii_uppercase();
     match val {
-        BqValue::Date(d) => match upper.as_str() {
-            "YEAR" => Ok(BqValue::Int64(i64::from(d.year()))),
-            "MONTH" => Ok(BqValue::Int64(i64::from(d.month()))),
-            "DAY" => Ok(BqValue::Int64(i64::from(d.day()))),
-            "DAYOFWEEK" => Ok(BqValue::Int64(
-                i64::from(d.weekday().num_days_from_sunday()) + 1,
-            )),
-            "DAYOFYEAR" => Ok(BqValue::Int64(i64::from(d.ordinal()))),
-            _ => Err(BqError::query(format!(
-                "Unsupported EXTRACT part '{part}' for DATE"
-            ))),
-        },
-        BqValue::Timestamp(ts) => match upper.as_str() {
-            "YEAR" => Ok(BqValue::Int64(i64::from(ts.year()))),
-            "MONTH" => Ok(BqValue::Int64(i64::from(ts.month()))),
-            "DAY" => Ok(BqValue::Int64(i64::from(ts.day()))),
-            "HOUR" => Ok(BqValue::Int64(i64::from(ts.hour()))),
-            "MINUTE" => Ok(BqValue::Int64(i64::from(ts.minute()))),
-            "SECOND" => Ok(BqValue::Int64(i64::from(ts.second()))),
-            _ => Err(BqError::query(format!(
-                "Unsupported EXTRACT part '{part}' for TIMESTAMP"
-            ))),
-        },
+        BqValue::Date(d) => extract_date_part(&upper, part, d),
+        BqValue::Datetime(dt) => extract_datetime_part(&upper, part, dt, false),
+        BqValue::Time(t) => extract_time_part(&upper, part, t),
+        BqValue::Timestamp(ts) => extract_datetime_part(&upper, part, ts.naive_utc(), true),
         other => Err(BqError::query(format!(
             "EXTRACT not supported for {}",
             other.infer_type()?
+        ))),
+    }
+}
+
+fn extract_date_part(upper: &str, raw_part: &str, d: chrono::NaiveDate) -> BqResult<BqValue> {
+    match upper {
+        "YEAR" => Ok(BqValue::Int64(i64::from(d.year()))),
+        "ISOYEAR" => Ok(BqValue::Int64(i64::from(d.iso_week().year()))),
+        "QUARTER" => Ok(BqValue::Int64(i64::from((d.month() - 1) / 3 + 1))),
+        "MONTH" => Ok(BqValue::Int64(i64::from(d.month()))),
+        "WEEK" => {
+            let dow_sun = d.weekday().num_days_from_sunday();
+            Ok(BqValue::Int64(i64::from((d.ordinal0() + 7 - dow_sun) / 7)))
+        }
+        "ISOWEEK" => Ok(BqValue::Int64(i64::from(d.iso_week().week()))),
+        "DAY" => Ok(BqValue::Int64(i64::from(d.day()))),
+        "DAYOFWEEK" => Ok(BqValue::Int64(
+            i64::from(d.weekday().num_days_from_sunday()) + 1,
+        )),
+        "DAYOFYEAR" => Ok(BqValue::Int64(i64::from(d.ordinal()))),
+        _ => Err(BqError::query(format!(
+            "Unsupported EXTRACT part '{raw_part}' for DATE"
+        ))),
+    }
+}
+
+fn extract_time_part(upper: &str, raw_part: &str, t: chrono::NaiveTime) -> BqResult<BqValue> {
+    match upper {
+        "HOUR" => Ok(BqValue::Int64(i64::from(t.hour()))),
+        "MINUTE" => Ok(BqValue::Int64(i64::from(t.minute()))),
+        "SECOND" => Ok(BqValue::Int64(i64::from(t.second()))),
+        "MILLISECOND" => Ok(BqValue::Int64(i64::from(t.nanosecond() / 1_000_000))),
+        "MICROSECOND" => Ok(BqValue::Int64(i64::from(t.nanosecond() / 1_000))),
+        _ => Err(BqError::query(format!(
+            "Unsupported EXTRACT part '{raw_part}' for TIME"
+        ))),
+    }
+}
+
+fn extract_datetime_part(
+    upper: &str,
+    raw_part: &str,
+    dt: chrono::NaiveDateTime,
+    is_timestamp: bool,
+) -> BqResult<BqValue> {
+    match upper {
+        "DATE" => Ok(BqValue::Date(dt.date())),
+        "TIME" => Ok(BqValue::Time(dt.time())),
+        "DATETIME" if is_timestamp => Ok(BqValue::Datetime(dt)),
+        "YEAR" | "ISOYEAR" | "QUARTER" | "MONTH" | "WEEK" | "ISOWEEK" | "DAY" | "DAYOFWEEK"
+        | "DAYOFYEAR" => extract_date_part(upper, raw_part, dt.date()),
+        "HOUR" | "MINUTE" | "SECOND" | "MILLISECOND" | "MICROSECOND" => {
+            extract_time_part(upper, raw_part, dt.time())
+        }
+        _ => Err(BqError::query(format!(
+            "Unsupported EXTRACT part '{raw_part}' for {}",
+            if is_timestamp {
+                "TIMESTAMP"
+            } else {
+                "DATETIME"
+            }
         ))),
     }
 }

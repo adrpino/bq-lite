@@ -5,7 +5,8 @@ use chrono::Utc;
 
 use crate::ast::{
     CreateFunctionStmt, CreateProcedureStmt, CreateRowAccessPolicyStmt, CreateSchemaStmt,
-    CreateViewStmt, DropObjectKind, DropStmt, ExportDataStmt, Statement,
+    CreateViewStmt, DataTypeAst, DropObjectKind, DropStmt, ExportDataStmt, FunctionKind,
+    RoutineParam, Statement,
 };
 use crate::catalog::{
     Catalog, ColumnSchema, DatasetMeta, RoutineMeta, RowAccessPolicyMeta, TableKind, TableMeta,
@@ -137,11 +138,23 @@ fn exec_create_view(
     Ok(QueryResult::empty())
 }
 
+fn reject_table_params(params: &[RoutineParam]) -> BqResult<()> {
+    if params.iter().any(|p| matches!(p.ty, DataTypeAst::Table(_))) {
+        return Err(BqError::query(
+            "TABLE<...> / ANY TABLE parameters are only valid in TABLE FUNCTION definitions",
+        ));
+    }
+    Ok(())
+}
+
 fn exec_create_function(
     stmt: &CreateFunctionStmt,
     catalog: &mut Catalog,
     _storage: &StorageEngine,
 ) -> BqResult<QueryResult> {
+    if stmt.kind != FunctionKind::Table {
+        reject_table_params(&stmt.params)?;
+    }
     let tref = if stmt.temp {
         let parts = stmt.name.normalized_parts();
         let fn_name = parts
@@ -167,6 +180,7 @@ fn exec_create_procedure(
     catalog: &mut Catalog,
     _storage: &StorageEngine,
 ) -> BqResult<QueryResult> {
+    reject_table_params(&stmt.params)?;
     let tref = catalog.resolve_table_name(&stmt.name)?;
     catalog.put_routine(
         &tref,

@@ -1,4 +1,7 @@
 mod extra;
+mod tables_meta;
+
+pub(in crate::executor) use tables_meta::try_infer_tables_meta_schema;
 
 use crate::ast::ObjectName;
 use crate::catalog::{Catalog, JobInfoProvider, TableKind};
@@ -20,6 +23,9 @@ pub(in crate::executor) fn try_eval_information_schema(
     storage: &StorageEngine,
     job_provider: Option<&dyn JobInfoProvider>,
 ) -> BqResult<Option<Vec<EvalRow>>> {
+    if let Some(meta_rows) = tables_meta::try_eval_tables_meta(name, alias, catalog, storage)? {
+        return Ok(Some(meta_rows));
+    }
     let parts = name.normalized_parts();
     let info_idx = parts
         .iter()

@@ -7,10 +7,13 @@ use crate::executor::evaluator::{compare_values, eval_expr, values_distinct_eq};
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqType, BqValue};
 
+use super::agg_approx::{eval_approx_count_distinct, eval_approx_quantiles};
 use super::sort::sort_with_order_keys;
 
 const AGGREGATE_FUNCTIONS: &[&str] = &[
     "ANY_VALUE",
+    "APPROX_COUNT_DISTINCT",
+    "APPROX_QUANTILES",
     "ARRAY_AGG",
     "AVG",
     "BIT_AND",
@@ -52,6 +55,8 @@ pub(super) fn eval_aggregate_call(
         "MIN" => eval_min_max(call, rows, ctx, true),
         "MAX" => eval_min_max(call, rows, ctx, false),
         "ANY_VALUE" => eval_any_value(call, rows, ctx),
+        "APPROX_COUNT_DISTINCT" => eval_approx_count_distinct(call, rows, ctx),
+        "APPROX_QUANTILES" => eval_approx_quantiles(call, rows, ctx),
         "ARRAY_AGG" => eval_array_agg(call, rows, ctx),
         "STRING_AGG" => eval_string_agg(call, rows, ctx),
         "LOGICAL_AND" => eval_logical(call, rows, ctx, true),
@@ -89,7 +94,7 @@ fn collect_arg_values(
     Ok(vals)
 }
 
-fn dedup_values(vals: &mut Vec<BqValue>) -> BqResult<()> {
+pub(super) fn dedup_values(vals: &mut Vec<BqValue>) -> BqResult<()> {
     let mut out = Vec::with_capacity(vals.len());
     for v in vals.drain(..) {
         let mut seen = false;

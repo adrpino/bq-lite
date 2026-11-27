@@ -126,6 +126,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `RPAD` | `implemented` | Right pad |
 | `RTRIM` | `implemented` | Right trim |
 | `SAFE_ADD` | `implemented` | Overflow-safe addition |
+| `SAFE_CONVERT_BYTES_TO_STRING` | `implemented` | Converts `BYTES` to `STRING` replacing invalid UTF-8 with `U+FFFD` |
 | `SAFE_DIVIDE` | `implemented` | Divide-by-zero-safe division |
 | `SAFE_MULTIPLY` | `implemented` | Overflow-safe multiplication |
 | `SAFE_NEGATE` | `implemented` | Overflow-safe negation |
@@ -176,6 +177,8 @@ Every function listed as `implemented` in a table below must exist in the corres
 | Function | Status | Notes |
 |---|---|---|
 | `ANY_VALUE` | `implemented` | Supports `HAVING MAX` / `HAVING MIN` |
+| `APPROX_COUNT_DISTINCT` | `implemented` | Approximate distinct count |
+| `APPROX_QUANTILES` | `implemented` | Approximate quantile array (`NULL` on empty input) |
 | `ARRAY_AGG` | `implemented` | Supports `DISTINCT`, `IGNORE NULLS`, `ORDER BY`, `LIMIT` |
 | `AVG` | `implemented` | Numeric average |
 | `BIT_AND` | `implemented` | Bitwise AND aggregate |

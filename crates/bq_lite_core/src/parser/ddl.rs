@@ -1,8 +1,8 @@
 use crate::ast::{
     AlterSchemaStmt, AlterViewStmt, CreateFunctionStmt, CreateProcedureStmt,
-    CreateRowAccessPolicyStmt, CreateSchemaStmt, CreateTableKind, CreateViewStmt, DropObjectKind,
-    DropStmt, ExportDataStmt, FunctionBody, FunctionKind, LoadDataStmt, ParamMode, RoutineParam,
-    Statement,
+    CreateRowAccessPolicyStmt, CreateSchemaStmt, CreateTableKind, CreateViewStmt, DataTypeAst,
+    DropObjectKind, DropStmt, ExportDataStmt, FunctionBody, FunctionKind, LoadDataStmt, ParamMode,
+    RoutineParam, Statement,
 };
 use crate::error::{BqError, BqResult};
 
@@ -250,7 +250,12 @@ fn parse_routine_params(p: &mut Parser) -> BqResult<Vec<RoutineParam>> {
             None
         };
         let name = p.parse_ident()?;
-        let ty = parse_data_type(p)?;
+        let ty = if p.eat_kw("ANY") {
+            p.expect_kw("TABLE")?;
+            DataTypeAst::Table(Vec::new())
+        } else {
+            parse_data_type(p)?
+        };
         Ok(RoutineParam { mode, name, ty })
     })?;
     p.expect(&TokenKind::RParen, "')'")?;

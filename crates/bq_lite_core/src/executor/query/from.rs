@@ -15,6 +15,7 @@ use super::governance::{
 use super::joins::{combine_rows, eval_join_with_schema};
 use super::pivot::{apply_pivot, apply_unpivot};
 use super::schema::{infer_table_factor_schema, null_out_eval_row};
+use super::tvf::eval_table_function;
 use super::type_infer::infer_expr_type;
 
 pub(in crate::executor) fn eval_from_clause(
@@ -169,38 +170,6 @@ pub(super) fn eval_table_factor(
             eval_table_function(name, args, alias.as_ref().map(|a| a.value.as_str()), ctx)
         }
     }
-}
-
-fn eval_table_function(
-    name: &crate::ast::ObjectName,
-    args: &[crate::ast::FunctionArg],
-    alias: Option<&str>,
-    ctx: &ExecContext<'_>,
-) -> BqResult<Vec<EvalRow>> {
-    let tref = ctx.catalog.resolve_table_name(name)?;
-    let ds = ctx.catalog.get_dataset(&tref.project, &tref.dataset)?;
-    let Some(routine) = ds.routines.get(&tref.table) else {
-        return Err(BqError::unimplemented(format!(
-            "Table function '{}' is not implemented",
-            name.normalized_parts().join(".")
-        )));
-    };
-    let crate::catalog::RoutineMeta::Function(cf) = routine.as_ref() else {
-        return Err(BqError::query("Routine is not a table function"));
-    };
-    let crate::ast::FunctionBody::Query(ref q) = cf.body else {
-        return Err(BqError::query("Function is not a table function"));
-    };
-    let empty_outer = EvalRow::default();
-    let mut sub_ctx = ctx.with_outer(&empty_outer);
-    for (param, arg) in cf.params.iter().zip(args.iter()) {
-        let val = eval_expr(&arg.expr, &EvalRow::default(), ctx)?;
-        sub_ctx
-            .vars
-            .insert(param.name.value.to_ascii_lowercase(), val);
-    }
-    let qr = execute_query(q, &sub_ctx)?;
-    Ok(EvalRow::from_query_result(alias, &qr))
 }
 
 fn eval_table_ref(

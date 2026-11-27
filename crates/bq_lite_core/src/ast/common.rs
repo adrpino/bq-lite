@@ -85,6 +85,7 @@ pub enum DataTypeAst {
     Range(Box<Self>),
     Array(Box<Self>),
     Struct(Vec<StructFieldAst>),
+    Table(Vec<StructFieldAst>),
 }
 
 impl DataTypeAst {
@@ -117,6 +118,9 @@ impl DataTypeAst {
                 }
                 Ok(BqType::Struct(out))
             }
+            Self::Table(_) => Err(crate::error::BqError::query(
+                "TABLE<...> type is only valid as a table-valued function parameter",
+            )),
         }
     }
 }
