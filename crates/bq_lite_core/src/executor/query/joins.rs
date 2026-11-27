@@ -58,14 +58,22 @@ pub(super) fn eval_join_with_schema(
             }
         }
         if !l_matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-            out.push(combine_rows(lrow, &right_null));
+            out.push(combine_rows_for_constraint(
+                lrow,
+                &right_null,
+                &join.constraint,
+            ));
         }
     }
 
     if matches!(join.kind, JoinKind::Right | JoinKind::Full) {
         for (r_idx, rrow) in right_rows.iter().enumerate() {
             if !right_matched.get(r_idx).copied().unwrap_or(false) {
-                out.push(combine_rows(&left_null, rrow));
+                out.push(combine_rows_for_constraint(
+                    &left_null,
+                    rrow,
+                    &join.constraint,
+                ));
             }
         }
     }
@@ -73,22 +81,45 @@ pub(super) fn eval_join_with_schema(
 }
 
 fn merged_join_schema(left: &EvalRow, right: &EvalRow, constraint: &JoinConstraint) -> EvalRow {
-    if let JoinConstraint::Using(cols) = constraint {
-        let mut merged = left.cols.clone();
-        for rcol in &right.cols {
-            if !cols
-                .iter()
-                .any(|c| c.value.eq_ignore_ascii_case(&rcol.name))
-            {
-                merged.push(rcol.clone());
+    combine_rows_for_constraint(left, right, constraint)
+}
+
+pub(super) fn combine_rows_for_constraint(
+    left: &EvalRow,
+    right: &EvalRow,
+    constraint: &JoinConstraint,
+) -> EvalRow {
+    let JoinConstraint::Using(cols) = constraint else {
+        return combine_rows(left, right);
+    };
+    let mut merged = left.cols.clone();
+    for using_col in cols {
+        if let Some(lcol) = merged
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(&using_col.value))
+        {
+            if lcol.value.is_null() {
+                if let Some(rcol) = right
+                    .cols
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&using_col.value))
+                {
+                    lcol.value = rcol.value.clone();
+                }
             }
         }
-        let mut pseudo = left.pseudo_cols.clone();
-        pseudo.extend(right.pseudo_cols.iter().cloned());
-        EvalRow::with_pseudo(merged, pseudo)
-    } else {
-        combine_rows(left, right)
     }
+    for rcol in &right.cols {
+        if !cols
+            .iter()
+            .any(|c| c.value.eq_ignore_ascii_case(&rcol.name))
+        {
+            merged.push(rcol.clone());
+        }
+    }
+    let mut pseudo = left.pseudo_cols.clone();
+    pseudo.extend(right.pseudo_cols.iter().cloned());
+    EvalRow::with_pseudo(merged, pseudo)
 }
 
 fn eval_correlated_unnest_join(
@@ -108,7 +139,11 @@ fn eval_correlated_unnest_join(
         }
         if !matched_any && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
             let null_unnest = infer_table_factor_schema(&join.relation, Some(lrow), ctx)?;
-            out.push(combine_rows(lrow, &null_unnest));
+            out.push(combine_rows_for_constraint(
+                lrow,
+                &null_unnest,
+                &join.constraint,
+            ));
         }
     }
     Ok(out)
@@ -144,18 +179,7 @@ pub(super) fn try_join_pair(
                     return Ok(None);
                 }
             }
-            let mut merged = lrow.cols.clone();
-            for rcol in &rrow.cols {
-                if !cols
-                    .iter()
-                    .any(|c| c.value.eq_ignore_ascii_case(&rcol.name))
-                {
-                    merged.push(rcol.clone());
-                }
-            }
-            let mut pseudo = lrow.pseudo_cols.clone();
-            pseudo.extend(rrow.pseudo_cols.iter().cloned());
-            Ok(Some(EvalRow::with_pseudo(merged, pseudo)))
+            Ok(Some(combine_rows_for_constraint(lrow, rrow, constraint)))
         }
     }
 }

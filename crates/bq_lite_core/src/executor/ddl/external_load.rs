@@ -36,6 +36,16 @@ fn parse_supported_format(format: &str, kind_label: &str) -> BqResult<SupportedF
     }
 }
 
+fn is_remote_http_uri(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn is_non_local_external(format: &str, uris: &[String]) -> bool {
+    parse_supported_format(format, "External tables").is_err()
+        || uris.iter().any(|u| is_remote_http_uri(u))
+}
+
 pub(super) fn exec_create_external_table(
     stmt: &CreateTableStmt,
     tref: &TableRef,
@@ -46,20 +56,24 @@ pub(super) fn exec_create_external_table(
     let mut columns = build_columns(&stmt.columns)?;
     let options = eval_options(&stmt.options, catalog, storage, bindings)?;
     let format = extract_opt_string(&options, "format").unwrap_or_else(|| "CSV".to_owned());
-    let _ = parse_supported_format(&format, "External tables")?;
     let uris = extract_opt_uris(&options)?;
     if uris.is_empty() {
         return Err(BqError::invalid_argument(
             "CREATE EXTERNAL TABLE requires uris option",
         ));
     }
-    for uri in &uris {
-        let _ = resolve_uri_local(uri)?;
-    }
     if columns.is_empty() {
+        let _ = parse_supported_format(&format, "External tables")?;
+        for uri in &uris {
+            let _ = resolve_uri_local(uri)?;
+        }
         let (detected, _) =
             load_files_with_schema(&uris, &format, &columns, &options, "External tables")?;
         columns = detected;
+    } else if !is_non_local_external(&format, &uris) {
+        for uri in &uris {
+            let _ = resolve_uri_local(uri)?;
+        }
     }
     let now = Utc::now();
     let meta = TableMeta {
@@ -88,6 +102,9 @@ type LoadedExternalData = (Vec<ColumnSchema>, Vec<Vec<BqValue>>);
 
 pub(in crate::executor) fn load_external_rows(meta: &TableMeta) -> BqResult<LoadedExternalData> {
     let format = meta.external_format.as_deref().unwrap_or("CSV");
+    if !meta.columns.is_empty() && is_non_local_external(format, &meta.external_uris) {
+        return Ok((meta.columns.clone(), Vec::new()));
+    }
     load_files_with_schema(
         &meta.external_uris,
         format,
@@ -211,8 +228,7 @@ fn load_files_with_schema(
 }
 
 fn resolve_uri_local(uri: &str) -> BqResult<PathBuf> {
-    let lower = uri.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+    if is_remote_http_uri(uri) {
         return Err(BqError::unimplemented(format!(
             "Remote HTTP/HTTPS external URI '{uri}' is not supported locally"
         )));

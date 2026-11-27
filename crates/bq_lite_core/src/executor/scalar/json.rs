@@ -3,6 +3,8 @@ use serde_json::{Map, Value as JsonValue};
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
 
+use super::json_path::{remove_json_path, resolve_json_path, set_json_path};
+
 pub(super) const JSON_FUNCTIONS: &[&str] = &[
     "BOOL",
     "FLOAT64",
@@ -32,12 +34,14 @@ pub(super) fn eval_json_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<Bq
         "PARSE_JSON" => eval_parse_json(&args).map(Some),
         "TO_JSON" => eval_to_json(&args).map(Some),
         "TO_JSON_STRING" => eval_to_json_string(&args).map(Some),
-        "JSON_QUERY" | "JSON_EXTRACT" => eval_json_query(args).map(Some),
-        "JSON_VALUE" | "JSON_EXTRACT_SCALAR" => eval_json_value(args).map(Some),
-        "JSON_QUERY_ARRAY" | "JSON_EXTRACT_ARRAY" => eval_json_array_query(args, false).map(Some),
-        "JSON_VALUE_ARRAY" | "JSON_EXTRACT_STRING_ARRAY" => {
-            eval_json_array_query(args, true).map(Some)
-        }
+        "JSON_QUERY" => eval_json_query(args, false).map(Some),
+        "JSON_EXTRACT" => eval_json_query(args, true).map(Some),
+        "JSON_VALUE" => eval_json_value(args, false).map(Some),
+        "JSON_EXTRACT_SCALAR" => eval_json_value(args, true).map(Some),
+        "JSON_QUERY_ARRAY" => eval_json_array_query(args, false, false).map(Some),
+        "JSON_EXTRACT_ARRAY" => eval_json_array_query(args, false, true).map(Some),
+        "JSON_VALUE_ARRAY" => eval_json_array_query(args, true, false).map(Some),
+        "JSON_EXTRACT_STRING_ARRAY" => eval_json_array_query(args, true, true).map(Some),
         "JSON_TYPE" => eval_json_type(args).map(Some),
         "JSON_OBJECT" => eval_json_object(args).map(Some),
         "JSON_ARRAY" => Ok(Some(BqValue::Json(Box::new(JsonValue::Array(
@@ -131,7 +135,7 @@ fn extract_json_input(val: &BqValue) -> BqResult<Option<JsonValue>> {
     }
 }
 
-fn eval_json_query(args: Vec<BqValue>) -> BqResult<BqValue> {
+fn eval_json_query(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValue> {
     let [doc_v, path_v]: [BqValue; 2] = args
         .try_into()
         .map_err(|_| BqError::query("JSON_QUERY expects 2 arguments"))?;
@@ -145,7 +149,7 @@ fn eval_json_query(args: Vec<BqValue>) -> BqResult<BqValue> {
             Err(BqError::query("JSONPath must be STRING"))
         };
     };
-    let Some(target) = resolve_json_path(&doc, &path)? else {
+    let Some(target) = resolve_json_path(&doc, &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     #[expect(
@@ -158,7 +162,7 @@ fn eval_json_query(args: Vec<BqValue>) -> BqResult<BqValue> {
     }
 }
 
-fn eval_json_value(args: Vec<BqValue>) -> BqResult<BqValue> {
+fn eval_json_value(args: Vec<BqValue>, legacy_brackets: bool) -> BqResult<BqValue> {
     if args.is_empty() || args.len() > 2 {
         return Err(BqError::query("JSON_VALUE expects 1 or 2 arguments"));
     }
@@ -175,13 +179,17 @@ fn eval_json_value(args: Vec<BqValue>) -> BqResult<BqValue> {
             Err(BqError::query("JSONPath must be STRING"))
         };
     };
-    let Some(target) = resolve_json_path(&doc, &path)? else {
+    let Some(target) = resolve_json_path(&doc, &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     Ok(json_scalar_to_string(target).map_or(BqValue::Null, BqValue::String))
 }
 
-fn eval_json_array_query(args: Vec<BqValue>, scalar_only: bool) -> BqResult<BqValue> {
+fn eval_json_array_query(
+    args: Vec<BqValue>,
+    scalar_only: bool,
+    legacy_brackets: bool,
+) -> BqResult<BqValue> {
     if args.is_empty() || args.len() > 2 {
         return Err(BqError::query("JSON_*_ARRAY expects 1 or 2 arguments"));
     }
@@ -194,7 +202,7 @@ fn eval_json_array_query(args: Vec<BqValue>, scalar_only: bool) -> BqResult<BqVa
     let BqValue::String(path) = path_v else {
         return Ok(BqValue::Null);
     };
-    let Some(JsonValue::Array(arr)) = resolve_json_path(&doc, &path)? else {
+    let Some(JsonValue::Array(arr)) = resolve_json_path(&doc, &path, legacy_brackets)? else {
         return Ok(BqValue::Null);
     };
     let items: Vec<BqValue> = arr
@@ -244,6 +252,16 @@ fn eval_json_type(args: Vec<BqValue>) -> BqResult<BqValue> {
 }
 
 fn eval_json_object(args: Vec<BqValue>) -> BqResult<BqValue> {
+    if args.len() == 2
+        && (matches!(args.first(), Some(BqValue::Array(_)))
+            || (matches!(args.first(), Some(BqValue::Null))
+                && matches!(args.get(1), Some(BqValue::Array(_) | BqValue::Null))))
+    {
+        let [keys_v, vals_v]: [BqValue; 2] = args
+            .try_into()
+            .map_err(|_| BqError::query("JSON_OBJECT expects 2 array arguments"))?;
+        return eval_json_object_arrays(keys_v, vals_v);
+    }
     if args.len() % 2 != 0 {
         return Err(BqError::query(
             "JSON_OBJECT expects an even number of arguments",
@@ -252,10 +270,45 @@ fn eval_json_object(args: Vec<BqValue>) -> BqResult<BqValue> {
     let mut map = Map::new();
     let mut it = args.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        if k.is_null() {
+            return Err(BqError::semantic("JSON_OBJECT key cannot be NULL"));
+        }
         let BqValue::String(key) = k else {
             return Err(BqError::query("JSON_OBJECT keys must be STRING"));
         };
-        map.insert(key, bq_to_json(&v));
+        map.entry(key).or_insert_with(|| bq_to_json(&v));
+    }
+    Ok(BqValue::Json(Box::new(JsonValue::Object(map))))
+}
+
+fn eval_json_object_arrays(keys_v: BqValue, vals_v: BqValue) -> BqResult<BqValue> {
+    if keys_v.is_null() || vals_v.is_null() {
+        return Ok(BqValue::Null);
+    }
+    let BqValue::Array(keys) = keys_v else {
+        return Err(BqError::query(
+            "JSON_OBJECT first argument must be ARRAY<STRING>",
+        ));
+    };
+    let BqValue::Array(vals) = vals_v else {
+        return Err(BqError::query("JSON_OBJECT second argument must be ARRAY"));
+    };
+    if keys.len() != vals.len() {
+        return Err(BqError::semantic(
+            "JSON_OBJECT key and value arrays must have the same length",
+        ));
+    }
+    let mut map = Map::new();
+    for (k, v) in keys.into_iter().zip(vals) {
+        if k.is_null() {
+            return Err(BqError::semantic("JSON_OBJECT key cannot be NULL"));
+        }
+        let BqValue::String(key) = k else {
+            return Err(BqError::query(
+                "JSON_OBJECT key array elements must be STRING",
+            ));
+        };
+        map.entry(key).or_insert_with(|| bq_to_json(&v));
     }
     Ok(BqValue::Json(Box::new(JsonValue::Object(map))))
 }
@@ -338,150 +391,4 @@ fn eval_json_typed_accessor(name: &str, args: Vec<BqValue>) -> BqResult<BqValue>
             "JSON value cannot be converted to {name}"
         ))),
     }
-}
-
-fn resolve_json_path<'a>(doc: &'a JsonValue, path: &str) -> BqResult<Option<&'a JsonValue>> {
-    let segs = parse_json_path(path)?;
-    let mut cur = doc;
-    for seg in segs {
-        match (cur, seg) {
-            (JsonValue::Object(m), PathSeg::Key(k)) => match m.get(&k) {
-                Some(next) => cur = next,
-                None => return Ok(None),
-            },
-            (JsonValue::Array(a), PathSeg::Idx(i)) => match a.get(i) {
-                Some(next) => cur = next,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(cur))
-}
-
-fn set_json_path(doc: &mut JsonValue, path: &str, val: JsonValue) -> BqResult<()> {
-    let segs = parse_json_path(path)?;
-    if segs.is_empty() {
-        *doc = val;
-        return Ok(());
-    }
-    let mut cur = doc;
-    let last_idx = segs.len() - 1;
-    for (i, seg) in segs.into_iter().enumerate() {
-        if i == last_idx {
-            match (cur, seg) {
-                (JsonValue::Object(m), PathSeg::Key(k)) => {
-                    m.insert(k, val);
-                }
-                (JsonValue::Array(a), PathSeg::Idx(idx)) if idx < a.len() => {
-                    if let Some(slot) = a.get_mut(idx) {
-                        *slot = val;
-                    }
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        match (cur, seg) {
-            (JsonValue::Object(m), PathSeg::Key(k)) => {
-                if let Some(next) = m.get_mut(&k) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            (JsonValue::Array(a), PathSeg::Idx(idx)) => {
-                if let Some(next) = a.get_mut(idx) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            _ => return Ok(()),
-        }
-    }
-    Ok(())
-}
-
-fn remove_json_path(doc: &mut JsonValue, path: &str) -> BqResult<()> {
-    let segs = parse_json_path(path)?;
-    let mut cur = doc;
-    let Some((last, prefix)) = segs.split_last() else {
-        return Ok(());
-    };
-    for seg in prefix {
-        match (cur, seg) {
-            (JsonValue::Object(m), PathSeg::Key(k)) => {
-                if let Some(next) = m.get_mut(k) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            (JsonValue::Array(a), PathSeg::Idx(idx)) => {
-                if let Some(next) = a.get_mut(*idx) {
-                    cur = next;
-                } else {
-                    return Ok(());
-                }
-            }
-            _ => return Ok(()),
-        }
-    }
-    match (cur, last) {
-        (JsonValue::Object(m), PathSeg::Key(k)) => {
-            m.remove(k);
-        }
-        (JsonValue::Array(a), PathSeg::Idx(idx)) if *idx < a.len() => {
-            a.remove(*idx);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-enum PathSeg {
-    Key(String),
-    Idx(usize),
-}
-
-fn parse_json_path(path: &str) -> BqResult<Vec<PathSeg>> {
-    let rest = path
-        .strip_prefix('$')
-        .ok_or_else(|| BqError::semantic(format!("JSONPath must start with '$': '{path}'")))?;
-    let mut out = Vec::new();
-    let mut chars = rest.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '.' => {
-                let mut key = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next == '.' || next == '[' {
-                        break;
-                    }
-                    key.push(next);
-                    chars.next();
-                }
-                if key.is_empty() {
-                    return Err(BqError::semantic(format!("Empty key in JSONPath '{path}'")));
-                }
-                out.push(PathSeg::Key(key));
-            }
-            '[' => {
-                let mut inner = String::new();
-                for c in chars.by_ref() {
-                    if c == ']' {
-                        break;
-                    }
-                    inner.push(c);
-                }
-                let idx = inner.trim().parse::<usize>().map_err(|_| {
-                    BqError::semantic(format!("Invalid array index in JSONPath '{path}'"))
-                })?;
-                out.push(PathSeg::Idx(idx));
-            }
-            _ => return Err(BqError::semantic(format!("Invalid JSONPath '{path}'"))),
-        }
-    }
-    Ok(out)
 }

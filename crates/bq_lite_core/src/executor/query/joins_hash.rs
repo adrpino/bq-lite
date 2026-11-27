@@ -8,7 +8,7 @@ use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::eval_expr;
 use crate::types::BqValue;
 
-use super::joins::{combine_rows, try_join_pair};
+use super::joins::{combine_rows_for_constraint, try_join_pair};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum JoinKey {
@@ -117,14 +117,22 @@ fn probe_hash_join(
             KeyEval::Unhashable => return Ok(None),
         }
         if !l_matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-            out.push(combine_rows(lrow, &right_null));
+            out.push(combine_rows_for_constraint(
+                lrow,
+                &right_null,
+                &join.constraint,
+            ));
         }
     }
 
     if matches!(join.kind, JoinKind::Right | JoinKind::Full) {
         for (r_idx, rrow) in right_rows.iter().enumerate() {
             if !right_matched.get(r_idx).copied().unwrap_or(false) {
-                out.push(combine_rows(&left_null, rrow));
+                out.push(combine_rows_for_constraint(
+                    &left_null,
+                    rrow,
+                    &join.constraint,
+                ));
             }
         }
     }

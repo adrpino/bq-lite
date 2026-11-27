@@ -234,10 +234,45 @@ fn infer_binary_type(
 
 fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecContext<'_>) -> BqType {
     let upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
+    if let Some(fixed) = infer_fixed_fn_type(&upper) {
+        return fixed;
+    }
     match upper.as_str() {
+        "SUM" | "MIN" | "MAX" | "ANY_VALUE" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+        | "LAG" | "LEAD" | "ABS" | "SAFE_NEGATE" | "ARRAY_REVERSE" | "ARRAY_SLICE"
+        | "ARRAY_FILTER" | "RANGE_INTERSECT" => call
+            .args
+            .first()
+            .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx)),
+        "ROUND" | "TRUNC" => {
+            let arg0 = call
+                .args
+                .first()
+                .map_or(BqType::Float64, |a| infer_expr_type(&a.expr, row, ctx));
+            if matches!(arg0, BqType::Numeric | BqType::BigNumeric) {
+                arg0
+            } else {
+                BqType::Float64
+            }
+        }
+        "IFNULL" | "NULLIF" | "IF" | "COALESCE" | "ARRAY_AGG" | "APPROX_QUANTILES" | "GREATEST"
+        | "LEAST" | "SAFE_ADD" | "SAFE_SUBTRACT" | "SAFE_MULTIPLY" | "DIV" | "MOD"
+        | "ARRAY_CONCAT" | "ARRAY_FIRST" | "ARRAY_LAST" | "GENERATE_ARRAY" | "RANGE_START"
+        | "RANGE_END" | "JSON_QUERY" | "JSON_EXTRACT" | "JSON_QUERY_ARRAY"
+        | "JSON_EXTRACT_ARRAY" | "SPLIT" => infer_polymorphic_fn_type(&upper, call, row, ctx),
+        _ => lookup_udf_return_type(&call.name, ctx).unwrap_or(BqType::String),
+    }
+}
+
+fn infer_fixed_fn_type(upper: &str) -> Option<BqType> {
+    match upper {
         "COUNT"
         | "COUNTIF"
         | "APPROX_COUNT_DISTINCT"
+        | "BIT_AND"
+        | "BIT_OR"
+        | "BIT_XOR"
+        | "GROUPING"
         | "ROW_NUMBER"
         | "RANK"
         | "DENSE_RANK"
@@ -247,6 +282,7 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
         | "BYTE_LENGTH"
         | "STRPOS"
         | "INSTR"
+        | "REGEXP_INSTR"
         | "ARRAY_LENGTH"
         | "UNIX_SECONDS"
         | "UNIX_MILLIS"
@@ -257,12 +293,19 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
         | "TIMESTAMP_DIFF"
         | "TIME_DIFF"
         | "FARM_FINGERPRINT"
-        | "RANGE_BUCKET" => BqType::Int64,
-        "AVG" | "PERCENT_RANK" | "CUME_DIST" | "IEEE_DIVIDE" | "SAFE_DIVIDE" | "SQRT" | "POW"
-        | "POWER" | "LN" | "LOG" | "LOG10" | "EXP" | "RAND" | "STDDEV" | "STDDEV_POP"
-        | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "ST_DISTANCE" => BqType::Float64,
+        | "RANGE_BUCKET"
+        | "SIGN"
+        | "INT64" => Some(BqType::Int64),
+        "AVG" | "PERCENT_RANK" | "CUME_DIST" | "IEEE_DIVIDE" | "SAFE_DIVIDE" | "SQRT" | "CBRT"
+        | "CEIL" | "CEILING" | "FLOOR" | "POW" | "POWER" | "LN" | "LOG" | "LOG10" | "EXP"
+        | "RAND" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
+        | "VAR_SAMP" | "CORR" | "COVAR_POP" | "COVAR_SAMP" | "ST_DISTANCE" | "FLOAT64" => {
+            Some(BqType::Float64)
+        }
         "LOGICAL_AND" | "LOGICAL_OR" | "STARTS_WITH" | "ENDS_WITH" | "REGEXP_CONTAINS"
-        | "RANGE_CONTAINS" | "RANGE_OVERLAPS" | "ST_CONTAINS" | "ST_WITHIN" => BqType::Bool,
+        | "RANGE_CONTAINS" | "RANGE_OVERLAPS" | "ST_CONTAINS" | "ST_WITHIN" | "SEARCH" | "BOOL" => {
+            Some(BqType::Bool)
+        }
         "DATE"
         | "CURRENT_DATE"
         | "DATE_ADD"
@@ -270,15 +313,15 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
         | "DATE_TRUNC"
         | "LAST_DAY"
         | "PARSE_DATE"
-        | "DATE_FROM_UNIX_DATE" => BqType::Date,
+        | "DATE_FROM_UNIX_DATE" => Some(BqType::Date),
         "DATETIME" | "CURRENT_DATETIME" | "DATETIME_ADD" | "DATETIME_SUB" | "DATETIME_TRUNC"
-        | "PARSE_DATETIME" => BqType::Datetime,
+        | "PARSE_DATETIME" => Some(BqType::Datetime),
         "TIME" | "CURRENT_TIME" | "TIME_ADD" | "TIME_SUB" | "TIME_TRUNC" | "PARSE_TIME" => {
-            BqType::Time
+            Some(BqType::Time)
         }
         "TIMESTAMP" | "CURRENT_TIMESTAMP" | "TIMESTAMP_ADD" | "TIMESTAMP_SUB"
         | "TIMESTAMP_TRUNC" | "PARSE_TIMESTAMP" | "TIMESTAMP_SECONDS" | "TIMESTAMP_MILLIS"
-        | "TIMESTAMP_MICROS" => BqType::Timestamp,
+        | "TIMESTAMP_MICROS" => Some(BqType::Timestamp),
         "MD5"
         | "SHA1"
         | "SHA256"
@@ -286,20 +329,16 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
         | "FROM_BASE64"
         | "FROM_HEX"
         | "NET.IP_FROM_STRING"
-        | "NET.SAFE_IP_FROM_STRING" => BqType::Bytes,
+        | "NET.SAFE_IP_FROM_STRING" => Some(BqType::Bytes),
         "PARSE_JSON" | "TO_JSON" | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_SET" | "JSON_REMOVE" => {
-            BqType::Json
+            Some(BqType::Json)
         }
-        "ST_GEOGPOINT" | "ST_GEOGFROMTEXT" => BqType::Geography,
-        "SUM" | "MIN" | "MAX" | "ANY_VALUE" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
-        | "LAG" | "LEAD" => call
-            .args
-            .first()
-            .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx)),
-        "IFNULL" | "NULLIF" | "IF" | "COALESCE" | "ARRAY_AGG" | "APPROX_QUANTILES" => {
-            infer_polymorphic_fn_type(&upper, call, row, ctx)
+        "ST_GEOGPOINT" | "ST_GEOGFROMTEXT" => Some(BqType::Geography),
+        "JSON_KEYS" | "JSON_VALUE_ARRAY" | "JSON_EXTRACT_STRING_ARRAY" | "REGEXP_EXTRACT_ALL" => {
+            BqType::array(BqType::String).ok()
         }
-        _ => lookup_udf_return_type(&call.name, ctx).unwrap_or(BqType::String),
+        "GENERATE_DATE_ARRAY" => BqType::array(BqType::Date).ok(),
+        _ => None,
     }
 }
 
@@ -310,7 +349,7 @@ fn infer_polymorphic_fn_type(
     ctx: &ExecContext<'_>,
 ) -> BqType {
     match upper {
-        "IFNULL" | "NULLIF" => {
+        "IFNULL" | "NULLIF" | "DIV" | "MOD" | "SAFE_ADD" | "SAFE_SUBTRACT" | "SAFE_MULTIPLY" => {
             let tys: Vec<BqType> = call
                 .args
                 .iter()
@@ -330,7 +369,7 @@ fn infer_polymorphic_fn_type(
                 .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx));
             common_supertype(&[t, f]).unwrap_or(BqType::UntypedNull)
         }
-        "COALESCE" => {
+        "COALESCE" | "GREATEST" | "LEAST" | "ARRAY_CONCAT" => {
             let tys: Vec<BqType> = call
                 .args
                 .iter()
@@ -344,6 +383,84 @@ fn infer_polymorphic_fn_type(
                 .first()
                 .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx));
             BqType::array(el).unwrap_or(BqType::UntypedNull)
+        }
+        "ARRAY_FIRST" | "ARRAY_LAST" => {
+            let arg0 = call
+                .args
+                .first()
+                .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx));
+            if let BqType::Array(el) = arg0 {
+                *el
+            } else {
+                BqType::UntypedNull
+            }
+        }
+        "GENERATE_ARRAY" => {
+            let tys: Vec<BqType> = call
+                .args
+                .iter()
+                .take(2)
+                .map(|a| infer_expr_type(&a.expr, row, ctx))
+                .collect();
+            let el = common_supertype(&tys).unwrap_or(BqType::Int64);
+            let elem = if matches!(el, BqType::UntypedNull) {
+                BqType::Int64
+            } else {
+                el
+            };
+            BqType::array(elem).unwrap_or(BqType::UntypedNull)
+        }
+        "RANGE_START" | "RANGE_END" => {
+            let arg0 = call
+                .args
+                .first()
+                .map_or(BqType::UntypedNull, |a| infer_expr_type(&a.expr, row, ctx));
+            if let BqType::Range(r) = arg0 {
+                r.to_bq_type()
+            } else {
+                BqType::UntypedNull
+            }
+        }
+        "JSON_QUERY" | "JSON_EXTRACT" | "JSON_QUERY_ARRAY" | "JSON_EXTRACT_ARRAY" | "SPLIT" => {
+            infer_json_or_split_type(upper, call, row, ctx)
+        }
+        _ => BqType::UntypedNull,
+    }
+}
+
+fn infer_json_or_split_type(
+    upper: &str,
+    call: &crate::ast::FunctionCall,
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqType {
+    let arg0 = call
+        .args
+        .first()
+        .map_or(BqType::String, |a| infer_expr_type(&a.expr, row, ctx));
+    match upper {
+        "JSON_QUERY" | "JSON_EXTRACT" => {
+            if matches!(arg0, BqType::Json) {
+                BqType::Json
+            } else {
+                BqType::String
+            }
+        }
+        "JSON_QUERY_ARRAY" | "JSON_EXTRACT_ARRAY" => {
+            let elem = if matches!(arg0, BqType::Json) {
+                BqType::Json
+            } else {
+                BqType::String
+            };
+            BqType::array(elem).unwrap_or(BqType::UntypedNull)
+        }
+        "SPLIT" => {
+            let elem = if matches!(arg0, BqType::Bytes) {
+                BqType::Bytes
+            } else {
+                BqType::String
+            };
+            BqType::array(elem).unwrap_or(BqType::UntypedNull)
         }
         _ => BqType::UntypedNull,
     }

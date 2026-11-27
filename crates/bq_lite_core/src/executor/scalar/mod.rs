@@ -5,6 +5,7 @@ mod datetime_fmt;
 mod farmhash;
 mod geo_search;
 mod json;
+mod json_path;
 mod math_hash;
 mod range_geo_net;
 mod regex_fn;

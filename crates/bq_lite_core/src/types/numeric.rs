@@ -95,6 +95,22 @@ impl BqNumeric {
             .map_err(|_| BqError::semantic("NUMERIC overflow in division"))?;
         Self::from_scaled(raw)
     }
+
+    pub fn round_or_trunc(self, digits: i32, trunc: bool) -> BqResult<Self> {
+        let scale = i32::try_from(NUMERIC_SCALE).unwrap_or(9);
+        if digits >= scale {
+            return Ok(self);
+        }
+        let shift = usize::try_from(scale.saturating_sub(digits)).unwrap_or(0);
+        if shift > 38 {
+            return Ok(Self::ZERO);
+        }
+        let unit = pow10(shift);
+        let scaled = round_or_trunc_bigint(&BigInt::from(self.0), &unit, trunc);
+        let raw = i128::try_from(scaled)
+            .map_err(|_| BqError::semantic("NUMERIC overflow in ROUND/TRUNC"))?;
+        Self::from_scaled(raw)
+    }
 }
 
 impl FromStr for BqNumeric {
@@ -189,6 +205,20 @@ impl BqBigNumeric {
         let scaled = div_round_half_away(&num, &rhs.0);
         Self::from_scaled(scaled)
     }
+
+    pub fn round_or_trunc(&self, digits: i32, trunc: bool) -> BqResult<Self> {
+        let scale = i32::try_from(BIGNUMERIC_SCALE).unwrap_or(38);
+        if digits >= scale {
+            return Ok(self.clone());
+        }
+        let shift = usize::try_from(scale.saturating_sub(digits)).unwrap_or(0);
+        if shift > 77 {
+            return Ok(Self::zero());
+        }
+        let unit = pow10(shift);
+        let scaled = round_or_trunc_bigint(&self.0, &unit, trunc);
+        Self::from_scaled(scaled)
+    }
 }
 
 impl FromStr for BqBigNumeric {
@@ -208,6 +238,14 @@ impl fmt::Display for BqBigNumeric {
 
 fn pow10(exp: usize) -> BigInt {
     BigInt::from(10_u8).pow(u32::try_from(exp).unwrap_or(u32::MAX))
+}
+
+fn round_or_trunc_bigint(val: &BigInt, unit: &BigInt, trunc: bool) -> BigInt {
+    if trunc {
+        (val / unit) * unit
+    } else {
+        div_round_half_away(val, unit) * unit
+    }
 }
 
 fn div_round_half_away(num: &BigInt, den: &BigInt) -> BigInt {

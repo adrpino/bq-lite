@@ -166,6 +166,14 @@ fn eval_round(args: Vec<BqValue>, trunc_mode: bool) -> BqResult<BqValue> {
     if v.is_null() {
         return Ok(BqValue::Null);
     }
+    if let BqValue::Numeric(n) = v {
+        return n.round_or_trunc(digits, trunc_mode).map(BqValue::Numeric);
+    }
+    if let BqValue::BigNumeric(bn) = v {
+        return bn
+            .round_or_trunc(digits, trunc_mode)
+            .map(|r| BqValue::BigNumeric(Box::new(r)));
+    }
     let f = to_f64(&v, "ROUND")?;
     let factor = 10.0_f64.powi(digits);
     let res = if trunc_mode {

@@ -392,9 +392,10 @@ fn issue_7_approx_quantiles_and_empty_input_type() {
 fn issue_8_google_sheets_external_table_clear_error() {
     let mut eng = Engine::new();
     eng.exec("CREATE SCHEMA ds;").unwrap();
+    // Without an explicit schema, GOOGLE_SHEETS / HTTP external tables return clear Unimplemented
     let err = eng
         .exec(
-            "CREATE EXTERNAL TABLE ds.sheet (a STRING)
+            "CREATE EXTERNAL TABLE ds.sheet
              OPTIONS (format = 'GOOGLE_SHEETS', uris = ['https://docs.google.com/spreadsheets/d/EXAMPLE']);",
         )
         .unwrap_err();
@@ -407,7 +408,7 @@ fn issue_8_google_sheets_external_table_clear_error() {
 
     let err_http = eng
         .exec(
-            "CREATE EXTERNAL TABLE ds.remote_csv (a STRING)
+            "CREATE EXTERNAL TABLE ds.remote_csv
              OPTIONS (format = 'CSV', uris = ['HTTPS://example.com/data.csv']);",
         )
         .unwrap_err();
