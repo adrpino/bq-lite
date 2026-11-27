@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Expr, Ident, ObjectName, Query};
+use super::{ArrayAccessKind, Expr, Ident, ObjectName, Query, SelectItem, TableWithJoins};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DmlReturning {
+    /// `None` = no `WITH ACTION`; `Some(None)` = `WITH ACTION` (column `"ACTION"`); `Some(Some(id))` = `WITH ACTION AS id`.
+    pub with_action: Option<Option<Ident>>,
+    pub items: Vec<SelectItem>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InsertSource {
@@ -13,12 +20,19 @@ pub struct InsertStmt {
     pub table: ObjectName,
     pub columns: Vec<Ident>,
     pub source: InsertSource,
-    pub returning: Option<Vec<super::SelectItem>>,
+    pub assert_rows_modified: Option<Expr>,
+    pub returning: Option<DmlReturning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UpdatePathStep {
+    Field(Ident),
+    Index { kind: ArrayAccessKind, index: Expr },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateAssignment {
-    pub path: Vec<Ident>,
+    pub path: Vec<UpdatePathStep>,
     pub value: Expr,
 }
 
@@ -27,17 +41,20 @@ pub struct UpdateStmt {
     pub table: ObjectName,
     pub alias: Option<Ident>,
     pub assignments: Vec<UpdateAssignment>,
-    pub from: Vec<super::TableWithJoins>,
+    pub from: Vec<TableWithJoins>,
     pub where_clause: Option<Expr>,
-    pub returning: Option<Vec<super::SelectItem>>,
+    pub assert_rows_modified: Option<Expr>,
+    pub returning: Option<DmlReturning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeleteStmt {
     pub table: ObjectName,
     pub alias: Option<Ident>,
+    pub using: Vec<TableWithJoins>,
     pub where_clause: Option<Expr>,
-    pub returning: Option<Vec<super::SelectItem>>,
+    pub assert_rows_modified: Option<Expr>,
+    pub returning: Option<DmlReturning>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -91,7 +91,7 @@ fn infer_select_columns_from_from(
     Ok(infer_select_columns(select, &acc, ctx))
 }
 
-pub(super) fn infer_select_columns(
+pub(in crate::executor) fn infer_select_columns(
     select: &Select,
     schema_row: &EvalRow,
     ctx: &ExecContext<'_>,

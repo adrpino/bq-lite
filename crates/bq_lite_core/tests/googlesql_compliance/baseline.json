@@ -265,28 +265,28 @@
     "skipped": 1
   },
   "dml_delete.test": {
-    "passed": 6,
-    "failed": 18,
+    "passed": 23,
+    "failed": 1,
     "skipped": 4
   },
   "dml_insert.test": {
-    "passed": 31,
-    "failed": 35,
+    "passed": 33,
+    "failed": 33,
     "skipped": 15
   },
   "dml_returning.test": {
-    "passed": 19,
-    "failed": 16,
+    "passed": 25,
+    "failed": 10,
     "skipped": 0
   },
   "dml_update.test": {
-    "passed": 43,
-    "failed": 37,
+    "passed": 58,
+    "failed": 22,
     "skipped": 12
   },
   "dml_update_struct.test": {
-    "passed": 35,
-    "failed": 14,
+    "passed": 47,
+    "failed": 2,
     "skipped": 6
   },
   "except_intersect_queries.test": {

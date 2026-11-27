@@ -1,6 +1,7 @@
 use crate::ast::{
-    DeleteStmt, Ident, InsertSource, InsertStmt, MergeAction, MergeClause, MergeConditionKind,
-    MergeStmt, SelectItem, TruncateStmt, UpdateAssignment, UpdateStmt,
+    ArrayAccessKind, DeleteStmt, DmlReturning, Expr, Ident, InsertSource, InsertStmt, MergeAction,
+    MergeClause, MergeConditionKind, MergeStmt, TruncateStmt, UpdateAssignment, UpdatePathStep,
+    UpdateStmt,
 };
 use crate::error::{BqError, BqResult};
 
@@ -32,11 +33,12 @@ pub(super) fn parse_insert(p: &mut Parser) -> BqResult<InsertStmt> {
     } else {
         InsertSource::Query(Box::new(parse_query(p)?))
     };
-    let returning = parse_optional_then_return(p)?;
+    let (assert_rows_modified, returning) = parse_dml_tail_clauses(p)?;
     Ok(InsertStmt {
         table,
         columns,
         source,
+        assert_rows_modified,
         returning,
     })
 }
@@ -57,13 +59,14 @@ pub(super) fn parse_update(p: &mut Parser) -> BqResult<UpdateStmt> {
     } else {
         None
     };
-    let returning = parse_optional_then_return(p)?;
+    let (assert_rows_modified, returning) = parse_dml_tail_clauses(p)?;
     Ok(UpdateStmt {
         table,
         alias,
         assignments,
         from,
         where_clause,
+        assert_rows_modified,
         returning,
     })
 }
@@ -76,18 +79,44 @@ fn parse_update_alias(p: &mut Parser) -> BqResult<Option<Ident>> {
 }
 
 fn parse_assignment(p: &mut Parser) -> BqResult<UpdateAssignment> {
-    let mut path = vec![p.parse_ident()?];
-    while p.eat(&TokenKind::Dot) {
-        path.push(p.parse_ident()?);
+    let mut path = vec![UpdatePathStep::Field(p.parse_ident()?)];
+    loop {
+        if p.eat(&TokenKind::Dot) {
+            path.push(UpdatePathStep::Field(p.parse_ident()?));
+        } else if p.eat(&TokenKind::LBracket) {
+            let kind = if p.eat_kw("OFFSET") {
+                ArrayAccessKind::Offset
+            } else if p.eat_kw("SAFE_OFFSET") {
+                ArrayAccessKind::SafeOffset
+            } else if p.eat_kw("ORDINAL") {
+                ArrayAccessKind::Ordinal
+            } else if p.eat_kw("SAFE_ORDINAL") {
+                ArrayAccessKind::SafeOrdinal
+            } else {
+                ArrayAccessKind::Raw
+            };
+            let index = if kind == ArrayAccessKind::Raw {
+                parse_expr(p)?
+            } else {
+                p.expect(&TokenKind::LParen, "'('")?;
+                let idx = parse_expr(p)?;
+                p.expect(&TokenKind::RParen, "')'")?;
+                idx
+            };
+            p.expect(&TokenKind::RBracket, "']'")?;
+            path.push(UpdatePathStep::Index { kind, index });
+        } else {
+            break;
+        }
     }
     p.expect(&TokenKind::Eq, "'='")?;
     let value = parse_dml_value_expr(p)?;
     Ok(UpdateAssignment { path, value })
 }
 
-fn parse_dml_value_expr(p: &mut Parser) -> BqResult<crate::ast::Expr> {
+fn parse_dml_value_expr(p: &mut Parser) -> BqResult<Expr> {
     if p.eat_kw("DEFAULT") {
-        return Ok(crate::ast::Expr::SystemVar("__bq_default__".to_owned()));
+        return Ok(Expr::SystemVar("__bq_default__".to_owned()));
     }
     parse_expr(p)
 }
@@ -96,22 +125,34 @@ pub(super) fn parse_delete(p: &mut Parser) -> BqResult<DeleteStmt> {
     p.expect_kw("DELETE")?;
     p.eat_kw("FROM");
     let table = p.parse_object_name()?;
-    let alias =
-        if p.is_kw("WHERE") || p.is_kw("THEN") || p.at_eof() || p.check(&TokenKind::Semicolon) {
-            None
-        } else {
-            parse_optional_alias(p)?
-        };
+    let alias = if p.is_kw("USING")
+        || p.is_kw("WHERE")
+        || p.is_kw("THEN")
+        || p.is_kw("ASSERT_ROWS_MODIFIED")
+        || p.at_eof()
+        || p.check(&TokenKind::Semicolon)
+    {
+        None
+    } else {
+        parse_optional_alias(p)?
+    };
+    let using = if p.eat_kw("USING") {
+        parse_from_list(p)?
+    } else {
+        Vec::new()
+    };
     let where_clause = if p.eat_kw("WHERE") {
         Some(parse_expr(p)?)
     } else {
         None
     };
-    let returning = parse_optional_then_return(p)?;
+    let (assert_rows_modified, returning) = parse_dml_tail_clauses(p)?;
     Ok(DeleteStmt {
         table,
         alias,
+        using,
         where_clause,
+        assert_rows_modified,
         returning,
     })
 }
@@ -219,10 +260,37 @@ pub(super) fn parse_truncate(p: &mut Parser) -> BqResult<TruncateStmt> {
     })
 }
 
-fn parse_optional_then_return(p: &mut Parser) -> BqResult<Option<Vec<SelectItem>>> {
+fn parse_dml_tail_clauses(p: &mut Parser) -> BqResult<(Option<Expr>, Option<DmlReturning>)> {
+    let mut assert_rows_modified = None;
+    let mut returning = None;
+    loop {
+        if assert_rows_modified.is_none() && p.eat_kw("ASSERT_ROWS_MODIFIED") {
+            assert_rows_modified = Some(parse_expr(p)?);
+        } else if returning.is_none() && p.is_kw("THEN") {
+            returning = parse_optional_then_return(p)?;
+        } else {
+            break;
+        }
+    }
+    Ok((assert_rows_modified, returning))
+}
+
+fn parse_optional_then_return(p: &mut Parser) -> BqResult<Option<DmlReturning>> {
     if !p.eat_kw("THEN") {
         return Ok(None);
     }
     p.expect_kw("RETURN")?;
-    Ok(Some(p.parse_comma_list(parse_select_item)?))
+    let with_action = if p.eat_kw("WITH") {
+        p.expect_kw("ACTION")?;
+        let alias = if p.eat_kw("AS") {
+            Some(p.parse_ident()?)
+        } else {
+            None
+        };
+        Some(alias)
+    } else {
+        None
+    };
+    let items = p.parse_comma_list(parse_select_item)?;
+    Ok(Some(DmlReturning { with_action, items }))
 }

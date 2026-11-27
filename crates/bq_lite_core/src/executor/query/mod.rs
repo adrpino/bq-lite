@@ -30,6 +30,7 @@ use crate::executor::result::{QueryColumn, QueryResult};
 use crate::types::{BqType, BqValue};
 
 pub(in crate::executor) use self::project::project_eval_rows as project_eval_rows_public;
+pub(in crate::executor) use self::schema::infer_select_columns as infer_select_columns_public;
 pub(in crate::executor) use self::type_infer::infer_expr_type as infer_expr_type_public;
 pub(in crate::executor) use from::{
     eval_from_clause as eval_from_clause_public,

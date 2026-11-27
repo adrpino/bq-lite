@@ -1,19 +1,23 @@
+mod assign;
 mod merge;
 
 use crate::ast::{
-    DeleteStmt, Ident, InsertSource, InsertStmt, Select, SelectItem, Statement, TruncateStmt,
-    UpdateStmt,
+    DeleteStmt, Ident, InsertSource, InsertStmt, Statement, TruncateStmt, UpdateStmt,
 };
 use crate::catalog::{Catalog, TableMeta};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding, ScriptBindings};
 use crate::executor::evaluator::eval_expr;
-use crate::executor::query::{eval_from_clause_public, execute_query, project_eval_rows_public};
-use crate::executor::result::{QueryColumn, QueryResult};
+use crate::executor::query::{eval_from_clause_public, execute_query};
+use crate::executor::result::QueryResult;
 use crate::storage::StorageEngine;
 use crate::types::coercion::coerce_value;
 use crate::types::BqValue;
 
+use assign::{
+    apply_assignment, build_returning_result, check_assert_rows_modified, eval_update_val,
+    is_default_sentinel, schema_eval_row, AssignCtx,
+};
 use merge::exec_merge;
 
 pub(in crate::executor) fn execute_dml(
@@ -52,7 +56,7 @@ fn exec_insert(
 ) -> BqResult<QueryResult> {
     let tref = catalog.resolve_table_name(&stmt.table)?;
     let meta = catalog.get_table(&tref)?.clone();
-    let prepared = {
+    let (prepared, count) = {
         let ctx = ExecContext::with_bindings(catalog, storage, bindings);
         let raw_rows: Vec<Vec<BqValue>> = match &stmt.source {
             InsertSource::Values(rows_expr) => {
@@ -76,23 +80,25 @@ fn exec_insert(
         for raw in raw_rows {
             out.push(finalize_new_row(&meta, &stmt.columns, raw, &ctx)?);
         }
-        out
+        let count = u64::try_from(out.len()).unwrap_or(u64::MAX);
+        check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), count, &ctx)?;
+        (out, count)
     };
 
-    let count = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
     storage.insert_rows(&tref, prepared.clone())?;
 
     stmt.returning.as_ref().map_or_else(
         || Ok(QueryResult::affected(count)),
         |returning| {
             let ctx = ExecContext::with_bindings(catalog, storage, bindings);
-            build_returning_result(&meta, None, prepared, returning, &ctx)
+            let schema = schema_eval_row(&meta, &meta.name);
+            let eval_rows: Vec<EvalRow> = prepared
+                .iter()
+                .map(|r| row_to_eval(&meta, r, &meta.name))
+                .collect();
+            build_returning_result(&schema, &eval_rows, returning, "INSERT", &ctx)
         },
     )
-}
-
-fn is_default_sentinel(expr: &crate::ast::Expr) -> bool {
-    matches!(expr, crate::ast::Expr::SystemVar(s) if s == "__bq_default__")
 }
 
 fn eval_insert_val(
@@ -116,32 +122,6 @@ fn eval_insert_val(
     };
     col.and_then(|c| c.default_expr.as_ref())
         .map_or(Ok(BqValue::Null), |def| eval_expr(def, empty, ctx))
-}
-
-fn eval_update_val(
-    meta: &TableMeta,
-    path: &[Ident],
-    expr: &crate::ast::Expr,
-    eval_row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    if !is_default_sentinel(expr) {
-        return eval_expr(expr, eval_row, ctx);
-    }
-    let col_ident = path.first().and_then(|first| {
-        if meta.column_index(&first.value).is_some() {
-            Some(first)
-        } else {
-            path.get(1)
-        }
-    });
-    let col = col_ident
-        .and_then(|id| meta.column_index(&id.value))
-        .and_then(|idx| meta.columns.get(idx));
-    col.and_then(|c| c.default_expr.as_ref())
-        .map_or(Ok(BqValue::Null), |def| {
-            eval_expr(def, &EvalRow::default(), ctx)
-        })
 }
 
 pub(super) fn finalize_new_row(
@@ -227,37 +207,49 @@ fn exec_update(
         .alias
         .as_ref()
         .map_or_else(|| meta.name.clone(), |a| a.value.clone());
+    let has_from = !stmt.from.is_empty();
 
-    let (out_rows, returned_rows, affected) = {
+    let (out_rows, returned_evals, affected) = {
         let ctx = ExecContext::with_bindings(catalog, storage, bindings);
-        let from_rows = if stmt.from.is_empty() {
-            Vec::new()
-        } else {
+        let from_rows = if has_from {
             eval_from_clause_public(&stmt.from, &ctx)?
+        } else {
+            Vec::new()
         };
         let rows = storage.read_rows(&tref);
         let mut out_rows = Vec::with_capacity(rows.len());
-        let mut returned_rows = Vec::new();
+        let mut returned_evals = Vec::new();
         let mut affected = 0_u64;
 
         for row in rows {
             let base_eval = row_to_eval(&meta, &row, &qual);
-            let matched_eval =
-                find_update_match(&base_eval, &from_rows, stmt.where_clause.as_ref(), &ctx)?;
-            if let Some(eval_row) = matched_eval {
+            let matched = find_update_match(
+                &base_eval,
+                has_from,
+                &from_rows,
+                stmt.where_clause.as_ref(),
+                &ctx,
+            )?;
+            if let Some((eval_row, matched_from)) = matched {
                 let mut updated = row;
+                let mut actx = AssignCtx::new(&eval_row, &ctx);
                 for assign in &stmt.assignments {
                     let val = eval_update_val(&meta, &assign.path, &assign.value, &eval_row, &ctx)?;
-                    apply_assignment(&meta, &mut updated, &assign.path, val)?;
+                    apply_assignment(&meta, &mut updated, &assign.path, val, &mut actx)?;
                 }
-                returned_rows.push(updated.clone());
+                let mut ret_row = row_to_eval(&meta, &updated, &qual);
+                if let Some(frow) = matched_from {
+                    ret_row.cols.extend(frow.cols);
+                }
+                returned_evals.push(ret_row);
                 out_rows.push(updated);
                 affected += 1;
             } else {
                 out_rows.push(row);
             }
         }
-        (out_rows, returned_rows, affected)
+        check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), affected, &ctx)?;
+        (out_rows, returned_evals, affected)
     };
     storage.replace_rows(&tref, out_rows);
 
@@ -265,24 +257,31 @@ fn exec_update(
         || Ok(QueryResult::affected(affected)),
         |returning| {
             let ctx = ExecContext::with_bindings(catalog, storage, bindings);
-            build_returning_result(&meta, Some(&qual), returned_rows, returning, &ctx)
+            let schema = schema_eval_row(&meta, &qual);
+            build_returning_result(&schema, &returned_evals, returning, "UPDATE", &ctx)
         },
     )
 }
 
 fn find_update_match(
     base: &EvalRow,
+    has_from: bool,
     from_rows: &[EvalRow],
     where_clause: Option<&crate::ast::Expr>,
     ctx: &ExecContext<'_>,
-) -> BqResult<Option<EvalRow>> {
-    if from_rows.is_empty() {
+) -> BqResult<Option<(EvalRow, Option<EvalRow>)>> {
+    if !has_from {
         let matched = match where_clause {
             Some(pred) => matches!(eval_expr(pred, base, ctx)?, BqValue::Bool(true)),
             None => true,
         };
-        return Ok(if matched { Some(base.clone()) } else { None });
+        return Ok(if matched {
+            Some((base.clone(), None))
+        } else {
+            None
+        });
     }
+    let mut found: Option<(EvalRow, Option<EvalRow>)> = None;
     for frow in from_rows {
         let mut combined_cols = base.cols.clone();
         combined_cols.extend(frow.cols.iter().cloned());
@@ -292,82 +291,15 @@ fn find_update_match(
             None => true,
         };
         if matched {
-            return Ok(Some(combined));
+            if found.is_some() {
+                return Err(BqError::semantic(
+                    "UPDATE with join requires that each row of the table being updated correspond with at most one joined row that matches the WHERE clause",
+                ));
+            }
+            found = Some((combined, Some(frow.clone())));
         }
     }
-    Ok(None)
-}
-
-pub(super) fn apply_assignment(
-    meta: &TableMeta,
-    row: &mut [BqValue],
-    path: &[Ident],
-    val: BqValue,
-) -> BqResult<()> {
-    let [first, rest @ ..] = path else {
-        return Err(BqError::query("Empty assignment target"));
-    };
-    let (col_ident, field_path) = if meta.column_index(&first.value).is_some() {
-        (first, rest)
-    } else if let Some(second) = rest.first() {
-        (second, rest.get(1..).unwrap_or(&[]))
-    } else {
-        return Err(BqError::not_found(format!(
-            "Column '{}' not found",
-            first.value
-        )));
-    };
-    let idx = meta
-        .column_index(&col_ident.value)
-        .ok_or_else(|| BqError::not_found(format!("Column '{}' not found", col_ident.value)))?;
-    let col_schema = meta
-        .columns
-        .get(idx)
-        .ok_or_else(|| BqError::internal("column idx"))?;
-    if field_path.is_empty() {
-        let coerced = coerce_value(val, &col_schema.ty)?;
-        if !col_schema.nullable && coerced.is_null() {
-            return Err(BqError::invalid_argument(format!(
-                "Column '{}' cannot be NULL",
-                col_schema.name
-            )));
-        }
-        if let Some(slot) = row.get_mut(idx) {
-            *slot = coerced;
-        }
-        return Ok(());
-    }
-    if let Some(slot) = row.get_mut(idx) {
-        update_nested_struct(slot, field_path, val)?;
-    }
-    Ok(())
-}
-
-fn update_nested_struct(target: &mut BqValue, path: &[Ident], val: BqValue) -> BqResult<()> {
-    let [head, tail @ ..] = path else {
-        *target = val;
-        return Ok(());
-    };
-    let BqValue::Struct(fields) = target else {
-        return Err(BqError::query(format!(
-            "Cannot update nested field '{}' on non-STRUCT",
-            head.value
-        )));
-    };
-    let field = fields
-        .iter_mut()
-        .find(|f| {
-            f.name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(&head.value))
-        })
-        .ok_or_else(|| BqError::not_found(format!("STRUCT field '{}' not found", head.value)))?;
-    if tail.is_empty() {
-        field.value = val;
-        Ok(())
-    } else {
-        update_nested_struct(&mut field.value, tail, val)
-    }
+    Ok(found)
 }
 
 fn exec_delete(
@@ -382,28 +314,38 @@ fn exec_delete(
         .alias
         .as_ref()
         .map_or_else(|| meta.name.clone(), |a| a.value.clone());
+    let has_using = !stmt.using.is_empty();
 
-    let (kept, deleted, affected) = {
+    let (kept, deleted_evals, affected) = {
         let ctx = ExecContext::with_bindings(catalog, storage, bindings);
+        let using_rows = if has_using {
+            eval_from_clause_public(&stmt.using, &ctx)?
+        } else {
+            Vec::new()
+        };
         let rows = storage.read_rows(&tref);
         let mut kept = Vec::with_capacity(rows.len());
-        let mut deleted = Vec::new();
+        let mut deleted_evals = Vec::new();
         let mut affected = 0_u64;
 
         for row in rows {
             let eval_row = row_to_eval(&meta, &row, &qual);
-            let match_del = match stmt.where_clause {
-                Some(ref pred) => matches!(eval_expr(pred, &eval_row, &ctx)?, BqValue::Bool(true)),
-                None => true,
-            };
+            let match_del = matches_delete_row(
+                &eval_row,
+                has_using,
+                &using_rows,
+                stmt.where_clause.as_ref(),
+                &ctx,
+            )?;
             if match_del {
-                deleted.push(row);
+                deleted_evals.push(eval_row);
                 affected += 1;
             } else {
                 kept.push(row);
             }
         }
-        (kept, deleted, affected)
+        check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), affected, &ctx)?;
+        (kept, deleted_evals, affected)
     };
     storage.replace_rows(&tref, kept);
 
@@ -411,9 +353,38 @@ fn exec_delete(
         || Ok(QueryResult::affected(affected)),
         |returning| {
             let ctx = ExecContext::with_bindings(catalog, storage, bindings);
-            build_returning_result(&meta, Some(&qual), deleted, returning, &ctx)
+            let schema = schema_eval_row(&meta, &qual);
+            build_returning_result(&schema, &deleted_evals, returning, "DELETE", &ctx)
         },
     )
+}
+
+fn matches_delete_row(
+    base: &EvalRow,
+    has_using: bool,
+    using_rows: &[EvalRow],
+    where_clause: Option<&crate::ast::Expr>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<bool> {
+    if !has_using {
+        return Ok(match where_clause {
+            Some(pred) => matches!(eval_expr(pred, base, ctx)?, BqValue::Bool(true)),
+            None => true,
+        });
+    }
+    for urow in using_rows {
+        let mut combined_cols = base.cols.clone();
+        combined_cols.extend(urow.cols.iter().cloned());
+        let combined = EvalRow::new(combined_cols);
+        let matched = match where_clause {
+            Some(pred) => matches!(eval_expr(pred, &combined, ctx)?, BqValue::Bool(true)),
+            None => true,
+        };
+        if matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn exec_truncate(
@@ -442,43 +413,4 @@ fn row_to_eval(meta: &TableMeta, row: &[BqValue], qual: &str) -> EvalRow {
             })
             .collect(),
     )
-}
-
-fn build_returning_result(
-    meta: &TableMeta,
-    qual: Option<&str>,
-    rows: Vec<Vec<BqValue>>,
-    returning: &[SelectItem],
-    ctx: &ExecContext<'_>,
-) -> BqResult<QueryResult> {
-    let q = qual.unwrap_or(&meta.name);
-    let eval_rows: Vec<EvalRow> = rows.into_iter().map(|r| row_to_eval(meta, &r, q)).collect();
-    let dummy_sel = Select {
-        distinct: false,
-        as_kind: None,
-        projection: returning.to_vec(),
-        from: Vec::new(),
-        where_clause: None,
-        group_by: None,
-        having: None,
-        qualify: None,
-        window: Vec::new(),
-    };
-    let projected = project_eval_rows_public(&dummy_sel, &eval_rows, ctx)?;
-    let cols = projected
-        .first()
-        .map(|r| {
-            r.cols
-                .iter()
-                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let out_rows = projected
-        .into_iter()
-        .map(|r| r.cols.into_iter().map(|c| c.value).collect())
-        .collect();
-    let mut qr = QueryResult::new(cols, out_rows);
-    qr.rows_affected = u64::try_from(qr.rows.len()).unwrap_or(u64::MAX);
-    Ok(qr)
 }

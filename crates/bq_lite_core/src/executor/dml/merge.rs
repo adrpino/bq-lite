@@ -8,7 +8,8 @@ use crate::executor::result::QueryResult;
 use crate::storage::StorageEngine;
 use crate::types::BqValue;
 
-use super::{apply_assignment, finalize_new_row};
+use super::assign::{apply_assignment, AssignCtx};
+use super::finalize_new_row;
 
 pub(super) fn exec_merge(
     stmt: &MergeStmt,
@@ -211,9 +212,10 @@ fn update_row_with_assignments(
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<BqValue>> {
     let mut updated = trow.to_vec();
+    let mut actx = AssignCtx::new(eval_row, ctx);
     for assign in assignments {
         let val = eval_expr(&assign.value, eval_row, ctx)?;
-        apply_assignment(meta, &mut updated, &assign.path, val)?;
+        apply_assignment(meta, &mut updated, &assign.path, val, &mut actx)?;
     }
     Ok(updated)
 }

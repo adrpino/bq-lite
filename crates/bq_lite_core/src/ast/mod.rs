@@ -18,8 +18,8 @@ pub use ddl::{
     FunctionBody, FunctionKind, LoadDataStmt, ParamMode, RoutineParam, TableConstraint,
 };
 pub use dml::{
-    DeleteStmt, InsertSource, InsertStmt, MergeAction, MergeClause, MergeConditionKind, MergeStmt,
-    TruncateStmt, UpdateAssignment, UpdateStmt,
+    DeleteStmt, DmlReturning, InsertSource, InsertStmt, MergeAction, MergeClause,
+    MergeConditionKind, MergeStmt, TruncateStmt, UpdateAssignment, UpdatePathStep, UpdateStmt,
 };
 pub use expr::{
     ArrayAccessKind, BinaryOp, Expr, FunctionArg, FunctionCall, HavingKind, InTarget, IsTest,
