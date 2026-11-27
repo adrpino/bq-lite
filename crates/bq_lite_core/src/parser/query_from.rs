@@ -110,10 +110,26 @@ fn parse_base_table_factor(p: &mut Parser) -> BqResult<TableFactor> {
         return parse_unnest_factor(p);
     }
     if p.eat(&TokenKind::LParen) {
-        let query = Box::new(parse_query(p)?);
+        if p.is_kw("SELECT") || p.is_kw("WITH") || p.is_kw("FROM") {
+            let query = Box::new(parse_query(p)?);
+            p.expect(&TokenKind::RParen, "')'")?;
+            let alias = parse_optional_alias(p)?;
+            return Ok(TableFactor::Derived { query, alias });
+        }
+        let saved = p.save_pos();
+        if let Ok(query) = parse_query(p) {
+            if p.eat(&TokenKind::RParen) {
+                let alias = parse_optional_alias(p)?;
+                return Ok(TableFactor::Derived {
+                    query: Box::new(query),
+                    alias,
+                });
+            }
+        }
+        p.restore_pos(saved);
+        let twj = parse_table_with_joins(p)?;
         p.expect(&TokenKind::RParen, "')'")?;
-        let alias = parse_optional_alias(p)?;
-        return Ok(TableFactor::Derived { query, alias });
+        return Ok(TableFactor::NestedJoin(Box::new(twj)));
     }
     let name = p.parse_table_object_name()?;
     if p.eat(&TokenKind::LParen) {
@@ -129,6 +145,23 @@ fn parse_base_table_factor(p: &mut Parser) -> BqResult<TableFactor> {
     let system_time = parse_optional_system_time(p)?;
     let tablesample_percent = parse_optional_tablesample(p)?;
     let alias = parse_optional_alias(p)?;
+    if p.eat_kw("WITH") {
+        p.expect_kw("OFFSET")?;
+        let off_alias = parse_optional_alias(p)?;
+        let expr = if name.parts.len() == 1 {
+            name.parts
+                .into_iter()
+                .next()
+                .map_or(Expr::Star, Expr::Ident)
+        } else {
+            Expr::CompoundIdent(name.parts)
+        };
+        return Ok(TableFactor::Unnest {
+            expr,
+            alias,
+            with_offset: Some(off_alias),
+        });
+    }
     let system_time = if system_time.is_none() {
         parse_optional_system_time(p)?
     } else {

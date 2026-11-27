@@ -119,6 +119,9 @@ fn expand_wildcard(
                 )?;
             }
         }
+        if matched_any {
+            return Ok(());
+        }
     }
     for col in &row.cols {
         if col.name.starts_with("__win_") {

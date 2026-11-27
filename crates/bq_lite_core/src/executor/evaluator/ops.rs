@@ -445,6 +445,11 @@ pub(in crate::executor) fn compare_values(a: &BqValue, b: &BqValue) -> BqResult<
         (BqValue::Datetime(x), BqValue::Datetime(y)) => x.partial_cmp(&y),
         (BqValue::Time(x), BqValue::Time(y)) => x.partial_cmp(&y),
         (BqValue::Timestamp(x), BqValue::Timestamp(y)) => x.partial_cmp(&y),
+        (BqValue::Interval(x), BqValue::Interval(y)) => {
+            Some(super::literals::interval_sort_key(x).cmp(&super::literals::interval_sort_key(y)))
+        }
+        (BqValue::Range(rx), BqValue::Range(ry)) => super::literals::compare_ranges(&rx, &ry)?,
+        (BqValue::Array(ax), BqValue::Array(ay)) => super::literals::compare_arrays(&ax, &ay)?,
         _ => {
             return Err(BqError::query(format!(
                 "Values of type {supertype} cannot be ordered"

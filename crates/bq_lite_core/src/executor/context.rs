@@ -145,7 +145,7 @@ pub(super) struct ExecContext<'a> {
     pub positional_params: Vec<BqValue>,
     pub vars: BTreeMap<String, BqValue>,
     pub sys_vars: BTreeMap<String, BqValue>,
-    pub outer_row: Option<&'a EvalRow>,
+    pub outer_rows: Vec<&'a EvalRow>,
     pub now: DateTime<Utc>,
     pub governance: GovernanceConfig,
 }
@@ -161,7 +161,7 @@ impl<'a> ExecContext<'a> {
             positional_params: Vec::new(),
             vars: BTreeMap::new(),
             sys_vars: BTreeMap::new(),
-            outer_row: None,
+            outer_rows: Vec::new(),
             now: Utc::now(),
             governance: GovernanceConfig::default(),
         }
@@ -196,6 +196,8 @@ impl<'a> ExecContext<'a> {
 
     #[must_use]
     pub(super) fn with_outer<'b>(&'b self, outer: &'b EvalRow) -> ExecContext<'b> {
+        let mut outer_rows = self.outer_rows.clone();
+        outer_rows.push(outer);
         ExecContext {
             catalog: self.catalog,
             storage: self.storage,
@@ -204,7 +206,7 @@ impl<'a> ExecContext<'a> {
             positional_params: self.positional_params.clone(),
             vars: self.vars.clone(),
             sys_vars: self.sys_vars.clone(),
-            outer_row: Some(outer),
+            outer_rows,
             now: self.now,
             governance: self.governance.clone(),
         }

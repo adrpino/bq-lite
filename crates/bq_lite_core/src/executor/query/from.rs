@@ -83,7 +83,11 @@ pub(super) fn eval_correlated_cross_or_factor(
     factor: &TableFactor,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<EvalRow>> {
-    if matches!(factor, TableFactor::Unnest { .. }) {
+    let is_corr_path = matches!(factor, TableFactor::Unnest { .. })
+        || left_rows
+            .first()
+            .is_some_and(|l| is_correlated_table_array_path(factor, l));
+    if is_corr_path {
         let mut out = Vec::new();
         for lrow in left_rows {
             let unnested = eval_table_factor(factor, Some(lrow), ctx)?;
@@ -101,6 +105,24 @@ pub(super) fn eval_correlated_cross_or_factor(
         }
     }
     Ok(out)
+}
+
+fn is_correlated_table_array_path(factor: &TableFactor, lrow: &EvalRow) -> bool {
+    let TableFactor::Table { name, .. } = factor else {
+        return false;
+    };
+    if name.parts.len() < 2 {
+        return false;
+    }
+    let Some(first) = name.parts.first() else {
+        return false;
+    };
+    let has_qual = lrow.cols.iter().any(|c| {
+        c.qualifier
+            .as_deref()
+            .is_some_and(|q| q.eq_ignore_ascii_case(&first.value))
+    });
+    has_qual || matches!(lrow.resolve_ident(&first.value), Ok(Some(_)))
 }
 
 pub(in crate::executor) fn eval_table_factor_standalone(
@@ -122,6 +144,15 @@ pub(super) fn eval_table_factor(
             system_time,
             tablesample_percent,
         } => {
+            if name.parts.len() >= 2 && (corr_row.is_some() || !ctx.outer_rows.is_empty()) {
+                let path_expr = crate::ast::Expr::CompoundIdent(name.parts.clone());
+                let empty = EvalRow::default();
+                if let Ok(BqValue::Array(_) | BqValue::Null) =
+                    eval_expr(&path_expr, corr_row.unwrap_or(&empty), ctx)
+                {
+                    return eval_unnest(&path_expr, alias.as_ref(), None, corr_row, ctx);
+                }
+            }
             let rows = eval_table_ref(
                 name,
                 alias.as_ref().map(|a| a.value.as_str()),
@@ -169,6 +200,7 @@ pub(super) fn eval_table_factor(
         TableFactor::TableFunction { name, args, alias } => {
             eval_table_function(name, args, alias.as_ref().map(|a| a.value.as_str()), ctx)
         }
+        TableFactor::NestedJoin(twj) => Ok(eval_table_with_joins_first(Some(twj), ctx)?.0),
     }
 }
 

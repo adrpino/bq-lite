@@ -24,11 +24,18 @@ pub(super) fn frame_bounds(
     if frame.unit == WindowFrameUnit::Range {
         return range_frame_bounds(spec, frame, pos, part, rows, ctx);
     }
-    let start = resolve_row_bound(&frame.start, pos, last, true, ctx)?;
-    let end = match &frame.end {
-        Some(b) => resolve_row_bound(b, pos, last, false, ctx)?,
-        None => pos,
+    let last_i = i128::try_from(last).unwrap_or(i128::MAX);
+    let pos_i = i128::try_from(pos).unwrap_or(0);
+    let start_i = resolve_row_bound(&frame.start, pos_i, last_i, ctx)?;
+    let end_i = match &frame.end {
+        Some(b) => resolve_row_bound(b, pos_i, last_i, ctx)?,
+        None => pos_i,
     };
+    if end_i < 0 || start_i > last_i || start_i > end_i {
+        return Ok((1, 0));
+    }
+    let start = usize::try_from(start_i.max(0)).unwrap_or(0);
+    let end = usize::try_from(end_i.min(last_i)).unwrap_or(last);
     Ok((start, end))
 }
 
@@ -57,7 +64,7 @@ fn range_frame_bounds(
         .get(*part.get(pos).unwrap_or(&0))
         .ok_or_else(|| BqError::internal("row"))?;
     let cur_val = eval_expr(&ob.expr, cur_row, ctx)?;
-    if cur_val.is_null() {
+    if cur_val.is_null() || matches!(cur_val, BqValue::Float64(f) if f.is_nan()) {
         return range_null_bounds(spec, frame, pos, part, rows, ctx);
     }
     range_offset_bounds(ob, frame, &cur_val, part, rows, ctx)
@@ -113,6 +120,15 @@ fn range_null_bounds(
     Ok((start, end))
 }
 
+#[derive(Debug, Clone)]
+enum RangeBoundVal {
+    Unbounded,
+    NegInf,
+    PosInf,
+    Int128(i128),
+    Value(BqValue),
+}
+
 fn range_offset_bounds(
     ob: &crate::ast::OrderByExpr,
     frame: &WindowFrame,
@@ -122,18 +138,32 @@ fn range_offset_bounds(
     ctx: &ExecContext<'_>,
 ) -> BqResult<(usize, usize)> {
     let asc = ob.asc.unwrap_or(true);
+    let nulls_first = ob.nulls_first.unwrap_or(asc);
     let end_bound = frame.end.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
     let lower = eval_range_bound(&frame.start, cur_val, asc, ctx)?;
     let upper = eval_range_bound(end_bound, cur_val, asc, ctx)?;
+    let include_nulls = if nulls_first {
+        matches!(frame.start, WindowFrameBound::Preceding(None))
+    } else {
+        matches!(end_bound, WindowFrameBound::Following(None))
+    };
     let mut first_idx: Option<usize> = None;
     let mut last_idx: usize = 0;
     for (idx, &row_idx) in part.iter().enumerate() {
         let row = rows.get(row_idx).ok_or_else(|| BqError::internal("row"))?;
         let key = eval_expr(&ob.expr, row, ctx)?;
-        if key.is_null() {
-            continue;
-        }
-        if key_in_range(&key, lower.as_ref(), upper.as_ref(), asc)? {
+        let matches = if key.is_null() {
+            include_nulls
+        } else if matches!(key, BqValue::Float64(f) if f.is_nan()) {
+            if asc {
+                matches!(frame.start, WindowFrameBound::Preceding(None))
+            } else {
+                matches!(end_bound, WindowFrameBound::Following(None))
+            }
+        } else {
+            key_in_range(&key, &lower, &upper, asc)?
+        };
+        if matches {
             if first_idx.is_none() {
                 first_idx = Some(idx);
             }
@@ -143,14 +173,37 @@ fn range_offset_bounds(
     Ok(first_idx.map_or((1, 0), |s| (s, last_idx)))
 }
 
+fn compare_key_to_bound(key: &BqValue, bound: &RangeBoundVal) -> BqResult<Option<Ordering>> {
+    match (key, bound) {
+        (_, RangeBoundVal::Unbounded) => Ok(None),
+        (_, RangeBoundVal::NegInf) => Ok(Some(Ordering::Greater)),
+        (_, RangeBoundVal::PosInf) => Ok(Some(Ordering::Less)),
+        (BqValue::Int64(k), RangeBoundVal::Int128(b)) => Ok(Some(i128::from(*k).cmp(b))),
+        (_, RangeBoundVal::Int128(b)) => {
+            let bv = i64::try_from(*b).map_or_else(
+                |_| {
+                    if *b < 0 {
+                        RangeBoundVal::NegInf
+                    } else {
+                        RangeBoundVal::PosInf
+                    }
+                },
+                |n| RangeBoundVal::Value(BqValue::Int64(n)),
+            );
+            compare_key_to_bound(key, &bv)
+        }
+        (_, RangeBoundVal::Value(bv)) => compare_values(key, bv),
+    }
+}
+
 fn key_in_range(
     key: &BqValue,
-    lower: Option<&BqValue>,
-    upper: Option<&BqValue>,
+    lower: &RangeBoundVal,
+    upper: &RangeBoundVal,
     asc: bool,
 ) -> BqResult<bool> {
-    if let Some(bound) = lower {
-        let ord = compare_values(key, bound)?;
+    if !matches!(lower, RangeBoundVal::Unbounded) {
+        let ord = compare_key_to_bound(key, lower)?;
         let ok = if asc {
             matches!(ord, Some(Ordering::Greater | Ordering::Equal))
         } else {
@@ -160,8 +213,8 @@ fn key_in_range(
             return Ok(false);
         }
     }
-    if let Some(bound) = upper {
-        let ord = compare_values(key, bound)?;
+    if !matches!(upper, RangeBoundVal::Unbounded) {
+        let ord = compare_key_to_bound(key, upper)?;
         let ok = if asc {
             matches!(ord, Some(Ordering::Less | Ordering::Equal))
         } else {
@@ -179,20 +232,51 @@ fn eval_range_bound(
     cur_val: &BqValue,
     asc: bool,
     ctx: &ExecContext<'_>,
-) -> BqResult<Option<BqValue>> {
+) -> BqResult<RangeBoundVal> {
     match bound {
-        WindowFrameBound::Preceding(None) | WindowFrameBound::Following(None) => Ok(None),
-        WindowFrameBound::CurrentRow => Ok(Some(cur_val.clone())),
+        WindowFrameBound::Preceding(None) | WindowFrameBound::Following(None) => {
+            Ok(RangeBoundVal::Unbounded)
+        }
+        WindowFrameBound::CurrentRow => Ok(RangeBoundVal::Value(cur_val.clone())),
         WindowFrameBound::Preceding(Some(expr)) => {
             let off = eval_nonneg_offset(expr, ctx)?;
             let op = if asc { BinaryOp::Sub } else { BinaryOp::Add };
-            eval_binary(op, cur_val.clone(), off).map(Some)
+            eval_range_shift(cur_val, &off, op)
         }
         WindowFrameBound::Following(Some(expr)) => {
             let off = eval_nonneg_offset(expr, ctx)?;
             let op = if asc { BinaryOp::Add } else { BinaryOp::Sub };
-            eval_binary(op, cur_val.clone(), off).map(Some)
+            eval_range_shift(cur_val, &off, op)
         }
+    }
+}
+
+fn eval_range_shift(cur_val: &BqValue, off: &BqValue, op: BinaryOp) -> BqResult<RangeBoundVal> {
+    if let (BqValue::Int64(c), BqValue::Int64(o)) = (cur_val, off) {
+        let shifted = if op == BinaryOp::Sub {
+            i128::from(*c) - i128::from(*o)
+        } else {
+            i128::from(*c) + i128::from(*o)
+        };
+        return Ok(RangeBoundVal::Int128(shifted));
+    }
+    if let BqValue::Float64(o) = off {
+        if o.is_infinite() {
+            return Ok(if op == BinaryOp::Sub {
+                RangeBoundVal::NegInf
+            } else {
+                RangeBoundVal::PosInf
+            });
+        }
+    }
+    match eval_binary(op, cur_val.clone(), off.clone()) {
+        Ok(v) => Ok(RangeBoundVal::Value(v)),
+        Err(e) if e.kind == crate::error::BqErrorKind::Semantic => Ok(if op == BinaryOp::Sub {
+            RangeBoundVal::NegInf
+        } else {
+            RangeBoundVal::PosInf
+        }),
+        Err(e) => Err(e),
     }
 }
 
@@ -225,26 +309,21 @@ const fn frame_has_numeric_offsets(frame: &WindowFrame) -> bool {
 
 fn resolve_row_bound(
     bound: &WindowFrameBound,
-    pos: usize,
-    last: usize,
-    is_start: bool,
+    pos: i128,
+    last: i128,
     ctx: &ExecContext<'_>,
-) -> BqResult<usize> {
+) -> BqResult<i128> {
     match bound {
         WindowFrameBound::CurrentRow => Ok(pos),
         WindowFrameBound::Preceding(None) => Ok(0),
         WindowFrameBound::Following(None) => Ok(last),
         WindowFrameBound::Preceding(Some(e)) => {
-            let n = eval_offset_int(e, ctx)?;
-            Ok(if is_start {
-                pos.saturating_sub(n)
-            } else {
-                pos.saturating_sub(n).min(last)
-            })
+            let n = i128::try_from(eval_offset_int(e, ctx)?).unwrap_or(i128::MAX);
+            Ok(pos.saturating_sub(n))
         }
         WindowFrameBound::Following(Some(e)) => {
-            let n = eval_offset_int(e, ctx)?;
-            Ok(pos.saturating_add(n).min(last))
+            let n = i128::try_from(eval_offset_int(e, ctx)?).unwrap_or(i128::MAX);
+            Ok(pos.saturating_add(n))
         }
     }
 }

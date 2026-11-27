@@ -54,7 +54,7 @@ impl ScriptState {
             positional_params: self.positional_params.clone(),
             vars: self.vars.clone(),
             sys_vars: self.sys_vars.clone(),
-            outer_row: None,
+            outer_rows: Vec::new(),
             now: Utc::now(),
             governance: self.governance.clone(),
         }

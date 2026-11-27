@@ -143,6 +143,7 @@ pub enum TableFactor {
         spec: UnpivotSpec,
         alias: Option<Ident>,
     },
+    NestedJoin(Box<TableWithJoins>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

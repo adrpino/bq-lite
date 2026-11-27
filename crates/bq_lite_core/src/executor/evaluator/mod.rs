@@ -271,7 +271,7 @@ fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqR
     if let Some(var_val) = ctx.vars.get(&name.to_ascii_lowercase()) {
         return Ok(var_val.clone());
     }
-    if let Some(outer) = ctx.outer_row {
+    for outer in ctx.outer_rows.iter().rev() {
         if let Some(binding) = outer.resolve_ident(name)? {
             return Ok(binding.value.clone());
         }
@@ -292,7 +292,7 @@ fn resolve_compound_ident(
         if let Some(val) = resolve_qualified_from_row(first, second, tail, row)? {
             return Ok(val);
         }
-        if let Some(outer) = ctx.outer_row {
+        for outer in ctx.outer_rows.iter().rev() {
             if let Some(val) = resolve_qualified_from_row(first, second, tail, outer)? {
                 return Ok(val);
             }

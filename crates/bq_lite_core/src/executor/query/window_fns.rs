@@ -19,6 +19,23 @@ pub(super) fn eval_window_partition(
     if is_aggregate_name(&upper) {
         return eval_window_agg(call, spec, part, rows, ctx, out);
     }
+    if spec.frame.is_some()
+        && matches!(
+            upper.as_str(),
+            "ROW_NUMBER"
+                | "RANK"
+                | "DENSE_RANK"
+                | "NTILE"
+                | "PERCENT_RANK"
+                | "CUME_DIST"
+                | "LAG"
+                | "LEAD"
+        )
+    {
+        return Err(BqError::query(format!(
+            "Window frame is not allowed for analytic function {upper}"
+        )));
+    }
     match upper.as_str() {
         "ROW_NUMBER" => {
             for (pos, &row_idx) in part.iter().enumerate() {

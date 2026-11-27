@@ -19,7 +19,7 @@ pub(in crate::executor) fn infer_query_columns(
 ) -> BqResult<Vec<QueryColumn>> {
     let empty_row = EvalRow::default();
     let mut local_ctx = ctx.with_outer(&empty_row);
-    local_ctx.outer_row = ctx.outer_row;
+    local_ctx.outer_rows.clone_from(&ctx.outer_rows);
     if let Some(ref with) = query.with {
         for cte in &with.ctes {
             let key = cte.name.value.to_ascii_lowercase();
@@ -156,26 +156,43 @@ fn expand_schema_wildcard(
 ) {
     let qual_str = qualifier.and_then(|q| q.normalized_parts().last().cloned());
     let mut matched_any = false;
-    let pseudo_iter = if qual_str.is_some() {
-        schema_row.pseudo_cols.as_slice()
-    } else {
-        &[]
-    };
-    for col in pseudo_iter.iter().chain(schema_row.cols.iter()) {
-        if col.name.starts_with("__win_") || col.name.starts_with("_PARTITION") {
-            continue;
-        }
-        if let Some(ref qs) = qual_str {
-            if !col
-                .qualifier
-                .as_deref()
-                .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
+    if let Some(ref qs) = qual_str {
+        for col in &schema_row.pseudo_cols {
+            if !col.name.starts_with("_PARTITION")
+                && col
+                    .qualifier
+                    .as_deref()
+                    .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
             {
-                continue;
+                matched_any = true;
+                push_schema_wildcard_col(
+                    (&col.name, &col.ty),
+                    schema_row,
+                    except,
+                    replace,
+                    ctx,
+                    out,
+                );
             }
         }
-        matched_any = true;
-        push_schema_wildcard_col((&col.name, &col.ty), schema_row, except, replace, ctx, out);
+    }
+    if !matched_any {
+        for col in &schema_row.cols {
+            if col.name.starts_with("__win_") {
+                continue;
+            }
+            if let Some(ref qs) = qual_str {
+                if !col
+                    .qualifier
+                    .as_deref()
+                    .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
+                {
+                    continue;
+                }
+            }
+            matched_any = true;
+            push_schema_wildcard_col((&col.name, &col.ty), schema_row, except, replace, ctx, out);
+        }
     }
     if !matched_any {
         if let Some(q) = qualifier {
@@ -263,6 +280,18 @@ pub(super) fn infer_table_factor_schema(
 ) -> BqResult<EvalRow> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
+            if name.parts.len() >= 2 && (corr_row.is_some() || !ctx.outer_rows.is_empty()) {
+                let path_expr = crate::ast::Expr::CompoundIdent(name.parts.clone());
+                let empty = EvalRow::default();
+                let arr_ty = infer_expr_type(&path_expr, corr_row.unwrap_or(&empty), ctx);
+                if let BqType::Array(el) = arr_ty {
+                    return Ok(unnest_schema_row(
+                        &el,
+                        alias.as_ref().map(|a| a.value.as_str()),
+                        None,
+                    ));
+                }
+            }
             infer_table_ref_schema(name, alias.as_ref().map(|a| a.value.as_str()), ctx)
         }
         TableFactor::Derived { query, alias } => {
@@ -280,25 +309,10 @@ pub(super) fn infer_table_factor_schema(
             let empty = EvalRow::default();
             let row_ref = corr_row.unwrap_or(&empty);
             let arr_ty = infer_expr_type(expr, row_ref, ctx);
-            let inner = match arr_ty {
-                BqType::Array(el) => *el,
-                BqType::UntypedNull
-                | BqType::Bool
-                | BqType::Int64
-                | BqType::Float64
-                | BqType::Numeric
-                | BqType::BigNumeric
-                | BqType::String
-                | BqType::Bytes
-                | BqType::Date
-                | BqType::Datetime
-                | BqType::Time
-                | BqType::Timestamp
-                | BqType::Interval
-                | BqType::Json
-                | BqType::Geography
-                | BqType::Range(_)
-                | BqType::Struct(_) => arr_ty,
+            let inner = if let BqType::Array(el) = arr_ty {
+                *el
+            } else {
+                arr_ty
             };
             let offset_name = with_offset
                 .as_ref()
@@ -318,53 +332,18 @@ pub(super) fn infer_table_factor_schema(
                 .first()
                 .map_or_else(EvalRow::default, null_out_eval_row))
         }
+        TableFactor::NestedJoin(twj) => {
+            let mut acc = infer_table_factor_schema(&twj.relation, corr_row, ctx)?;
+            for j in &twj.joins {
+                let r = infer_table_factor_schema(&j.relation, Some(&acc), ctx)?;
+                acc = combine_rows_for_constraint(&acc, &r, &j.constraint);
+            }
+            Ok(acc)
+        }
     }
 }
 
-pub(super) fn unnest_schema_row(
-    elem_ty: &BqType,
-    alias: Option<&str>,
-    offset_name: Option<&str>,
-) -> EvalRow {
-    let mut cols = Vec::new();
-    let mut pseudo = Vec::new();
-    if let BqType::Struct(fields) = elem_ty {
-        for (i, sf) in fields.iter().enumerate() {
-            let fname = sf.name.clone().unwrap_or_else(|| format!("f{i}_"));
-            cols.push(RowBinding {
-                qualifier: alias.map(str::to_owned),
-                name: fname,
-                ty: sf.ty.clone(),
-                value: BqValue::Null,
-            });
-        }
-        if let Some(a) = alias {
-            pseudo.push(RowBinding {
-                qualifier: None,
-                name: a.to_owned(),
-                ty: elem_ty.clone(),
-                value: BqValue::Null,
-            });
-        }
-    } else {
-        let elem_name = alias.map_or_else(|| "f0_".to_owned(), str::to_owned);
-        cols.push(RowBinding {
-            qualifier: alias.map(str::to_owned),
-            name: elem_name,
-            ty: elem_ty.clone(),
-            value: BqValue::Null,
-        });
-    }
-    if let Some(off) = offset_name {
-        cols.push(RowBinding {
-            qualifier: None,
-            name: off.to_owned(),
-            ty: BqType::Int64,
-            value: BqValue::Null,
-        });
-    }
-    EvalRow::with_pseudo(cols, pseudo)
-}
+pub(super) use super::governance::unnest_schema_row;
 
 fn infer_table_ref_schema(
     name: &crate::ast::ObjectName,

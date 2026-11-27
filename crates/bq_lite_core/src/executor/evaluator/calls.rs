@@ -336,16 +336,57 @@ pub(super) fn eval_array_literal(
     }
     let target_elem = match elem_type {
         Some(ast_ty) => ast_ty.to_bq_type()?,
-        None => common_supertype(&types)?,
+        None => infer_array_elem_type(&types, elements)?,
     };
     if matches!(target_elem, BqType::Array(_)) {
         return Err(BqError::query("Arrays of arrays are not supported"));
     }
     let coerced = values
         .into_iter()
-        .map(|v| coerce_value(v, &target_elem))
+        .zip(elements.iter())
+        .map(|(v, el)| {
+            if matches!(el, Expr::Literal(crate::ast::Literal::String(_)))
+                && matches!(
+                    target_elem,
+                    BqType::Date | BqType::Datetime | BqType::Time | BqType::Timestamp
+                )
+            {
+                crate::types::coercion::cast_value(v, &target_elem)
+            } else {
+                coerce_value(v, &target_elem)
+            }
+        })
         .collect::<BqResult<Vec<_>>>()?;
     Ok(BqValue::Array(coerced))
+}
+
+fn infer_array_elem_type(types: &[BqType], elements: &[Expr]) -> BqResult<BqType> {
+    if let Ok(t) = common_supertype(types) {
+        return Ok(t);
+    }
+    let temporal = types.iter().find(|t| {
+        matches!(
+            t,
+            BqType::Date | BqType::Datetime | BqType::Time | BqType::Timestamp
+        )
+    });
+    if let Some(temp_ty) = temporal {
+        let adjusted: Vec<BqType> = types
+            .iter()
+            .zip(elements.iter())
+            .map(|(t, el)| {
+                if *t == BqType::String
+                    && matches!(el, Expr::Literal(crate::ast::Literal::String(_)))
+                {
+                    temp_ty.clone()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        return common_supertype(&adjusted);
+    }
+    common_supertype(types)
 }
 
 pub(super) fn eval_struct_literal(

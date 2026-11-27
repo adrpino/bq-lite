@@ -25,8 +25,8 @@
     "skipped": 132
   },
   "analytic_any_value.test": {
-    "passed": 6,
-    "failed": 6,
+    "passed": 7,
+    "failed": 5,
     "skipped": 10
   },
   "analytic_array_aggregation.test": {
@@ -75,23 +75,23 @@
     "skipped": 6
   },
   "analytic_first_value.test": {
-    "passed": 6,
-    "failed": 3,
+    "passed": 9,
+    "failed": 0,
     "skipped": 10
   },
   "analytic_lag.test": {
-    "passed": 17,
-    "failed": 14,
+    "passed": 18,
+    "failed": 13,
     "skipped": 15
   },
   "analytic_last_value.test": {
-    "passed": 7,
-    "failed": 3,
+    "passed": 10,
+    "failed": 0,
     "skipped": 10
   },
   "analytic_lead.test": {
-    "passed": 17,
-    "failed": 14,
+    "passed": 18,
+    "failed": 13,
     "skipped": 15
   },
   "analytic_logical_and.test": {
@@ -140,28 +140,28 @@
     "skipped": 5
   },
   "analytic_row_number.test": {
-    "passed": 5,
-    "failed": 1,
+    "passed": 6,
+    "failed": 0,
     "skipped": 0
   },
   "analytic_string_aggregation.test": {
-    "passed": 7,
-    "failed": 11,
+    "passed": 18,
+    "failed": 0,
     "skipped": 0
   },
   "analytic_sum.test": {
-    "passed": 22,
-    "failed": 2,
+    "passed": 24,
+    "failed": 0,
     "skipped": 100
   },
   "analytic_window_frames.test": {
-    "passed": 49,
-    "failed": 36,
+    "passed": 85,
+    "failed": 0,
     "skipped": 64
   },
   "any_value_aggregation.test": {
-    "passed": 5,
-    "failed": 6,
+    "passed": 9,
+    "failed": 2,
     "skipped": 4
   },
   "arithmetic_functions.test": {
@@ -190,8 +190,8 @@
     "skipped": 30
   },
   "array_joins.test": {
-    "passed": 18,
-    "failed": 9,
+    "passed": 27,
+    "failed": 0,
     "skipped": 0
   },
   "array_of_arrays.test": {
@@ -200,8 +200,8 @@
     "skipped": 9
   },
   "array_queries.test": {
-    "passed": 2,
-    "failed": 17,
+    "passed": 3,
+    "failed": 16,
     "skipped": 45
   },
   "bytes.test": {
@@ -220,8 +220,8 @@
     "skipped": 14
   },
   "case_statement_queries.test": {
-    "passed": 35,
-    "failed": 11,
+    "passed": 40,
+    "failed": 6,
     "skipped": 19
   },
   "cast_function.test": {
@@ -335,8 +335,8 @@
     "skipped": 5
   },
   "interval.test": {
-    "passed": 8,
-    "failed": 47,
+    "passed": 9,
+    "failed": 46,
     "skipped": 17
   },
   "is_unknown.test": {
@@ -345,8 +345,8 @@
     "skipped": 0
   },
   "join_queries.test": {
-    "passed": 38,
-    "failed": 13,
+    "passed": 39,
+    "failed": 12,
     "skipped": 10
   },
   "json_queries.test": {
@@ -470,8 +470,8 @@
     "skipped": 11
   },
   "subquery_expression_queries.test": {
-    "passed": 13,
-    "failed": 6,
+    "passed": 15,
+    "failed": 4,
     "skipped": 12
   },
   "tablesample.test": {
@@ -495,8 +495,8 @@
     "skipped": 17
   },
   "unnest_queries.test": {
-    "passed": 15,
-    "failed": 5,
+    "passed": 19,
+    "failed": 1,
     "skipped": 1
   },
   "unpivot.test": {
@@ -510,8 +510,8 @@
     "skipped": 0
   },
   "with_recursive.test": {
-    "passed": 17,
-    "failed": 18,
+    "passed": 25,
+    "failed": 10,
     "skipped": 8
   }
 }

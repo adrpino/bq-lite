@@ -133,3 +133,48 @@ pub(super) fn apply_tablesample(
     rows.truncate(keep.min(rows.len()));
     Ok(rows)
 }
+
+pub(super) fn unnest_schema_row(
+    elem_ty: &BqType,
+    alias: Option<&str>,
+    offset_name: Option<&str>,
+) -> EvalRow {
+    let mut cols = Vec::new();
+    let mut pseudo = Vec::new();
+    if let BqType::Struct(fields) = elem_ty {
+        for (i, sf) in fields.iter().enumerate() {
+            let fname = sf.name.clone().unwrap_or_else(|| format!("f{i}_"));
+            cols.push(RowBinding {
+                qualifier: alias.map(str::to_owned),
+                name: fname,
+                ty: sf.ty.clone(),
+                value: BqValue::Null,
+            });
+        }
+        if let Some(a) = alias {
+            pseudo.push(RowBinding {
+                qualifier: None,
+                name: a.to_owned(),
+                ty: elem_ty.clone(),
+                value: BqValue::Null,
+            });
+        }
+    } else {
+        let elem_name = alias.map_or_else(|| "f0_".to_owned(), str::to_owned);
+        cols.push(RowBinding {
+            qualifier: alias.map(str::to_owned),
+            name: elem_name,
+            ty: elem_ty.clone(),
+            value: BqValue::Null,
+        });
+    }
+    if let Some(off) = offset_name {
+        cols.push(RowBinding {
+            qualifier: None,
+            name: off.to_owned(),
+            ty: BqType::Int64,
+            value: BqValue::Null,
+        });
+    }
+    EvalRow::with_pseudo(cols, pseudo)
+}

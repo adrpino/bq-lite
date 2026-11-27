@@ -3,6 +3,7 @@ mod agg_approx;
 mod agg_builtins;
 mod agg_eval;
 mod agg_grouping;
+mod cte;
 mod from;
 mod governance;
 mod joins;
@@ -19,9 +20,7 @@ mod window;
 mod window_fns;
 mod window_frames;
 
-use crate::ast::{
-    Expr, OrderByExpr, Query, Select, SelectAsKind, SetExpr, SetQuantifier, WithClause,
-};
+use crate::ast::{Expr, OrderByExpr, Query, Select, SelectAsKind, SetExpr};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::eval_expr;
@@ -35,15 +34,14 @@ pub(in crate::executor) use from::{
 };
 
 use agg::{execute_grouped_select_with_order, select_uses_grouping};
+use cte::eval_with_clause;
 use from::eval_from_clause_with_schema;
 use pipe::apply_pipe_ops;
 use project::{has_untyped_null, project_eval_rows};
 use schema::infer_select_columns;
-use set_ops::{dedup_rows, execute_set_op, is_union_set_expr, rows_equal};
+use set_ops::{execute_set_op, rows_equal};
 use sort::{apply_limit_offset, apply_order_by, apply_order_by_with_source, merge_proj_and_source};
 use window::{apply_windows, execute_grouped_with_windows, select_has_windows};
-
-const MAX_CTE_RECURSION: usize = 100;
 
 pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
     let mut local_ctx = ExecContext {
@@ -54,7 +52,7 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
         positional_params: ctx.positional_params.clone(),
         vars: ctx.vars.clone(),
         sys_vars: ctx.sys_vars.clone(),
-        outer_row: ctx.outer_row,
+        outer_rows: ctx.outer_rows.clone(),
         now: ctx.now,
         governance: ctx.governance.clone(),
     };
@@ -97,93 +95,7 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
     Ok(result)
 }
 
-fn eval_with_clause(with: &WithClause, ctx: &mut ExecContext<'_>) -> BqResult<()> {
-    for cte in &with.ctes {
-        let key = cte.name.value.to_ascii_lowercase();
-        let mut qr = if with.recursive {
-            eval_recursive_cte(cte, ctx)?
-        } else {
-            execute_query(&cte.query, ctx)?
-        };
-        if !cte.columns.is_empty() {
-            if cte.columns.len() != qr.columns.len() {
-                return Err(BqError::query(format!(
-                    "CTE '{}' column count mismatch",
-                    cte.name.value
-                )));
-            }
-            for (col, alias) in qr.columns.iter_mut().zip(&cte.columns) {
-                col.name.clone_from(&alias.value);
-            }
-        }
-        ctx.ctes.insert(key, qr);
-    }
-    Ok(())
-}
-
-fn eval_recursive_cte(cte: &crate::ast::Cte, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
-    let Some((quantifier, base_expr, rec_expr)) = is_union_set_expr(&cte.query.body) else {
-        return execute_query(&cte.query, ctx);
-    };
-    let key = cte.name.value.to_ascii_lowercase();
-    let mut accumulated = execute_set_expr(base_expr, ctx)?;
-    if quantifier == SetQuantifier::Distinct {
-        accumulated.rows = dedup_rows(accumulated.rows)?;
-    }
-    let mut delta = accumulated.clone();
-    let empty_outer = EvalRow::default();
-    for _ in 0..MAX_CTE_RECURSION {
-        if delta.rows.is_empty() {
-            return Ok(accumulated);
-        }
-        let mut step_ctx = ctx.with_outer(&empty_outer);
-        step_ctx.ctes.insert(key.clone(), delta);
-        let mut next_delta = execute_set_expr(rec_expr, &step_ctx)?;
-        if next_delta.rows.is_empty() {
-            return Ok(accumulated);
-        }
-        if next_delta.columns.len() != accumulated.columns.len() {
-            return Err(BqError::query(format!(
-                "Recursive CTE '{}' column count mismatch",
-                cte.name.value
-            )));
-        }
-        for (dst, src) in next_delta.columns.iter_mut().zip(&accumulated.columns) {
-            dst.name.clone_from(&src.name);
-        }
-        if quantifier == SetQuantifier::Distinct {
-            next_delta.rows = filter_new_rows(&accumulated.rows, next_delta.rows)?;
-        }
-        accumulated.rows.extend(next_delta.rows.clone());
-        delta = next_delta;
-    }
-    Err(BqError::semantic(format!(
-        "Recursive CTE '{}' exceeded maximum iteration limit ({MAX_CTE_RECURSION})",
-        cte.name.value
-    )))
-}
-
-fn filter_new_rows(
-    existing: &[Vec<BqValue>],
-    candidates: Vec<Vec<BqValue>>,
-) -> BqResult<Vec<Vec<BqValue>>> {
-    let mut fresh = Vec::new();
-    for row in candidates {
-        let mut dup = false;
-        for ex in existing.iter().chain(fresh.iter()) {
-            if rows_equal(ex, &row)? {
-                dup = true;
-                break;
-            }
-        }
-        if !dup {
-            fresh.push(row);
-        }
-    }
-    Ok(fresh)
-}
-
-fn execute_set_expr(expr: &SetExpr, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
+pub(super) fn execute_set_expr(expr: &SetExpr, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
     match expr {
         SetExpr::Select(sel) => execute_select(sel, ctx),
         SetExpr::Query(q) => execute_query(q, ctx),

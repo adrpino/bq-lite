@@ -14,7 +14,9 @@ pub(super) fn eval_join_with_schema(
     join: &Join,
     ctx: &ExecContext<'_>,
 ) -> BqResult<(Vec<EvalRow>, EvalRow)> {
-    if matches!(join.relation, TableFactor::Unnest { .. }) {
+    if matches!(join.relation, TableFactor::Unnest { .. })
+        && !matches!(join.kind, JoinKind::Right | JoinKind::Full)
+    {
         let rows = eval_correlated_unnest_join(left_rows, join, ctx)?;
         let r_schema = infer_table_factor_schema(&join.relation, Some(left_schema), ctx)?;
         let schema = merged_join_schema(left_schema, &r_schema, &join.constraint);
@@ -95,38 +97,94 @@ pub(super) fn combine_rows_for_constraint(
     let is_using = |name: &str| cols.iter().any(|c| c.value.eq_ignore_ascii_case(name));
     let mut merged = Vec::with_capacity(left.cols.len() + right.cols.len());
     let mut pseudo = left.pseudo_cols.clone();
-    for lcol in &left.cols {
-        if is_using(&lcol.name) {
-            if lcol.qualifier.is_some() {
-                pseudo.push(lcol.clone());
-            }
-            let mut merged_col = lcol.clone();
+
+    // Record full ordered columns per qualifier for sides that lose a USING column so `t.*`
+    // preserves the table's exact original column order and pre-coalesce values.
+    record_using_table_cols(&left.cols, is_using, &mut pseudo);
+    record_using_table_cols(&right.cols, is_using, &mut pseudo);
+
+    // BigQuery emits merged USING columns FIRST (in USING list order), then left non-USING, then right non-USING.
+    for ucol in cols {
+        let lmatch = left
+            .cols
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&ucol.value));
+        let rmatch = right
+            .cols
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&ucol.value));
+        if let Some(base) = lmatch.or(rmatch) {
+            let mut merged_col = base.clone();
             merged_col.qualifier = None;
             if merged_col.value.is_null() {
-                if let Some(rcol) = right
-                    .cols
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&lcol.name))
-                {
-                    merged_col.value = rcol.value.clone();
+                if let Some(rc) = rmatch {
+                    merged_col.value = rc.value.clone();
                 }
             }
             merged.push(merged_col);
-        } else {
+        }
+    }
+    for lcol in &left.cols {
+        if !is_using(&lcol.name) {
             merged.push(lcol.clone());
         }
     }
     for rcol in &right.cols {
-        if is_using(&rcol.name) {
-            if rcol.qualifier.is_some() {
-                pseudo.push(rcol.clone());
-            }
-        } else {
+        if !is_using(&rcol.name) {
             merged.push(rcol.clone());
         }
     }
-    pseudo.extend(right.pseudo_cols.iter().cloned());
+    for rp in &right.pseudo_cols {
+        let already = rp.qualifier.as_deref().is_some_and(|rq| {
+            pseudo.iter().any(|p| {
+                p.qualifier
+                    .as_deref()
+                    .is_some_and(|pq| pq.eq_ignore_ascii_case(rq))
+                    && p.name.eq_ignore_ascii_case(&rp.name)
+            })
+        });
+        if !already {
+            pseudo.push(rp.clone());
+        }
+    }
     EvalRow::with_pseudo(merged, pseudo)
+}
+
+fn record_using_table_cols(
+    side_cols: &[crate::executor::context::RowBinding],
+    is_using: impl Fn(&str) -> bool,
+    pseudo: &mut Vec<crate::executor::context::RowBinding>,
+) {
+    let mut touched_quals: Vec<String> = Vec::new();
+    for col in side_cols {
+        if is_using(&col.name) {
+            if let Some(ref q) = col.qualifier {
+                if !touched_quals.iter().any(|t| t.eq_ignore_ascii_case(q)) {
+                    touched_quals.push(q.clone());
+                }
+            }
+        }
+    }
+    for q in &touched_quals {
+        let already = pseudo.iter().any(|p| {
+            !p.name.starts_with("_PARTITION")
+                && p.qualifier
+                    .as_deref()
+                    .is_some_and(|pq| pq.eq_ignore_ascii_case(q))
+        });
+        if already {
+            continue;
+        }
+        for col in side_cols {
+            if col
+                .qualifier
+                .as_deref()
+                .is_some_and(|cq| cq.eq_ignore_ascii_case(q))
+            {
+                pseudo.push(col.clone());
+            }
+        }
+    }
 }
 
 fn eval_correlated_unnest_join(

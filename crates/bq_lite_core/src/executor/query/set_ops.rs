@@ -1,4 +1,4 @@
-use crate::ast::{SetExpr, SetOpKind, SetQuantifier};
+use crate::ast::{SetOpKind, SetQuantifier};
 use crate::error::{BqError, BqResult};
 use crate::executor::evaluator::values_distinct_eq;
 use crate::executor::result::{QueryColumn, QueryResult};
@@ -179,19 +179,4 @@ pub(super) fn rows_equal(a: &[BqValue], b: &[BqValue]) -> BqResult<bool> {
         }
     }
     Ok(true)
-}
-
-pub(super) fn is_union_set_expr(expr: &SetExpr) -> Option<(SetQuantifier, &SetExpr, &SetExpr)> {
-    if let SetExpr::SetOperation {
-        op: SetOpKind::Union,
-        quantifier,
-        left,
-        right,
-        ..
-    } = expr
-    {
-        Some((*quantifier, left, right))
-    } else {
-        None
-    }
 }

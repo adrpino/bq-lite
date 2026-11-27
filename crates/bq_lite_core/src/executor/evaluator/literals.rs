@@ -109,3 +109,49 @@ pub(super) fn eval_like(text: &str, pattern: &str) -> bool {
     }
     dp.get(p.len()).copied().unwrap_or(false)
 }
+
+pub(super) const fn interval_sort_key(iv: crate::types::BqInterval) -> i128 {
+    (iv.months as i128) * 30 * 86_400_000_000
+        + (iv.days as i128) * 86_400_000_000
+        + (iv.micros as i128)
+}
+
+pub(super) fn compare_ranges(
+    rx: &crate::types::BqRange,
+    ry: &crate::types::BqRange,
+) -> BqResult<Option<std::cmp::Ordering>> {
+    let start_ord = match (&rx.start, &ry.start) {
+        (None, None) => Some(std::cmp::Ordering::Equal),
+        (None, Some(_)) => Some(std::cmp::Ordering::Less),
+        (Some(_), None) => Some(std::cmp::Ordering::Greater),
+        (Some(sx), Some(sy)) => super::ops::compare_values(sx, sy)?,
+    };
+    if start_ord != Some(std::cmp::Ordering::Equal) {
+        return Ok(start_ord);
+    }
+    match (&rx.end, &ry.end) {
+        (None, None) => Ok(Some(std::cmp::Ordering::Equal)),
+        (None, Some(_)) => Ok(Some(std::cmp::Ordering::Greater)),
+        (Some(_), None) => Ok(Some(std::cmp::Ordering::Less)),
+        (Some(ex), Some(ey)) => super::ops::compare_values(ex, ey),
+    }
+}
+
+pub(super) fn compare_arrays(
+    ax: &[BqValue],
+    ay: &[BqValue],
+) -> BqResult<Option<std::cmp::Ordering>> {
+    for (x, y) in ax.iter().zip(ay.iter()) {
+        if x.is_null() || y.is_null() {
+            if x.is_null() && y.is_null() {
+                continue;
+            }
+            return Ok(None);
+        }
+        match super::ops::compare_values(x, y)? {
+            Some(std::cmp::Ordering::Equal) => {}
+            other => return Ok(other),
+        }
+    }
+    Ok(Some(ax.len().cmp(&ay.len())))
+}
