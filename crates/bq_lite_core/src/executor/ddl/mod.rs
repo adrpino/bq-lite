@@ -281,6 +281,9 @@ fn exec_drop(
         | DropObjectKind::View
         | DropObjectKind::MaterializedView => {
             let tref = catalog.resolve_table_name(&stmt.name)?;
+            if let Ok(existing) = catalog.get_table(&tref) {
+                check_drop_table_kind(stmt.kind, &tref, existing.kind)?;
+            }
             catalog.drop_table(&tref, stmt.if_exists)?;
             storage.drop_table(&tref);
         }
@@ -288,6 +291,9 @@ fn exec_drop(
             let tref = catalog.resolve_table_name(&stmt.name)?;
             let ds = catalog.get_dataset_mut(&tref.project, &tref.dataset);
             if let Ok(ds_meta) = ds {
+                if let Some(existing) = ds_meta.routines.get(&tref.table) {
+                    check_drop_routine_kind(stmt.kind, &tref, existing)?;
+                }
                 if ds_meta.routines.remove(&tref.table).is_none() && !stmt.if_exists {
                     return Err(BqError::not_found(format!(
                         "Not found: Routine {}:{}.{}",
@@ -315,4 +321,95 @@ fn exec_drop(
         }
     }
     Ok(QueryResult::empty())
+}
+
+fn check_drop_table_kind(
+    drop_kind: DropObjectKind,
+    tref: &TableRef,
+    actual: TableKind,
+) -> BqResult<()> {
+    let matches = match drop_kind {
+        DropObjectKind::Table => matches!(actual, TableKind::Table | TableKind::External),
+        DropObjectKind::ExternalTable => actual == TableKind::External,
+        DropObjectKind::SnapshotTable => actual == TableKind::Snapshot,
+        DropObjectKind::View => actual == TableKind::View,
+        DropObjectKind::MaterializedView => actual == TableKind::MaterializedView,
+        DropObjectKind::Schema
+        | DropObjectKind::Function
+        | DropObjectKind::TableFunction
+        | DropObjectKind::Procedure
+        | DropObjectKind::RowAccessPolicy => false,
+    };
+    if matches {
+        return Ok(());
+    }
+    let actual_label = match actual {
+        TableKind::Table => "table",
+        TableKind::External => "external table",
+        TableKind::Snapshot => "snapshot table",
+        TableKind::View => "view",
+        TableKind::MaterializedView => "materialized view",
+    };
+    Err(BqError::query(format!(
+        "{} cannot drop {actual_label} {}:{}.{}",
+        drop_kind_label(drop_kind),
+        tref.project,
+        tref.dataset,
+        tref.table
+    )))
+}
+
+fn check_drop_routine_kind(
+    drop_kind: DropObjectKind,
+    tref: &TableRef,
+    actual: &RoutineMeta,
+) -> BqResult<()> {
+    let matches = match (drop_kind, actual) {
+        (DropObjectKind::Function, RoutineMeta::Function(f)) => f.kind == FunctionKind::Scalar,
+        (DropObjectKind::TableFunction, RoutineMeta::Function(f)) => f.kind == FunctionKind::Table,
+        (DropObjectKind::Procedure, RoutineMeta::Procedure(_)) => true,
+        (
+            DropObjectKind::Function
+            | DropObjectKind::TableFunction
+            | DropObjectKind::Procedure
+            | DropObjectKind::Schema
+            | DropObjectKind::Table
+            | DropObjectKind::ExternalTable
+            | DropObjectKind::SnapshotTable
+            | DropObjectKind::View
+            | DropObjectKind::MaterializedView
+            | DropObjectKind::RowAccessPolicy,
+            _,
+        ) => false,
+    };
+    if matches {
+        return Ok(());
+    }
+    let actual_label = match actual {
+        RoutineMeta::Function(f) if f.kind == FunctionKind::Table => "table function",
+        RoutineMeta::Function(_) => "function",
+        RoutineMeta::Procedure(_) => "procedure",
+    };
+    Err(BqError::query(format!(
+        "{} cannot drop {actual_label} {}:{}.{}",
+        drop_kind_label(drop_kind),
+        tref.project,
+        tref.dataset,
+        tref.table
+    )))
+}
+
+const fn drop_kind_label(kind: DropObjectKind) -> &'static str {
+    match kind {
+        DropObjectKind::Schema => "DROP SCHEMA",
+        DropObjectKind::Table => "DROP TABLE",
+        DropObjectKind::ExternalTable => "DROP EXTERNAL TABLE",
+        DropObjectKind::SnapshotTable => "DROP SNAPSHOT TABLE",
+        DropObjectKind::View => "DROP VIEW",
+        DropObjectKind::MaterializedView => "DROP MATERIALIZED VIEW",
+        DropObjectKind::Function => "DROP FUNCTION",
+        DropObjectKind::TableFunction => "DROP TABLE FUNCTION",
+        DropObjectKind::Procedure => "DROP PROCEDURE",
+        DropObjectKind::RowAccessPolicy => "DROP ROW ACCESS POLICY",
+    }
 }
