@@ -155,9 +155,17 @@ fn eval_grouped_compound(
             negated,
             target,
         } => eval_grouped_in(inner, *negated, target, bucket, keys, ctx),
-        Expr::Extract { part, expr: inner } => {
+        Expr::Extract {
+            part,
+            expr: inner,
+            time_zone,
+        } => {
             let val = eval_grouped_expr(inner, bucket, keys, ctx)?;
-            eval_extract_value(&part.value, val)
+            let tz_val = time_zone
+                .as_deref()
+                .map(|tz_e| eval_grouped_expr(tz_e, bucket, keys, ctx))
+                .transpose()?;
+            eval_extract_value(&part.value, val, tz_val.as_ref())
         }
         Expr::ArrayLiteral { elements, .. } => {
             let mut items = Vec::with_capacity(elements.len());
@@ -292,11 +300,17 @@ fn eval_grouped_fn(
             Err(err) => Err(err),
         };
     }
-    let args = call
-        .args
-        .iter()
-        .map(|a| eval_grouped_expr(&a.expr, bucket, keys, ctx))
-        .collect::<BqResult<Vec<_>>>()?;
+    let upper = name.to_ascii_uppercase();
+    let mut args = Vec::with_capacity(call.args.len());
+    for (idx, a) in call.args.iter().enumerate() {
+        if crate::executor::evaluator::is_date_part_arg_pos(&upper, idx) {
+            if let Expr::Ident(id) = &a.expr {
+                args.push(BqValue::String(id.value.clone()));
+                continue;
+            }
+        }
+        args.push(eval_grouped_expr(&a.expr, bucket, keys, ctx)?);
+    }
     match crate::executor::scalar::eval_scalar_builtin(&name, args, ctx) {
         Ok(Some(val)) => return Ok(val),
         Ok(None) => {}

@@ -185,7 +185,9 @@ fn eval_lag_lead(
         .collect::<BqResult<_>>()?;
 
     for (pos, &row_idx) in part.iter().enumerate() {
-        let target = if name == "LAG" {
+        let target = if offset == 0 {
+            vals.get(pos).cloned()
+        } else if name == "LAG" {
             step_backward(pos, offset, &vals, ignore_nulls)
         } else {
             step_forward(pos, offset, &vals, ignore_nulls)

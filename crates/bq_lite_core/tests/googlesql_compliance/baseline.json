@@ -10,8 +10,8 @@
     "skipped": 71
   },
   "aggregation_having_modifier_queries.test": {
-    "passed": 3,
-    "failed": 31,
+    "passed": 16,
+    "failed": 18,
     "skipped": 9
   },
   "aggregation_order_by_queries.test": {
@@ -205,8 +205,8 @@
     "skipped": 45
   },
   "bytes.test": {
-    "passed": 20,
-    "failed": 36,
+    "passed": 35,
+    "failed": 21,
     "skipped": 6
   },
   "call_sql_tvf.test": {
@@ -225,8 +225,8 @@
     "skipped": 19
   },
   "cast_function.test": {
-    "passed": 63,
-    "failed": 53,
+    "passed": 67,
+    "failed": 49,
     "skipped": 75
   },
   "cast_function_to_json.test": {
@@ -235,8 +235,8 @@
     "skipped": 24
   },
   "civil_time.test": {
-    "passed": 16,
-    "failed": 40,
+    "passed": 21,
+    "failed": 35,
     "skipped": 16
   },
   "comparison_functions.test": {
@@ -260,8 +260,8 @@
     "skipped": 2
   },
   "date.test": {
-    "passed": 12,
-    "failed": 16,
+    "passed": 14,
+    "failed": 14,
     "skipped": 1
   },
   "dml_delete.test": {
@@ -270,8 +270,8 @@
     "skipped": 4
   },
   "dml_insert.test": {
-    "passed": 30,
-    "failed": 36,
+    "passed": 31,
+    "failed": 35,
     "skipped": 15
   },
   "dml_returning.test": {
@@ -280,13 +280,13 @@
     "skipped": 0
   },
   "dml_update.test": {
-    "passed": 41,
-    "failed": 39,
+    "passed": 43,
+    "failed": 37,
     "skipped": 12
   },
   "dml_update_struct.test": {
-    "passed": 24,
-    "failed": 25,
+    "passed": 35,
+    "failed": 14,
     "skipped": 6
   },
   "except_intersect_queries.test": {
@@ -315,8 +315,8 @@
     "skipped": 32
   },
   "grouping_sets_queries.test": {
-    "passed": 25,
-    "failed": 64,
+    "passed": 27,
+    "failed": 62,
     "skipped": 18
   },
   "hash.test": {
@@ -330,8 +330,8 @@
     "skipped": 0
   },
   "in_queries.test": {
-    "passed": 86,
-    "failed": 26,
+    "passed": 102,
+    "failed": 10,
     "skipped": 5
   },
   "interval.test": {
@@ -345,13 +345,13 @@
     "skipped": 0
   },
   "join_queries.test": {
-    "passed": 29,
-    "failed": 22,
+    "passed": 30,
+    "failed": 21,
     "skipped": 10
   },
   "json_queries.test": {
-    "passed": 51,
-    "failed": 28,
+    "passed": 55,
+    "failed": 24,
     "skipped": 63
   },
   "limit_queries.test": {
@@ -435,8 +435,8 @@
     "skipped": 0
   },
   "round.test": {
-    "passed": 2,
-    "failed": 11,
+    "passed": 11,
+    "failed": 2,
     "skipped": 0
   },
   "safe_function.test": {
@@ -455,8 +455,8 @@
     "skipped": 0
   },
   "strings.test": {
-    "passed": 85,
-    "failed": 56,
+    "passed": 101,
+    "failed": 40,
     "skipped": 24
   },
   "struct_positional_accessor.test": {
@@ -465,8 +465,8 @@
     "skipped": 12
   },
   "struct_queries.test": {
-    "passed": 17,
-    "failed": 6,
+    "passed": 18,
+    "failed": 5,
     "skipped": 11
   },
   "subquery_expression_queries.test": {

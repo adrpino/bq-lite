@@ -24,7 +24,7 @@ pub(super) fn parse_insert(p: &mut Parser) -> BqResult<InsertStmt> {
     let source = if p.eat_kw("VALUES") {
         let rows = p.parse_comma_list(|p| {
             p.expect(&TokenKind::LParen, "'('")?;
-            let vals = p.parse_comma_list(parse_expr)?;
+            let vals = p.parse_comma_list(parse_dml_value_expr)?;
             p.expect(&TokenKind::RParen, "')'")?;
             Ok(vals)
         })?;
@@ -81,8 +81,15 @@ fn parse_assignment(p: &mut Parser) -> BqResult<UpdateAssignment> {
         path.push(p.parse_ident()?);
     }
     p.expect(&TokenKind::Eq, "'='")?;
-    let value = parse_expr(p)?;
+    let value = parse_dml_value_expr(p)?;
     Ok(UpdateAssignment { path, value })
+}
+
+fn parse_dml_value_expr(p: &mut Parser) -> BqResult<crate::ast::Expr> {
+    if p.eat_kw("DEFAULT") {
+        return Ok(crate::ast::Expr::SystemVar("__bq_default__".to_owned()));
+    }
+    parse_expr(p)
 }
 
 pub(super) fn parse_delete(p: &mut Parser) -> BqResult<DeleteStmt> {

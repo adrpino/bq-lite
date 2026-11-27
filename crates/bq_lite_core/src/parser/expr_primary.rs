@@ -242,10 +242,18 @@ fn parse_extract(p: &mut Parser) -> BqResult<Expr> {
     let part = p.parse_ident()?;
     p.expect_kw("FROM")?;
     let expr = parse_expr(p)?;
+    let time_zone = if p.eat_kw("AT") {
+        p.expect_kw("TIME")?;
+        p.expect_kw("ZONE")?;
+        Some(Box::new(parse_expr(p)?))
+    } else {
+        None
+    };
     p.expect(&TokenKind::RParen, "')'")?;
     Ok(Expr::Extract {
         part,
         expr: Box::new(expr),
+        time_zone,
     })
 }
 

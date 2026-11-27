@@ -196,7 +196,7 @@ fn milestone_k_subqueries_and_coercion() {
     assert_eq!(sub.rows[0][1], BqValue::Bool(true));
     assert_eq!(sub.rows[0][2], BqValue::Bool(false));
     assert_eq!(sub.rows[1][2], BqValue::Bool(true));
-    assert_eq!(sub.rows[0][8], BqValue::String("YWJj".to_owned()));
+    assert_eq!(sub.rows[0][8], BqValue::String("abc".to_owned()));
 
     let z = eng
         .query(

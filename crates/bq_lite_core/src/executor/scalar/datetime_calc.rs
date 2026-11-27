@@ -1,7 +1,40 @@
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
 use crate::error::{BqError, BqResult};
-use crate::types::{BqInterval, BqValue};
+use crate::types::coercion::cast_value;
+use crate::types::{BqInterval, BqType, BqValue};
+
+pub(super) fn coerce_date_arg(val: BqValue) -> BqResult<BqValue> {
+    if matches!(val, BqValue::String(_)) {
+        cast_value(val, &BqType::Date)
+    } else {
+        Ok(val)
+    }
+}
+
+pub(super) fn coerce_datetime_arg(val: BqValue) -> BqResult<BqValue> {
+    if matches!(val, BqValue::String(_)) {
+        cast_value(val, &BqType::Datetime)
+    } else {
+        Ok(val)
+    }
+}
+
+pub(super) fn coerce_timestamp_arg(val: BqValue) -> BqResult<BqValue> {
+    if matches!(val, BqValue::String(_)) {
+        cast_value(val, &BqType::Timestamp)
+    } else {
+        Ok(val)
+    }
+}
+
+pub(super) fn coerce_time_arg(val: BqValue) -> BqResult<BqValue> {
+    if matches!(val, BqValue::String(_)) {
+        cast_value(val, &BqType::Time)
+    } else {
+        Ok(val)
+    }
+}
 
 pub(in crate::executor) fn add_interval_to_date(
     d: NaiveDate,
@@ -28,6 +61,7 @@ pub(super) fn eval_date_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<BqVal
     if d_val.is_null() || iv_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let d_val = coerce_date_arg(d_val)?;
     let (BqValue::Date(d), BqValue::Interval(iv)) = (d_val, iv_val) else {
         return Err(BqError::query("DATE_ADD/SUB expects (DATE, INTERVAL)"));
     };
@@ -41,6 +75,7 @@ pub(super) fn eval_datetime_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<B
     if dt_val.is_null() || iv_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let dt_val = coerce_datetime_arg(dt_val)?;
     let (BqValue::Datetime(dt), BqValue::Interval(iv)) = (dt_val, iv_val) else {
         return Err(BqError::query(
             "DATETIME_ADD/SUB expects (DATETIME, INTERVAL)",
@@ -59,6 +94,7 @@ pub(super) fn eval_timestamp_add_sub(args: Vec<BqValue>, add: bool) -> BqResult<
     if ts_val.is_null() || iv_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let ts_val = coerce_timestamp_arg(ts_val)?;
     let (BqValue::Timestamp(ts), BqValue::Interval(iv)) = (ts_val, iv_val) else {
         return Err(BqError::query(
             "TIMESTAMP_ADD/SUB expects (TIMESTAMP, INTERVAL)",
@@ -77,6 +113,7 @@ pub(super) fn eval_date_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
     if a.is_null() || b.is_null() {
         return Ok(BqValue::Null);
     }
+    let (a, b) = (coerce_date_arg(a)?, coerce_date_arg(b)?);
     let (BqValue::Date(da), BqValue::Date(db), BqValue::String(p)) = (a, b, part) else {
         return Err(BqError::query("DATE_DIFF expects (DATE, DATE, PART)"));
     };
@@ -86,6 +123,11 @@ pub(super) fn eval_date_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
         "MONTH" => i64::from(
             (da.year() - db.year()) * 12
                 + (i32::try_from(da.month()).unwrap_or(0) - i32::try_from(db.month()).unwrap_or(0)),
+        ),
+        "QUARTER" => i64::from(
+            (da.year() - db.year()) * 4
+                + (i32::try_from((da.month() - 1) / 3).unwrap_or(0)
+                    - i32::try_from((db.month() - 1) / 3).unwrap_or(0)),
         ),
         "YEAR" => i64::from(da.year() - db.year()),
         _ => return Err(BqError::query(format!("Unsupported DATE_DIFF part '{p}'"))),
@@ -100,6 +142,7 @@ pub(super) fn eval_datetime_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
     if a.is_null() || b.is_null() {
         return Ok(BqValue::Null);
     }
+    let (a, b) = (coerce_datetime_arg(a)?, coerce_datetime_arg(b)?);
     let (BqValue::Datetime(da), BqValue::Datetime(db), BqValue::String(p)) = (a, b, part) else {
         return Err(BqError::query(
             "DATETIME_DIFF expects (DATETIME, DATETIME, PART)",
@@ -115,6 +158,7 @@ pub(super) fn eval_timestamp_diff(args: Vec<BqValue>) -> BqResult<BqValue> {
     if a.is_null() || b.is_null() {
         return Ok(BqValue::Null);
     }
+    let (a, b) = (coerce_timestamp_arg(a)?, coerce_timestamp_arg(b)?);
     let (BqValue::Timestamp(ta), BqValue::Timestamp(tb), BqValue::String(p)) = (a, b, part) else {
         return Err(BqError::query(
             "TIMESTAMP_DIFF expects (TIMESTAMP, TIMESTAMP, PART)",
@@ -143,11 +187,14 @@ pub(super) fn eval_date_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
     if d_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let d_val = coerce_date_arg(d_val)?;
     let (BqValue::Date(d), BqValue::String(p)) = (d_val, part) else {
         return Err(BqError::query("DATE_TRUNC expects (DATE, PART)"));
     };
     let out = match p.to_ascii_uppercase().as_str() {
         "DAY" => d,
+        "WEEK" => d - Duration::days(i64::from(d.weekday().num_days_from_sunday())),
+        "ISOWEEK" => d - Duration::days(i64::from(d.weekday().num_days_from_monday())),
         "MONTH" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
         "QUARTER" => {
             let q_month = ((d.month() - 1) / 3) * 3 + 1;
@@ -166,6 +213,7 @@ pub(super) fn eval_datetime_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
     if dt_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let dt_val = coerce_datetime_arg(dt_val)?;
     let (BqValue::Datetime(dt), BqValue::String(p)) = (dt_val, part) else {
         return Err(BqError::query("DATETIME_TRUNC expects (DATETIME, PART)"));
     };
@@ -183,6 +231,7 @@ pub(super) fn eval_timestamp_trunc(args: Vec<BqValue>) -> BqResult<BqValue> {
     if ts_val.is_null() {
         return Ok(BqValue::Null);
     }
+    let ts_val = coerce_timestamp_arg(ts_val)?;
     let (BqValue::Timestamp(ts), BqValue::String(p)) = (ts_val, part) else {
         return Err(BqError::query("TIMESTAMP_TRUNC expects (TIMESTAMP, PART)"));
     };
@@ -308,8 +357,9 @@ pub(super) fn eval_last_day(args: &[BqValue]) -> BqResult<BqValue> {
     if first.is_null() {
         return Ok(BqValue::Null);
     }
-    let d = match first {
-        BqValue::Date(d) => *d,
+    let coerced = coerce_date_arg(first.clone())?;
+    let d = match coerced {
+        BqValue::Date(d) => d,
         BqValue::Datetime(dt) => dt.date(),
         _ => return Err(BqError::query("LAST_DAY expects DATE or DATETIME")),
     };
@@ -334,6 +384,7 @@ pub(super) fn eval_generate_date_array(args: Vec<BqValue>) -> BqResult<BqValue> 
     if start_v.is_null() || end_v.is_null() {
         return Ok(BqValue::Null);
     }
+    let (start_v, end_v) = (coerce_date_arg(start_v)?, coerce_date_arg(end_v)?);
     let (BqValue::Date(start), BqValue::Date(end)) = (start_v, end_v) else {
         return Err(BqError::query("GENERATE_DATE_ARRAY expects DATE bounds"));
     };
@@ -342,9 +393,13 @@ pub(super) fn eval_generate_date_array(args: Vec<BqValue>) -> BqResult<BqValue> 
         None => BqInterval::new(0, 1, 0),
         _ => return Err(BqError::query("GENERATE_DATE_ARRAY step must be INTERVAL")),
     };
+    if step.months == 0 && step.days == 0 {
+        return Err(BqError::semantic("GENERATE_DATE_ARRAY step cannot be zero"));
+    }
+    let forward = step.months > 0 || (step.months == 0 && step.days > 0);
     let mut out = Vec::new();
     let mut cur = start;
-    while cur <= end && out.len() < 100_000 {
+    while (if forward { cur <= end } else { cur >= end }) && out.len() < 100_000 {
         out.push(BqValue::Date(cur));
         cur = add_interval_to_date(cur, step, true)?;
     }

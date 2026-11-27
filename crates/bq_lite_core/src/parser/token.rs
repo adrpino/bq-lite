@@ -68,7 +68,6 @@ const RESERVED_KEYWORDS: &[&str] = &[
     "AS",
     "ASC",
     "ASSERT_ROWS_MODIFIED",
-    "AT",
     "BETWEEN",
     "BY",
     "CASE",

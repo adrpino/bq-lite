@@ -3,6 +3,11 @@ use std::cmp::Ordering;
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
 
+use super::bytes_fn::{
+    eval_bytes_concat, eval_bytes_left_right, eval_bytes_pad, eval_bytes_repeat,
+    eval_bytes_replace, eval_bytes_split, eval_bytes_strpos, eval_bytes_substr, eval_bytes_trim,
+    eval_reverse, eval_safe_convert_bytes_to_string,
+};
 use super::string_fmt::{
     eval_format, eval_from_base64, eval_from_hex, eval_to_base64, eval_to_hex,
 };
@@ -51,7 +56,7 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
         "LOWER" => eval_unary_str(args, "LOWER", str::to_lowercase).map(Some),
         "UPPER" => eval_unary_str(args, "UPPER", str::to_uppercase).map(Some),
         "INITCAP" => eval_initcap(args).map(Some),
-        "REVERSE" => eval_unary_str(args, "REVERSE", |s| s.chars().rev().collect()).map(Some),
+        "REVERSE" => eval_reverse(args).map(Some),
         "STRPOS" => eval_strpos(args).map(Some),
         "INSTR" => eval_instr(args).map(Some),
         "SPLIT" => eval_split(args).map(Some),
@@ -79,31 +84,14 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "SAFE_CONVERT_BYTES_TO_STRING accepts BYTES or NULL"
-)]
-fn eval_safe_convert_bytes_to_string(args: &[BqValue]) -> BqResult<BqValue> {
-    let [arg] = args else {
-        return Err(BqError::query(
-            "SAFE_CONVERT_BYTES_TO_STRING expects 1 argument",
-        ));
-    };
-    match arg {
-        BqValue::Null => Ok(BqValue::Null),
-        BqValue::Bytes(b) => Ok(BqValue::String(String::from_utf8_lossy(b).into_owned())),
-        other => Err(BqError::query(format!(
-            "SAFE_CONVERT_BYTES_TO_STRING expects BYTES, got {}",
-            other.infer_type()?
-        ))),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "CONCAT expects STRING or NULL"
+    reason = "CONCAT expects STRING, BYTES, or NULL"
 )]
 fn eval_concat_fn(args: Vec<BqValue>) -> BqResult<BqValue> {
     if args.is_empty() {
         return Err(BqError::query("CONCAT requires at least 1 argument"));
+    }
+    if args.iter().any(|a| matches!(a, BqValue::Bytes(_))) {
+        return eval_bytes_concat(args);
     }
     let mut out = String::new();
     for a in args {
@@ -112,7 +100,7 @@ fn eval_concat_fn(args: Vec<BqValue>) -> BqResult<BqValue> {
             BqValue::String(s) => out.push_str(&s),
             other => {
                 return Err(BqError::query(format!(
-                    "CONCAT expects STRING, got {}",
+                    "CONCAT expects STRING or BYTES, got {}",
                     other.infer_type()?
                 )))
             }
@@ -176,11 +164,14 @@ fn eval_substr(args: Vec<BqValue>) -> BqResult<BqValue> {
     if val.is_null() || pos_v.is_null() || len_v.as_ref().is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
-    let BqValue::String(s) = val else {
-        return Err(BqError::query("SUBSTR expects STRING"));
-    };
     let BqValue::Int64(pos) = pos_v else {
         return Err(BqError::query("SUBSTR position must be INT64"));
+    };
+    if let BqValue::Bytes(b) = val {
+        return eval_bytes_substr(&b, pos, len_v.as_ref());
+    }
+    let BqValue::String(s) = val else {
+        return Err(BqError::query("SUBSTR expects STRING or BYTES"));
     };
     let chars: Vec<char> = s.chars().collect();
     let total = chars.len();
@@ -239,8 +230,11 @@ fn eval_strpos(args: Vec<BqValue>) -> BqResult<BqValue> {
     if hay.is_null() || needle.is_null() {
         return Ok(BqValue::Null);
     }
+    if let (BqValue::Bytes(h), BqValue::Bytes(n)) = (&hay, &needle) {
+        return Ok(eval_bytes_strpos(h, n));
+    }
     let (BqValue::String(h), BqValue::String(n)) = (hay, needle) else {
-        return Err(BqError::query("STRPOS expects STRING arguments"));
+        return Err(BqError::query("STRPOS expects STRING or BYTES arguments"));
     };
     let pos = h.find(&n).map_or(0, |byte_idx| {
         i64::try_from(h.get(..byte_idx).unwrap_or("").chars().count() + 1).unwrap_or(i64::MAX)
@@ -258,8 +252,11 @@ fn eval_split(args: Vec<BqValue>) -> BqResult<BqValue> {
     if s.is_null() || sep.as_ref().is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
+    if let BqValue::Bytes(b) = s {
+        return eval_bytes_split(&b, sep);
+    }
     let BqValue::String(text) = s else {
-        return Err(BqError::query("SPLIT expects STRING"));
+        return Err(BqError::query("SPLIT expects STRING or BYTES"));
     };
     let delim = match sep {
         Some(BqValue::String(d)) => d,
@@ -288,8 +285,11 @@ fn eval_trim(args: Vec<BqValue>, left: bool, right: bool) -> BqResult<BqValue> {
     if val.is_null() || chars_v.as_ref().is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
+    if let BqValue::Bytes(b) = val {
+        return eval_bytes_trim(&b, chars_v, left, right);
+    }
     let BqValue::String(s) = val else {
-        return Err(BqError::query("TRIM expects STRING"));
+        return Err(BqError::query("TRIM expects STRING or BYTES"));
     };
     let out = match chars_v {
         Some(BqValue::String(cset)) => {
@@ -328,11 +328,14 @@ fn eval_pad(args: Vec<BqValue>, left: bool) -> BqResult<BqValue> {
     if v.is_null() || len_v.is_null() || pad_v.as_ref().is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
-    let BqValue::String(s) = v else {
-        return Err(BqError::query("LPAD/RPAD expects STRING"));
-    };
     let BqValue::Int64(target) = len_v else {
         return Err(BqError::query("LPAD/RPAD length must be INT64"));
+    };
+    if let BqValue::Bytes(b) = v {
+        return eval_bytes_pad(&b, target, pad_v, left);
+    }
+    let BqValue::String(s) = v else {
+        return Err(BqError::query("LPAD/RPAD expects STRING or BYTES"));
     };
     if target < 0 {
         return Err(BqError::semantic("LPAD/RPAD length cannot be negative"));
@@ -368,8 +371,11 @@ fn eval_replace(args: Vec<BqValue>) -> BqResult<BqValue> {
     if s.is_null() || from.is_null() || to.is_null() {
         return Ok(BqValue::Null);
     }
+    if let (BqValue::Bytes(sb), BqValue::Bytes(fb), BqValue::Bytes(tb)) = (&s, &from, &to) {
+        return Ok(eval_bytes_replace(sb, fb, tb));
+    }
     let (BqValue::String(s), BqValue::String(f), BqValue::String(t)) = (s, from, to) else {
-        return Err(BqError::query("REPLACE expects STRING arguments"));
+        return Err(BqError::query("REPLACE expects STRING or BYTES arguments"));
     };
     Ok(BqValue::String(s.replace(&f, &t)))
 }
@@ -406,8 +412,11 @@ fn eval_repeat(args: Vec<BqValue>) -> BqResult<BqValue> {
     if s.is_null() || n.is_null() {
         return Ok(BqValue::Null);
     }
+    if let (BqValue::Bytes(b), BqValue::Int64(cnt)) = (&s, &n) {
+        return eval_bytes_repeat(b, *cnt);
+    }
     let (BqValue::String(text), BqValue::Int64(cnt)) = (s, n) else {
-        return Err(BqError::query("REPEAT expects (STRING, INT64)"));
+        return Err(BqError::query("REPEAT expects (STRING|BYTES, INT64)"));
     };
     if cnt < 0 {
         return Err(BqError::semantic("REPEAT count cannot be negative"));
@@ -423,8 +432,11 @@ fn eval_left_right(args: Vec<BqValue>, is_left: bool) -> BqResult<BqValue> {
     if s.is_null() || n.is_null() {
         return Ok(BqValue::Null);
     }
+    if let (BqValue::Bytes(b), BqValue::Int64(cnt)) = (&s, &n) {
+        return eval_bytes_left_right(b, *cnt, is_left);
+    }
     let (BqValue::String(text), BqValue::Int64(cnt)) = (s, n) else {
-        return Err(BqError::query("LEFT/RIGHT expects (STRING, INT64)"));
+        return Err(BqError::query("LEFT/RIGHT expects (STRING|BYTES, INT64)"));
     };
     if cnt < 0 {
         return Err(BqError::semantic("LEFT/RIGHT length cannot be negative"));
@@ -447,8 +459,17 @@ fn eval_starts_ends(args: Vec<BqValue>, starts: bool) -> BqResult<BqValue> {
     if s.is_null() || pat.is_null() {
         return Ok(BqValue::Null);
     }
+    if let (BqValue::Bytes(tb), BqValue::Bytes(pb)) = (&s, &pat) {
+        return Ok(BqValue::Bool(if starts {
+            tb.starts_with(pb)
+        } else {
+            tb.ends_with(pb)
+        }));
+    }
     let (BqValue::String(text), BqValue::String(p)) = (s, pat) else {
-        return Err(BqError::query("STARTS_WITH/ENDS_WITH expects STRING"));
+        return Err(BqError::query(
+            "STARTS_WITH/ENDS_WITH expects STRING or BYTES",
+        ));
     };
     Ok(BqValue::Bool(if starts {
         text.starts_with(&p)

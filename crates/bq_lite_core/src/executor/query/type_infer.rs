@@ -265,6 +265,53 @@ fn infer_fn_type(call: &crate::ast::FunctionCall, row: &EvalRow, ctx: &ExecConte
 }
 
 fn infer_fixed_fn_type(upper: &str) -> Option<BqType> {
+    if let Some(ty) = infer_fixed_scalar_type(upper) {
+        return Some(ty);
+    }
+    match upper {
+        "DATE"
+        | "CURRENT_DATE"
+        | "DATE_ADD"
+        | "DATE_SUB"
+        | "DATE_TRUNC"
+        | "DATE_BUCKET"
+        | "LAST_DAY"
+        | "PARSE_DATE"
+        | "DATE_FROM_UNIX_DATE" => Some(BqType::Date),
+        "DATETIME" | "CURRENT_DATETIME" | "DATETIME_ADD" | "DATETIME_SUB" | "DATETIME_TRUNC"
+        | "DATETIME_BUCKET" | "PARSE_DATETIME" => Some(BqType::Datetime),
+        "TIME" | "CURRENT_TIME" | "TIME_ADD" | "TIME_SUB" | "TIME_TRUNC" | "PARSE_TIME" => {
+            Some(BqType::Time)
+        }
+        "TIMESTAMP" | "CURRENT_TIMESTAMP" | "TIMESTAMP_ADD" | "TIMESTAMP_SUB"
+        | "TIMESTAMP_TRUNC" | "TIMESTAMP_BUCKET" | "PARSE_TIMESTAMP" | "TIMESTAMP_SECONDS"
+        | "TIMESTAMP_MILLIS" | "TIMESTAMP_MICROS" => Some(BqType::Timestamp),
+        "MAKE_INTERVAL" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL" => {
+            Some(BqType::Interval)
+        }
+        "MD5"
+        | "SHA1"
+        | "SHA256"
+        | "SHA512"
+        | "FROM_BASE64"
+        | "FROM_HEX"
+        | "CODE_POINTS_TO_BYTES"
+        | "NET.IP_FROM_STRING"
+        | "NET.SAFE_IP_FROM_STRING" => Some(BqType::Bytes),
+        "PARSE_JSON" | "TO_JSON" | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_SET" | "JSON_REMOVE" => {
+            Some(BqType::Json)
+        }
+        "ST_GEOGPOINT" | "ST_GEOGFROMTEXT" => Some(BqType::Geography),
+        "JSON_KEYS" | "JSON_VALUE_ARRAY" | "JSON_EXTRACT_STRING_ARRAY" | "REGEXP_EXTRACT_ALL" => {
+            BqType::array(BqType::String).ok()
+        }
+        "TO_CODE_POINTS" => BqType::array(BqType::Int64).ok(),
+        "GENERATE_DATE_ARRAY" => BqType::array(BqType::Date).ok(),
+        _ => None,
+    }
+}
+
+fn infer_fixed_scalar_type(upper: &str) -> Option<BqType> {
     match upper {
         "COUNT"
         | "COUNTIF"
@@ -280,6 +327,9 @@ fn infer_fixed_fn_type(upper: &str) -> Option<BqType> {
         | "LENGTH"
         | "CHAR_LENGTH"
         | "BYTE_LENGTH"
+        | "OCTET_LENGTH"
+        | "ASCII"
+        | "UNICODE"
         | "STRPOS"
         | "INSTR"
         | "REGEXP_INSTR"
@@ -306,38 +356,6 @@ fn infer_fixed_fn_type(upper: &str) -> Option<BqType> {
         | "RANGE_CONTAINS" | "RANGE_OVERLAPS" | "ST_CONTAINS" | "ST_WITHIN" | "SEARCH" | "BOOL" => {
             Some(BqType::Bool)
         }
-        "DATE"
-        | "CURRENT_DATE"
-        | "DATE_ADD"
-        | "DATE_SUB"
-        | "DATE_TRUNC"
-        | "LAST_DAY"
-        | "PARSE_DATE"
-        | "DATE_FROM_UNIX_DATE" => Some(BqType::Date),
-        "DATETIME" | "CURRENT_DATETIME" | "DATETIME_ADD" | "DATETIME_SUB" | "DATETIME_TRUNC"
-        | "PARSE_DATETIME" => Some(BqType::Datetime),
-        "TIME" | "CURRENT_TIME" | "TIME_ADD" | "TIME_SUB" | "TIME_TRUNC" | "PARSE_TIME" => {
-            Some(BqType::Time)
-        }
-        "TIMESTAMP" | "CURRENT_TIMESTAMP" | "TIMESTAMP_ADD" | "TIMESTAMP_SUB"
-        | "TIMESTAMP_TRUNC" | "PARSE_TIMESTAMP" | "TIMESTAMP_SECONDS" | "TIMESTAMP_MILLIS"
-        | "TIMESTAMP_MICROS" => Some(BqType::Timestamp),
-        "MD5"
-        | "SHA1"
-        | "SHA256"
-        | "SHA512"
-        | "FROM_BASE64"
-        | "FROM_HEX"
-        | "NET.IP_FROM_STRING"
-        | "NET.SAFE_IP_FROM_STRING" => Some(BqType::Bytes),
-        "PARSE_JSON" | "TO_JSON" | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_SET" | "JSON_REMOVE" => {
-            Some(BqType::Json)
-        }
-        "ST_GEOGPOINT" | "ST_GEOGFROMTEXT" => Some(BqType::Geography),
-        "JSON_KEYS" | "JSON_VALUE_ARRAY" | "JSON_EXTRACT_STRING_ARRAY" | "REGEXP_EXTRACT_ALL" => {
-            BqType::array(BqType::String).ok()
-        }
-        "GENERATE_DATE_ARRAY" => BqType::array(BqType::Date).ok(),
         _ => None,
     }
 }

@@ -38,13 +38,43 @@ pub(super) fn eval_in_expr(
         InTarget::Subquery(q) => {
             let sub_ctx = ctx.with_outer(row);
             let res = execute_query(q, &sub_ctx)?;
-            if res.columns.len() != 1 {
-                return Err(BqError::query("IN subquery must return exactly 1 column"));
+            if let BqValue::Struct(ref fields) = lhs {
+                if res.columns.len() == fields.len() && res.columns.len() > 1 {
+                    res.rows
+                        .into_iter()
+                        .map(|r| {
+                            BqValue::Struct(
+                                r.into_iter()
+                                    .zip(res.columns.iter())
+                                    .map(|(v, c)| crate::types::BqStructFieldValue {
+                                        name: Some(c.name.clone()),
+                                        value: v,
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                } else if res.columns.len() == 1 {
+                    res.rows
+                        .into_iter()
+                        .filter_map(|r| r.into_iter().next())
+                        .collect()
+                } else {
+                    return Err(BqError::query(format!(
+                        "IN subquery column count mismatch: expected {}, got {}",
+                        fields.len(),
+                        res.columns.len()
+                    )));
+                }
+            } else {
+                if res.columns.len() != 1 {
+                    return Err(BqError::query("IN subquery must return exactly 1 column"));
+                }
+                res.rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .collect()
             }
-            res.rows
-                .into_iter()
-                .filter_map(|r| r.into_iter().next())
-                .collect()
         }
     };
     eval_in_values(&lhs, negated, &candidates)
@@ -147,19 +177,27 @@ pub(super) fn eval_subscript_values(
 pub(super) fn eval_extract(
     part: &str,
     expr: &Expr,
+    time_zone: Option<&Expr>,
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let val = eval_expr(expr, row, ctx)?;
-    eval_extract_value(part, val)
+    let tz_val = time_zone
+        .map(|tz_e| eval_expr(tz_e, row, ctx))
+        .transpose()?;
+    eval_extract_value(part, val, tz_val.as_ref())
 }
 
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "EXTRACT supports Date, Datetime, Time, and Timestamp variants"
 )]
-pub(super) fn eval_extract_value(part: &str, val: BqValue) -> BqResult<BqValue> {
-    if val.is_null() {
+pub(super) fn eval_extract_value(
+    part: &str,
+    val: BqValue,
+    tz_val: Option<&BqValue>,
+) -> BqResult<BqValue> {
+    if val.is_null() || tz_val.is_some_and(BqValue::is_null) {
         return Ok(BqValue::Null);
     }
     let upper = part.to_ascii_uppercase();
@@ -167,7 +205,20 @@ pub(super) fn eval_extract_value(part: &str, val: BqValue) -> BqResult<BqValue> 
         BqValue::Date(d) => extract_date_part(&upper, part, d),
         BqValue::Datetime(dt) => extract_datetime_part(&upper, part, dt, false),
         BqValue::Time(t) => extract_time_part(&upper, part, t),
-        BqValue::Timestamp(ts) => extract_datetime_part(&upper, part, ts.naive_utc(), true),
+        BqValue::Timestamp(ts) => {
+            let local_dt = match tz_val {
+                None => ts.naive_utc(),
+                Some(BqValue::String(tz_s)) => {
+                    crate::executor::scalar::timestamp_to_tz_naive(ts, tz_s)?
+                }
+                Some(_) => {
+                    return Err(BqError::query(
+                        "EXTRACT AT TIME ZONE expects STRING timezone",
+                    ))
+                }
+            };
+            extract_datetime_part(&upper, part, local_dt, true)
+        }
         other => Err(BqError::query(format!(
             "EXTRACT not supported for {}",
             other.infer_type()?

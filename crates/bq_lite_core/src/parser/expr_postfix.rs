@@ -1,6 +1,6 @@
 use crate::ast::{
     ArrayAccessKind, Expr, FunctionArg, FunctionCall, HavingKind, Ident, NullHandling, ObjectName,
-    OrderByExpr, WindowFrame, WindowFrameBound, WindowFrameUnit, WindowSpec,
+    OrderByExpr, StructFieldExpr, WindowFrame, WindowFrameBound, WindowFrameUnit, WindowSpec,
 };
 use crate::error::{BqError, BqResult};
 
@@ -110,6 +110,7 @@ pub(super) fn parse_function_call(
         p.parse_comma_list(parse_function_arg)?
     };
     let null_handling = parse_null_handling(p)?;
+    let mut having = parse_agg_having(p)?;
     let order_by = if p.eat_kw("ORDER") {
         p.expect_kw("BY")?;
         p.parse_comma_list(parse_order_by_expr)?
@@ -121,7 +122,9 @@ pub(super) fn parse_function_call(
     } else {
         None
     };
-    let having = parse_agg_having(p)?;
+    if having.is_none() {
+        having = parse_agg_having(p)?;
+    }
     p.expect(&TokenKind::RParen, "')'")?;
     let null_handling = if null_handling.is_none() {
         parse_null_handling(p)?
@@ -203,15 +206,27 @@ pub(super) fn parse_paren_or_lambda(p: &mut Parser) -> BqResult<Expr> {
     }
     let first = parse_expr(p)?;
     if p.eat(&TokenKind::Comma) {
-        let mut params = vec![expr_to_ident(first, p)?];
-        let rest = p.parse_comma_list(Parser::parse_ident)?;
-        params.extend(rest);
+        let mut items = vec![first];
+        items.extend(p.parse_comma_list(parse_expr)?);
         p.expect(&TokenKind::RParen, "')'")?;
-        p.expect(&TokenKind::Arrow, "'->'")?;
-        let body = parse_expr(p)?;
-        return Ok(Expr::Lambda {
-            params,
-            body: Box::new(body),
+        if p.eat(&TokenKind::Arrow) {
+            let params = items
+                .into_iter()
+                .map(|e| expr_to_ident(e, p))
+                .collect::<BqResult<Vec<_>>>()?;
+            let body = parse_expr(p)?;
+            return Ok(Expr::Lambda {
+                params,
+                body: Box::new(body),
+            });
+        }
+        let fields = items
+            .into_iter()
+            .map(|expr| StructFieldExpr { name: None, expr })
+            .collect();
+        return Ok(Expr::StructLiteral {
+            explicit_type: None,
+            fields,
         });
     }
     p.expect(&TokenKind::RParen, "')'")?;

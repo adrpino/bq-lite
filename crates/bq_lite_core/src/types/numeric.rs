@@ -96,7 +96,7 @@ impl BqNumeric {
         Self::from_scaled(raw)
     }
 
-    pub fn round_or_trunc(self, digits: i32, trunc: bool) -> BqResult<Self> {
+    pub fn round_or_trunc(self, digits: i32, trunc: bool, half_even: bool) -> BqResult<Self> {
         let scale = i32::try_from(NUMERIC_SCALE).unwrap_or(9);
         if digits >= scale {
             return Ok(self);
@@ -106,7 +106,7 @@ impl BqNumeric {
             return Ok(Self::ZERO);
         }
         let unit = pow10(shift);
-        let scaled = round_or_trunc_bigint(&BigInt::from(self.0), &unit, trunc);
+        let scaled = round_or_trunc_bigint(&BigInt::from(self.0), &unit, trunc, half_even);
         let raw = i128::try_from(scaled)
             .map_err(|_| BqError::semantic("NUMERIC overflow in ROUND/TRUNC"))?;
         Self::from_scaled(raw)
@@ -206,7 +206,7 @@ impl BqBigNumeric {
         Self::from_scaled(scaled)
     }
 
-    pub fn round_or_trunc(&self, digits: i32, trunc: bool) -> BqResult<Self> {
+    pub fn round_or_trunc(&self, digits: i32, trunc: bool, half_even: bool) -> BqResult<Self> {
         let scale = i32::try_from(BIGNUMERIC_SCALE).unwrap_or(38);
         if digits >= scale {
             return Ok(self.clone());
@@ -216,7 +216,7 @@ impl BqBigNumeric {
             return Ok(Self::zero());
         }
         let unit = pow10(shift);
-        let scaled = round_or_trunc_bigint(&self.0, &unit, trunc);
+        let scaled = round_or_trunc_bigint(&self.0, &unit, trunc, half_even);
         Self::from_scaled(scaled)
     }
 }
@@ -240,11 +240,33 @@ fn pow10(exp: usize) -> BigInt {
     BigInt::from(10_u8).pow(u32::try_from(exp).unwrap_or(u32::MAX))
 }
 
-fn round_or_trunc_bigint(val: &BigInt, unit: &BigInt, trunc: bool) -> BigInt {
+fn round_or_trunc_bigint(val: &BigInt, unit: &BigInt, trunc: bool, half_even: bool) -> BigInt {
     if trunc {
         (val / unit) * unit
+    } else if half_even {
+        div_round_half_even(val, unit) * unit
     } else {
         div_round_half_away(val, unit) * unit
+    }
+}
+
+fn div_round_half_even(num: &BigInt, den: &BigInt) -> BigInt {
+    let sign = if num.is_negative() ^ den.is_negative() {
+        -1_i8
+    } else {
+        1_i8
+    };
+    let abs_num = num.abs();
+    let abs_den = den.abs();
+    let (mut q, r) = abs_num.div_rem(&abs_den);
+    let twice = &r * 2_u8;
+    if twice > abs_den || (twice == abs_den && (&q % 2_u8) != BigInt::zero()) {
+        q += 1_u8;
+    }
+    if sign < 0 {
+        -q
+    } else {
+        q
     }
 }
 

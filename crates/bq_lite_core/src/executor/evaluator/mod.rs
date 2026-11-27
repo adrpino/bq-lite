@@ -11,7 +11,7 @@ use crate::types::coercion::cast_value;
 use crate::types::BqValue;
 
 use calls::{eval_array_literal, eval_function_expr, eval_struct_literal};
-pub(super) use calls::{infer_expr_col_name, lookup_udf_return_type};
+pub(super) use calls::{infer_expr_col_name, is_date_part_arg_pos, lookup_udf_return_type};
 pub(super) use ops::{
     combine_logical, compare_values, eval_binary, eval_is_test, eval_unary, to_opt_bool,
     values_distinct_eq, values_equal,
@@ -28,8 +28,12 @@ pub(super) fn eval_subscript_values(
     subquery::eval_subscript_values(base, kind, idx_val)
 }
 
-pub(super) fn eval_extract_value(part: &str, val: BqValue) -> BqResult<BqValue> {
-    subquery::eval_extract_value(part, val)
+pub(super) fn eval_extract_value(
+    part: &str,
+    val: BqValue,
+    tz_val: Option<&BqValue>,
+) -> BqResult<BqValue> {
+    subquery::eval_extract_value(part, val, tz_val)
 }
 
 pub(super) fn eval_in_values(
@@ -91,14 +95,28 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
         Expr::FieldAccess { expr, field } => {
             access_struct_field(&eval_expr(expr, row, ctx)?, &field.value)
         }
-        Expr::Extract { part, expr } => eval_extract(&part.value, expr, row, ctx),
+        Expr::Extract {
+            part,
+            expr,
+            time_zone,
+        } => eval_extract(&part.value, expr, time_zone.as_deref(), row, ctx),
         Expr::Exists(q) => {
             let res = execute_query(q, &ctx.with_outer(row))?;
             Ok(BqValue::Bool(!res.rows.is_empty()))
         }
         Expr::Subquery(q) => eval_scalar_subquery(q, row, ctx),
         Expr::ArraySubquery(q) => eval_array_subquery(q, row, ctx),
-        Expr::Interval { value, unit, .. } => eval_interval_expr(value, &unit.value, row, ctx),
+        Expr::Interval {
+            value,
+            unit,
+            end_unit,
+        } => eval_interval_expr(
+            value,
+            &unit.value,
+            end_unit.as_ref().map(|e| e.value.as_str()),
+            row,
+            ctx,
+        ),
         Expr::RangeLiteral {
             elem_type,
             start,
@@ -217,6 +235,7 @@ fn eval_param_or_sysvar(expr: &Expr, ctx: &ExecContext<'_>) -> BqResult<BqValue>
 fn eval_interval_expr(
     value: &Expr,
     unit: &str,
+    end_unit: Option<&str>,
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
@@ -224,27 +243,14 @@ fn eval_interval_expr(
     if val.is_null() {
         return Ok(BqValue::Null);
     }
+    if let BqValue::String(s) = val {
+        let iv = crate::executor::scalar::parse_compound_interval(&s, unit, end_unit)?;
+        return Ok(BqValue::Interval(iv));
+    }
     let BqValue::Int64(n) = val else {
-        return Err(BqError::query("INTERVAL quantity must be INT64"));
+        return Err(BqError::query("INTERVAL quantity must be INT64 or STRING"));
     };
-    let n32 = i32::try_from(n).map_err(|_| BqError::semantic("INTERVAL quantity out of range"))?;
-    let iv = match unit.to_ascii_uppercase().as_str() {
-        "YEAR" => crate::types::BqInterval::new(n32.saturating_mul(12), 0, 0),
-        "QUARTER" => crate::types::BqInterval::new(n32.saturating_mul(3), 0, 0),
-        "MONTH" => crate::types::BqInterval::new(n32, 0, 0),
-        "WEEK" => crate::types::BqInterval::new(0, n32.saturating_mul(7), 0),
-        "DAY" => crate::types::BqInterval::new(0, n32, 0),
-        "HOUR" => crate::types::BqInterval::new(0, 0, n.saturating_mul(3_600_000_000)),
-        "MINUTE" => crate::types::BqInterval::new(0, 0, n.saturating_mul(60_000_000)),
-        "SECOND" => crate::types::BqInterval::new(0, 0, n.saturating_mul(1_000_000)),
-        "MILLISECOND" => crate::types::BqInterval::new(0, 0, n.saturating_mul(1_000)),
-        "MICROSECOND" => crate::types::BqInterval::new(0, 0, n),
-        _ => {
-            return Err(BqError::query(format!(
-                "Unsupported INTERVAL unit '{unit}'"
-            )))
-        }
-    };
+    let iv = crate::executor::scalar::single_unit_interval(n, &unit.to_ascii_uppercase())?;
     Ok(BqValue::Interval(iv))
 }
 

@@ -17,6 +17,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `ARRAY_SLICE` | `implemented` | Slices `[start, end]` inclusive |
 | `ARRAY_TO_STRING` | `implemented` | Joins array elements |
 | `ARRAY_TRANSFORM` | `implemented` | Maps array elements via lambda |
+| `ASCII` | `implemented` | ASCII code of first byte |
 | `BOOL` | `implemented` | Extracts `BOOL` from `JSON` |
 | `BYTE_LENGTH` | `implemented` | UTF-8 byte count |
 | `CBRT` | `implemented` | Cube root |
@@ -24,19 +25,23 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `CEILING` | `implemented` | Alias for `CEIL` |
 | `CHAR_LENGTH` | `implemented` | Character count |
 | `COALESCE` | `implemented` | First non-`NULL` argument |
-| `CONCAT` | `implemented` | String concatenation |
+| `CODE_POINTS_TO_BYTES` | `implemented` | Converts `ARRAY<INT64>` byte code points to `BYTES` |
+| `CODE_POINTS_TO_STRING` | `implemented` | Converts `ARRAY<INT64>` Unicode code points to `STRING` |
+| `CONCAT` | `implemented` | `STRING` or `BYTES` concatenation |
 | `CURRENT_DATE` | `implemented` | Current date (optional timezone) |
 | `CURRENT_DATETIME` | `implemented` | Current UTC datetime |
 | `CURRENT_TIME` | `implemented` | Current UTC time |
 | `CURRENT_TIMESTAMP` | `implemented` | Current UTC timestamp |
 | `DATE` | `implemented` | `DATE` constructor |
 | `DATE_ADD` | `implemented` | Adds `INTERVAL` to `DATE` |
+| `DATE_BUCKET` | `implemented` | Buckets `DATE` by `INTERVAL` width |
 | `DATE_DIFF` | `implemented` | Difference between `DATE`s |
 | `DATE_FROM_UNIX_DATE` | `implemented` | Epoch days to `DATE` |
 | `DATE_SUB` | `implemented` | Subtracts `INTERVAL` from `DATE` |
 | `DATE_TRUNC` | `implemented` | Truncates `DATE` to part |
 | `DATETIME` | `implemented` | `DATETIME` constructor |
 | `DATETIME_ADD` | `implemented` | Adds `INTERVAL` to `DATETIME` |
+| `DATETIME_BUCKET` | `implemented` | Buckets `DATETIME` by `INTERVAL` width |
 | `DATETIME_DIFF` | `implemented` | Difference between `DATETIME`s |
 | `DATETIME_SUB` | `implemented` | Subtracts `INTERVAL` from `DATETIME` |
 | `DATETIME_TRUNC` | `implemented` | Truncates `DATETIME` to part |
@@ -78,16 +83,20 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `JSON_TYPE` | `implemented` | JSON value type name |
 | `JSON_VALUE` | `implemented` | JSON scalar extraction |
 | `JSON_VALUE_ARRAY` | `implemented` | JSON scalar array extraction |
+| `JUSTIFY_DAYS` | `implemented` | Normalizes 30-day chunks into months |
+| `JUSTIFY_HOURS` | `implemented` | Normalizes 24-hour chunks into days |
+| `JUSTIFY_INTERVAL` | `implemented` | Normalizes hours, days, and months |
 | `LAST_DAY` | `implemented` | Last day of month |
 | `LEAST` | `implemented` | Minimum of arguments |
-| `LEFT` | `implemented` | Left prefix characters |
-| `LENGTH` | `implemented` | Character length |
+| `LEFT` | `implemented` | Left prefix characters or bytes |
+| `LENGTH` | `implemented` | Character or byte length |
 | `LN` | `implemented` | Natural logarithm |
 | `LOG` | `implemented` | Logarithm |
 | `LOG10` | `implemented` | Base-10 logarithm |
 | `LOWER` | `implemented` | Lowercase |
-| `LPAD` | `implemented` | Left pad |
-| `LTRIM` | `implemented` | Left trim |
+| `LPAD` | `implemented` | Left pad (`STRING` or `BYTES`) |
+| `LTRIM` | `implemented` | Left trim (`STRING` or `BYTES`) |
+| `MAKE_INTERVAL` | `implemented` | Constructs `INTERVAL` from date/time components |
 | `MD5` | `implemented` | MD5 digest (`BYTES`) |
 | `MOD` | `implemented` | Integer modulo |
 | `NET.HOST` | `implemented` | Extracts host from URL |
@@ -97,6 +106,7 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `NET.REG_DOMAIN` | `implemented` | Extracts registrable domain |
 | `NET.SAFE_IP_FROM_STRING` | `implemented` | Null-safe IP string parser |
 | `NULLIF` | `implemented` | Returns `NULL` if equal |
+| `OCTET_LENGTH` | `implemented` | Byte length of `STRING` or `BYTES` |
 | `PARSE_DATE` | `implemented` | Parses `DATE` |
 | `PARSE_DATETIME` | `implemented` | Parses `DATETIME` |
 | `PARSE_JSON` | `implemented` | Parses JSON string |
@@ -151,8 +161,13 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `SUBSTR` | `implemented` | Substring |
 | `SUBSTRING` | `implemented` | Alias for `SUBSTR` |
 | `TIME` | `implemented` | `TIME` constructor |
+| `TIME_ADD` | `implemented` | Adds `INTERVAL` to `TIME` |
+| `TIME_DIFF` | `implemented` | Difference between `TIME`s |
+| `TIME_SUB` | `implemented` | Subtracts `INTERVAL` from `TIME` |
+| `TIME_TRUNC` | `implemented` | Truncates `TIME` to part |
 | `TIMESTAMP` | `implemented` | `TIMESTAMP` constructor |
 | `TIMESTAMP_ADD` | `implemented` | Adds `INTERVAL` to `TIMESTAMP` |
+| `TIMESTAMP_BUCKET` | `implemented` | Buckets `TIMESTAMP` by `INTERVAL` width |
 | `TIMESTAMP_DIFF` | `implemented` | Difference between `TIMESTAMP`s |
 | `TIMESTAMP_MICROS` | `implemented` | Microseconds since epoch |
 | `TIMESTAMP_MILLIS` | `implemented` | Milliseconds since epoch |
@@ -160,12 +175,14 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `TIMESTAMP_SUB` | `implemented` | Subtracts `INTERVAL` from `TIMESTAMP` |
 | `TIMESTAMP_TRUNC` | `implemented` | Truncates `TIMESTAMP` to part |
 | `TO_BASE64` | `implemented` | Encodes `BYTES` as base64 |
+| `TO_CODE_POINTS` | `implemented` | Converts `STRING`/`BYTES` to `ARRAY<INT64>` code points |
 | `TO_HEX` | `implemented` | Encodes `BYTES` as hex |
 | `TO_JSON` | `implemented` | Converts value to `JSON` |
-| `TO_JSON_STRING` | `implemented` | Converts value to JSON string |
+| `TO_JSON_STRING` | `implemented` | Converts value to JSON string (preserves `STRUCT` field order) |
 | `TRANSLATE` | `implemented` | Character translation |
 | `TRIM` | `implemented` | Whitespace/char trim |
-| `TRUNC` | `implemented` | Truncates float |
+| `TRUNC` | `implemented` | Truncates float/numeric |
+| `UNICODE` | `implemented` | Unicode code point of first character |
 | `UNIX_DATE` | `implemented` | Days since 1970-01-01 |
 | `UNIX_MICROS` | `implemented` | Epoch microseconds |
 | `UNIX_MILLIS` | `implemented` | Epoch milliseconds |

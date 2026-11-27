@@ -36,31 +36,38 @@ fn compare_key_slices(
         let vb = kb.get(idx).unwrap_or(&BqValue::Null);
         let asc = ob.asc.unwrap_or(true);
         let nulls_first = ob.nulls_first.unwrap_or(asc);
-        let ord =
-            match (va.is_null(), vb.is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
+        let ord = match (va.is_null(), vb.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
                 }
-                (false, true) => {
-                    if nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
+            }
+            (false, true) => {
+                if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
                 }
-                (false, false) => compare_values(va, vb)?.map_or(Ordering::Equal, |o| {
-                    if asc {
-                        o
-                    } else {
-                        o.reverse()
-                    }
-                }),
-            };
+            }
+            (false, false) => {
+                let a_nan = matches!(va, BqValue::Float64(f) if f.is_nan());
+                let b_nan = matches!(vb, BqValue::Float64(f) if f.is_nan());
+                let raw = match (a_nan, b_nan) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => compare_values(va, vb)?.unwrap_or(Ordering::Equal),
+                };
+                if asc {
+                    raw
+                } else {
+                    raw.reverse()
+                }
+            }
+        };
         if ord != Ordering::Equal {
             return Ok(ord);
         }

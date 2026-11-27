@@ -61,7 +61,10 @@ fn exec_insert(
                 for row_e in rows_expr {
                     let row_values = row_e
                         .iter()
-                        .map(|e| eval_expr(e, &empty, &ctx))
+                        .enumerate()
+                        .map(|(col_pos, e)| {
+                            eval_insert_val(&meta, &stmt.columns, col_pos, e, &empty, &ctx)
+                        })
                         .collect::<BqResult<Vec<_>>>()?;
                     out.push(row_values);
                 }
@@ -86,6 +89,59 @@ fn exec_insert(
             build_returning_result(&meta, None, prepared, returning, &ctx)
         },
     )
+}
+
+fn is_default_sentinel(expr: &crate::ast::Expr) -> bool {
+    matches!(expr, crate::ast::Expr::SystemVar(s) if s == "__bq_default__")
+}
+
+fn eval_insert_val(
+    meta: &TableMeta,
+    target_cols: &[Ident],
+    col_pos: usize,
+    expr: &crate::ast::Expr,
+    empty: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    if !is_default_sentinel(expr) {
+        return eval_expr(expr, empty, ctx);
+    }
+    let col = if target_cols.is_empty() {
+        meta.columns.get(col_pos)
+    } else {
+        target_cols
+            .get(col_pos)
+            .and_then(|id| meta.column_index(&id.value))
+            .and_then(|idx| meta.columns.get(idx))
+    };
+    col.and_then(|c| c.default_expr.as_ref())
+        .map_or(Ok(BqValue::Null), |def| eval_expr(def, empty, ctx))
+}
+
+fn eval_update_val(
+    meta: &TableMeta,
+    path: &[Ident],
+    expr: &crate::ast::Expr,
+    eval_row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    if !is_default_sentinel(expr) {
+        return eval_expr(expr, eval_row, ctx);
+    }
+    let col_ident = path.first().and_then(|first| {
+        if meta.column_index(&first.value).is_some() {
+            Some(first)
+        } else {
+            path.get(1)
+        }
+    });
+    let col = col_ident
+        .and_then(|id| meta.column_index(&id.value))
+        .and_then(|idx| meta.columns.get(idx));
+    col.and_then(|c| c.default_expr.as_ref())
+        .map_or(Ok(BqValue::Null), |def| {
+            eval_expr(def, &EvalRow::default(), ctx)
+        })
 }
 
 pub(super) fn finalize_new_row(
@@ -191,7 +247,7 @@ fn exec_update(
             if let Some(eval_row) = matched_eval {
                 let mut updated = row;
                 for assign in &stmt.assignments {
-                    let val = eval_expr(&assign.value, &eval_row, &ctx)?;
+                    let val = eval_update_val(&meta, &assign.path, &assign.value, &eval_row, &ctx)?;
                     apply_assignment(&meta, &mut updated, &assign.path, val)?;
                 }
                 returned_rows.push(updated.clone());

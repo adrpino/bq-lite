@@ -3,7 +3,10 @@ use serde_json::{Map, Value as JsonValue};
 use crate::error::{BqError, BqResult};
 use crate::types::BqValue;
 
-use super::json_path::{remove_json_path, resolve_json_path, set_json_path};
+use super::json_path::{
+    format_datetime_iso, format_timestamp_rfc3339, remove_json_path, resolve_json_path,
+    set_json_path, write_bq_json_string,
+};
 
 pub(super) const JSON_FUNCTIONS: &[&str] = &[
     "BOOL",
@@ -83,14 +86,9 @@ fn eval_to_json_string(args: &[BqValue]) -> BqResult<BqValue> {
         return Err(BqError::query("TO_JSON_STRING expects 1 or 2 arguments"));
     };
     let pretty = matches!(args.get(1), Some(BqValue::Bool(true)));
-    let j = bq_to_json(first);
-    let s = if pretty {
-        serde_json::to_string_pretty(&j)
-    } else {
-        serde_json::to_string(&j)
-    }
-    .map_err(|e| BqError::internal(format!("JSON serialization failed: {e}")))?;
-    Ok(BqValue::String(s))
+    let mut out = String::new();
+    write_bq_json_string(first, pretty, 0, &mut out, &bq_to_json)?;
+    Ok(BqValue::String(out))
 }
 
 #[expect(
@@ -106,6 +104,8 @@ fn bq_to_json(val: &BqValue) -> JsonValue {
             serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
         }
         BqValue::String(s) | BqValue::Geography(s) => JsonValue::String(s.clone()),
+        BqValue::Timestamp(ts) => JsonValue::String(format_timestamp_rfc3339(*ts)),
+        BqValue::Datetime(dt) => JsonValue::String(format_datetime_iso(*dt)),
         BqValue::Json(j) => (**j).clone(),
         BqValue::Array(items) => JsonValue::Array(items.iter().map(bq_to_json).collect()),
         BqValue::Struct(fields) => {

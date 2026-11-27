@@ -119,7 +119,7 @@ pub fn cast_value(val: BqValue, target: &BqType) -> BqResult<BqValue> {
         BqType::Float64 => cast_to_float64(val),
         BqType::Numeric => cast_to_numeric(val),
         BqType::BigNumeric => cast_to_bignumeric(val),
-        BqType::String => Ok(BqValue::String(val.to_string())),
+        BqType::String => cast_to_string(val),
         BqType::Bytes => cast_to_bytes(val),
         BqType::Date => cast_to_date(val),
         BqType::Datetime => cast_to_datetime(val),
@@ -132,6 +132,15 @@ pub fn cast_value(val: BqValue, target: &BqType) -> BqResult<BqValue> {
             BqError::query(format!("Unsupported CAST target type: {target}")),
         ),
     }
+}
+
+fn cast_to_string(val: BqValue) -> BqResult<BqValue> {
+    if let BqValue::Bytes(b) = val {
+        return String::from_utf8(b)
+            .map(BqValue::String)
+            .map_err(|_| BqError::semantic("Invalid cast of BYTES to UTF-8 STRING"));
+    }
+    Ok(BqValue::String(val.to_string()))
 }
 
 fn unsupported_cast(val: &BqValue, target: &str) -> BqResult<BqValue> {

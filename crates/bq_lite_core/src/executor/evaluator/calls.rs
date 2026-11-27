@@ -33,6 +33,38 @@ pub(super) fn eval_function_expr(
             Err(err) => Err(err),
         };
     }
+    if upper == "MAKE_INTERVAL" && call.args.iter().any(|a| a.name.is_some()) {
+        let mut slots = vec![BqValue::Int64(0); 6];
+        for (idx, arg) in call.args.iter().enumerate() {
+            let val = eval_expr(&arg.expr, row, ctx)?;
+            let pos = if let Some(ref nm) = arg.name {
+                match nm.value.to_ascii_lowercase().as_str() {
+                    "year" => 0,
+                    "month" => 1,
+                    "day" => 2,
+                    "hour" => 3,
+                    "minute" => 4,
+                    "second" => 5,
+                    other => {
+                        return Err(BqError::query(format!(
+                            "Unknown MAKE_INTERVAL parameter '{other}'"
+                        )))
+                    }
+                }
+            } else {
+                idx
+            };
+            if let Some(slot) = slots.get_mut(pos) {
+                *slot = val;
+            }
+        }
+        return match eval_scalar_builtin(&fn_name, slots, ctx) {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => Ok(BqValue::Null),
+            Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
+            Err(err) => Err(err),
+        };
+    }
     let mut args = Vec::with_capacity(call.args.len());
     for (idx, arg) in call.args.iter().enumerate() {
         if is_date_part_arg_pos(&upper, idx) {
@@ -55,13 +87,16 @@ pub(super) fn eval_function_expr(
     }
 }
 
-fn is_date_part_arg_pos(upper_fn: &str, idx: usize) -> bool {
+pub(in crate::executor) fn is_date_part_arg_pos(upper_fn: &str, idx: usize) -> bool {
     matches!(
         (upper_fn, idx),
         (
-            "DATE_TRUNC" | "DATETIME_TRUNC" | "TIMESTAMP_TRUNC" | "LAST_DAY",
+            "DATE_TRUNC" | "DATETIME_TRUNC" | "TIMESTAMP_TRUNC" | "TIME_TRUNC" | "LAST_DAY",
             1
-        ) | ("DATE_DIFF" | "DATETIME_DIFF" | "TIMESTAMP_DIFF", 2)
+        ) | (
+            "DATE_DIFF" | "DATETIME_DIFF" | "TIMESTAMP_DIFF" | "TIME_DIFF",
+            2
+        )
     )
 }
 

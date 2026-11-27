@@ -152,8 +152,13 @@ fn eval_sign(args: Vec<BqValue>) -> BqResult<BqValue> {
 }
 
 fn eval_round(args: Vec<BqValue>, trunc_mode: bool) -> BqResult<BqValue> {
-    if args.is_empty() || args.len() > 2 {
-        return Err(BqError::query("ROUND/TRUNC expects 1 or 2 arguments"));
+    let max_args = if trunc_mode { 2 } else { 3 };
+    if args.is_empty() || args.len() > max_args {
+        return Err(BqError::query(if trunc_mode {
+            "TRUNC expects 1 or 2 arguments"
+        } else {
+            "ROUND expects 1, 2, or 3 arguments"
+        }));
     }
     let mut it = args.into_iter();
     let v = it.next().unwrap_or(BqValue::Null);
@@ -163,21 +168,39 @@ fn eval_round(args: Vec<BqValue>, trunc_mode: bool) -> BqResult<BqValue> {
         Some(_) => return Err(BqError::query("ROUND/TRUNC digits must be INT64")),
         None => 0,
     };
+    let half_even = match it.next() {
+        None => false,
+        Some(BqValue::Null) => return Ok(BqValue::Null),
+        Some(BqValue::String(mode)) => match mode.to_ascii_uppercase().as_str() {
+            "ROUND_HALF_AWAY_FROM_ZERO" => false,
+            "ROUND_HALF_EVEN" => true,
+            _ => {
+                return Err(BqError::semantic(format!(
+                    "Invalid ROUND rounding_mode: '{mode}'"
+                )))
+            }
+        },
+        Some(_) => return Err(BqError::query("ROUND rounding_mode must be STRING")),
+    };
     if v.is_null() {
         return Ok(BqValue::Null);
     }
     if let BqValue::Numeric(n) = v {
-        return n.round_or_trunc(digits, trunc_mode).map(BqValue::Numeric);
+        return n
+            .round_or_trunc(digits, trunc_mode, half_even)
+            .map(BqValue::Numeric);
     }
     if let BqValue::BigNumeric(bn) = v {
         return bn
-            .round_or_trunc(digits, trunc_mode)
+            .round_or_trunc(digits, trunc_mode, half_even)
             .map(|r| BqValue::BigNumeric(Box::new(r)));
     }
     let f = to_f64(&v, "ROUND")?;
     let factor = 10.0_f64.powi(digits);
     let res = if trunc_mode {
         (f * factor).trunc() / factor
+    } else if half_even {
+        (f * factor).round_ties_even() / factor
     } else {
         (f * factor).round() / factor
     };

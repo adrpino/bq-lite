@@ -126,6 +126,14 @@ fn parse_optional_by_name(p: &mut Parser) -> BqResult<bool> {
     if p.eat_kw("BY") {
         p.expect_kw("NAME")?;
         Ok(true)
+    } else if p.eat_kw("CORRESPONDING") {
+        Ok(true)
+    } else if p.is_kw("STRICT")
+        && matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("CORRESPONDING"))
+    {
+        p.advance();
+        p.advance();
+        Ok(true)
     } else {
         Ok(false)
     }

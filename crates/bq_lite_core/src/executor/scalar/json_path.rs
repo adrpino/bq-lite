@@ -1,6 +1,150 @@
 use serde_json::Value as JsonValue;
 
 use crate::error::{BqError, BqResult};
+use crate::types::BqValue;
+
+pub(super) fn format_timestamp_rfc3339(ts: chrono::DateTime<chrono::Utc>) -> String {
+    if ts.timestamp_subsec_nanos() == 0 {
+        return ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    let raw = ts.format("%Y-%m-%dT%H:%M:%S.%6f").to_string();
+    format!("{}Z", raw.trim_end_matches('0').trim_end_matches('.'))
+}
+
+pub(super) fn format_datetime_iso(dt: chrono::NaiveDateTime) -> String {
+    if dt.and_utc().timestamp_subsec_nanos() == 0 {
+        return dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+    }
+    let raw = dt.format("%Y-%m-%dT%H:%M:%S.%6f").to_string();
+    raw.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+pub(super) fn write_bq_json_string(
+    val: &BqValue,
+    pretty: bool,
+    indent: usize,
+    out: &mut String,
+    scalar_to_json: &impl Fn(&BqValue) -> JsonValue,
+) -> BqResult<()> {
+    match val {
+        BqValue::Struct(fields) => write_struct_json(fields, pretty, indent, out, scalar_to_json),
+        BqValue::Array(items) => write_array_json(items, pretty, indent, out, scalar_to_json),
+        BqValue::Json(j) => write_raw_json(j, pretty, indent, out),
+        BqValue::Null
+        | BqValue::Bool(_)
+        | BqValue::Int64(_)
+        | BqValue::Float64(_)
+        | BqValue::Numeric(_)
+        | BqValue::BigNumeric(_)
+        | BqValue::String(_)
+        | BqValue::Bytes(_)
+        | BqValue::Date(_)
+        | BqValue::Datetime(_)
+        | BqValue::Time(_)
+        | BqValue::Timestamp(_)
+        | BqValue::Interval(_)
+        | BqValue::Geography(_)
+        | BqValue::Range(_) => {
+            let j = scalar_to_json(val);
+            let s = serde_json::to_string(&j)
+                .map_err(|e| BqError::internal(format!("JSON serialization failed: {e}")))?;
+            out.push_str(&s);
+            Ok(())
+        }
+    }
+}
+
+fn write_struct_json(
+    fields: &[crate::types::BqStructFieldValue],
+    pretty: bool,
+    indent: usize,
+    out: &mut String,
+    scalar_to_json: &impl Fn(&BqValue) -> JsonValue,
+) -> BqResult<()> {
+    if fields.is_empty() {
+        out.push_str("{}");
+        return Ok(());
+    }
+    out.push('{');
+    for (idx, f) in fields.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        if pretty {
+            out.push('\n');
+            push_indent(out, indent + 2);
+        }
+        let k = f.name.clone().unwrap_or_else(|| format!("f{idx}_"));
+        let key_json = serde_json::to_string(&k)
+            .map_err(|e| BqError::internal(format!("JSON key serialization failed: {e}")))?;
+        out.push_str(&key_json);
+        out.push_str(if pretty { ": " } else { ":" });
+        write_bq_json_string(&f.value, pretty, indent + 2, out, scalar_to_json)?;
+    }
+    if pretty {
+        out.push('\n');
+        push_indent(out, indent);
+    }
+    out.push('}');
+    Ok(())
+}
+
+fn write_array_json(
+    items: &[BqValue],
+    pretty: bool,
+    indent: usize,
+    out: &mut String,
+    scalar_to_json: &impl Fn(&BqValue) -> JsonValue,
+) -> BqResult<()> {
+    if items.is_empty() {
+        out.push_str("[]");
+        return Ok(());
+    }
+    out.push('[');
+    for (idx, item) in items.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        if pretty {
+            out.push('\n');
+            push_indent(out, indent + 2);
+        }
+        write_bq_json_string(item, pretty, indent + 2, out, scalar_to_json)?;
+    }
+    if pretty {
+        out.push('\n');
+        push_indent(out, indent);
+    }
+    out.push(']');
+    Ok(())
+}
+
+fn write_raw_json(j: &JsonValue, pretty: bool, indent: usize, out: &mut String) -> BqResult<()> {
+    let s = if pretty {
+        serde_json::to_string_pretty(j)
+    } else {
+        serde_json::to_string(j)
+    }
+    .map_err(|e| BqError::internal(format!("JSON serialization failed: {e}")))?;
+    if pretty && indent > 0 {
+        for (i, line) in s.lines().enumerate() {
+            if i > 0 {
+                out.push('\n');
+                push_indent(out, indent);
+            }
+            out.push_str(line);
+        }
+    } else {
+        out.push_str(&s);
+    }
+    Ok(())
+}
+
+fn push_indent(out: &mut String, n: usize) {
+    for _ in 0..n {
+        out.push(' ');
+    }
+}
 
 pub(super) enum PathSeg {
     Key(String),

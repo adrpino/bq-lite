@@ -194,6 +194,7 @@ pub enum Expr {
     Extract {
         part: Ident,
         expr: Box<Self>,
+        time_zone: Option<Box<Self>>,
     },
     Interval {
         value: Box<Self>,

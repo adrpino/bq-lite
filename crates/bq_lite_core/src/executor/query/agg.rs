@@ -199,14 +199,25 @@ pub(super) fn execute_grouped_buckets(
 }
 
 fn build_select_alias_map(select: &Select) -> BTreeMap<String, Expr> {
-    let mut map = BTreeMap::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut raw: Vec<(String, Expr)> = Vec::new();
     for item in &select.projection {
-        if let SelectItem::Expr {
-            expr,
-            alias: Some(id),
-        } = item
-        {
-            map.insert(id.value.to_ascii_lowercase(), (**expr).clone());
+        if let SelectItem::Expr { expr, alias } = item {
+            let col_name = alias
+                .as_ref()
+                .map(|a| a.value.clone())
+                .or_else(|| infer_expr_col_name(expr));
+            if let Some(name) = col_name {
+                let key = name.to_ascii_lowercase();
+                *counts.entry(key.clone()).or_insert(0) += 1;
+                raw.push((key, (**expr).clone()));
+            }
+        }
+    }
+    let mut map = BTreeMap::new();
+    for (k, e) in raw {
+        if counts.get(&k).copied().unwrap_or(0) == 1 {
+            map.insert(k, e);
         }
     }
     map
@@ -286,8 +297,8 @@ fn resolve_gb_expr(
         return Ok(target.clone());
     }
     if let Expr::Ident(id) = expr {
-        let in_from = schema_row.resolve_ident(&id.value).ok().flatten().is_some();
-        if !in_from {
+        let unambiguous_in_from = matches!(schema_row.resolve_ident(&id.value), Ok(Some(_)));
+        if !unambiguous_in_from {
             if let Some(aliased) = alias_map.get(&id.value.to_ascii_lowercase()) {
                 return Ok(aliased.clone());
             }

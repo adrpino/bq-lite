@@ -46,6 +46,13 @@ pub(super) fn eval_aggregate_call(
     rows: &[EvalRow],
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
+    let filtered_storage;
+    let rows = if let Some((having_kind, ref having_expr)) = call.having {
+        filtered_storage = filter_rows_by_having(rows, having_kind, having_expr, ctx)?;
+        filtered_storage.as_slice()
+    } else {
+        rows
+    };
     let upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
     match upper.as_str() {
         "COUNT" => eval_count(call, rows, ctx),
@@ -227,8 +234,10 @@ fn eval_any_value(
         .args
         .first()
         .ok_or_else(|| BqError::query("ANY_VALUE requires 1 argument"))?;
-    if let Some((having_kind, ref having_expr)) = call.having {
-        return eval_any_value_having(arg, having_kind, having_expr, rows, ctx);
+    if call.having.is_some() {
+        return rows
+            .first()
+            .map_or(Ok(BqValue::Null), |row| eval_expr(&arg.expr, row, ctx));
     }
     for row in rows {
         let v = eval_expr(&arg.expr, row, ctx)?;
@@ -239,36 +248,45 @@ fn eval_any_value(
     Ok(BqValue::Null)
 }
 
-fn eval_any_value_having(
-    arg: &crate::ast::FunctionArg,
+fn filter_rows_by_having(
+    rows: &[EvalRow],
     kind: HavingKind,
     having_expr: &crate::ast::Expr,
-    rows: &[EvalRow],
     ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
+) -> BqResult<Vec<EvalRow>> {
     let mut best_key: Option<BqValue> = None;
-    let mut best_val: Option<BqValue> = None;
+    let mut winners: Vec<EvalRow> = Vec::new();
     for row in rows {
         let key = eval_expr(having_expr, row, ctx)?;
         if key.is_null() {
             continue;
         }
-        let take = match &best_key {
-            None => true,
+        match &best_key {
+            None => {
+                best_key = Some(key);
+                winners.clear();
+                winners.push(row.clone());
+            }
             Some(cur) => {
                 let ord = compare_values(&key, cur)?;
-                match kind {
+                let is_better = match kind {
                     HavingKind::Max => ord == Some(Ordering::Greater),
                     HavingKind::Min => ord == Some(Ordering::Less),
+                };
+                if is_better {
+                    best_key = Some(key);
+                    winners.clear();
+                    winners.push(row.clone());
+                } else if ord == Some(Ordering::Equal) {
+                    winners.push(row.clone());
                 }
             }
-        };
-        if take {
-            best_key = Some(key);
-            best_val = Some(eval_expr(&arg.expr, row, ctx)?);
         }
     }
-    Ok(best_val.unwrap_or(BqValue::Null))
+    if best_key.is_none() {
+        return Ok(rows.to_vec());
+    }
+    Ok(winners)
 }
 
 fn eval_array_agg(
