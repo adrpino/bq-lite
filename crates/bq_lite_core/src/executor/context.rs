@@ -98,6 +98,63 @@ impl EvalRow {
         })
     }
 
+    /// Collects the ordered visible columns belonging to a table alias / range variable.
+    /// Prefers pre-coalesce `USING` snapshots in `pseudo_cols` (excluding `_PARTITION*`),
+    /// falling back to visible `cols` (excluding internal `__win_*` bindings).
+    pub(super) fn resolve_range_var_cols(&self, name: &str) -> Vec<&RowBinding> {
+        let from_pseudo: Vec<&RowBinding> = self
+            .pseudo_cols
+            .iter()
+            .filter(|c| {
+                !c.name.starts_with("_PARTITION")
+                    && c.qualifier
+                        .as_deref()
+                        .is_some_and(|q| q.eq_ignore_ascii_case(name))
+            })
+            .collect();
+        if !from_pseudo.is_empty() {
+            return from_pseudo;
+        }
+        self.cols
+            .iter()
+            .filter(|c| {
+                !c.name.starts_with("__win_")
+                    && c.qualifier
+                        .as_deref()
+                        .is_some_and(|q| q.eq_ignore_ascii_case(name))
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub(super) fn resolve_range_var_struct(&self, name: &str) -> Option<BqValue> {
+        let cols = self.resolve_range_var_cols(name);
+        if cols.is_empty() {
+            return None;
+        }
+        Some(BqValue::Struct(
+            cols.into_iter()
+                .map(|c| BqStructFieldValue {
+                    name: Some(c.name.as_ref().to_owned()),
+                    value: c.value.clone(),
+                })
+                .collect(),
+        ))
+    }
+
+    #[must_use]
+    pub(super) fn resolve_range_var_type(&self, name: &str) -> Option<BqType> {
+        let cols = self.resolve_range_var_cols(name);
+        if cols.is_empty() {
+            return None;
+        }
+        Some(BqType::Struct(
+            cols.into_iter()
+                .map(|c| crate::types::StructField::named(c.name.as_ref().to_owned(), c.ty.clone()))
+                .collect(),
+        ))
+    }
+
     #[must_use]
     pub(super) fn to_struct_value(&self) -> BqValue {
         BqValue::Struct(

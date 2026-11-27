@@ -19,10 +19,21 @@ pub(in crate::executor) fn infer_expr_type(
             .ok()
             .flatten()
             .map(|b| b.ty.clone())
+            .or_else(|| row.resolve_range_var_type(&id.value))
             .or_else(|| {
                 ctx.vars
                     .get(&id.value.to_ascii_lowercase())
                     .and_then(|v| v.infer_type().ok())
+            })
+            .or_else(|| {
+                ctx.outer_rows.iter().rev().find_map(|outer| {
+                    outer
+                        .resolve_ident(&id.value)
+                        .ok()
+                        .flatten()
+                        .map(|b| b.ty.clone())
+                        .or_else(|| outer.resolve_range_var_type(&id.value))
+                })
             })
             .unwrap_or(BqType::UntypedNull),
         Expr::CompoundIdent(parts) => {

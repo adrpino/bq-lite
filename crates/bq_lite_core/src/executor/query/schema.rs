@@ -248,7 +248,12 @@ pub(super) fn resolve_struct_type_for_name(
             return Some(ty);
         }
     }
-    let mut cur_ty = row.resolve_ident(first).ok().flatten()?.ty.clone();
+    let mut cur_ty = row
+        .resolve_ident(first)
+        .ok()
+        .flatten()
+        .map(|b| b.ty.clone())
+        .or_else(|| row.resolve_range_var_type(first))?;
     for f in rest {
         cur_ty = struct_field_ty(&cur_ty, f)?;
     }

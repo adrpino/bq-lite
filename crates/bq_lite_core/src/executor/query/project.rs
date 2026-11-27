@@ -103,6 +103,19 @@ pub(super) fn merge_inferred_type(raw: BqType, inferred: BqType) -> BqType {
         ))
         .unwrap_or(raw);
     }
+    if let (BqType::Struct(r_fields), BqType::Struct(i_fields)) = (&raw, &inferred) {
+        if r_fields.len() == i_fields.len() {
+            let merged = r_fields
+                .iter()
+                .zip(i_fields.iter())
+                .map(|(rf, inf)| crate::types::StructField {
+                    name: rf.name.clone().or_else(|| inf.name.clone()),
+                    ty: merge_inferred_type(rf.ty.clone(), inf.ty.clone()),
+                })
+                .collect();
+            return BqType::Struct(merged);
+        }
+    }
     raw
 }
 

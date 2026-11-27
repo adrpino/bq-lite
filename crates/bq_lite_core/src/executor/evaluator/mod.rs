@@ -268,12 +268,18 @@ fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqR
     if let Some(binding) = row.resolve_ident(name)? {
         return Ok(binding.value.clone());
     }
+    if let Some(struct_val) = row.resolve_range_var_struct(name) {
+        return Ok(struct_val);
+    }
     if let Some(var_val) = ctx.vars.get(&name.to_ascii_lowercase()) {
         return Ok(var_val.clone());
     }
     for outer in ctx.outer_rows.iter().rev() {
         if let Some(binding) = outer.resolve_ident(name)? {
             return Ok(binding.value.clone());
+        }
+        if let Some(struct_val) = outer.resolve_range_var_struct(name) {
+            return Ok(struct_val);
         }
     }
     Err(BqError::query(format!("Unrecognized name: {name}")))
