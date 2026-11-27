@@ -223,6 +223,15 @@ impl Engine {
         execute_script_stmts(&[stmt], &mut self.catalog, &mut self.storage)
     }
 
+    /// Drops all temporary tables and routines stored in the ephemeral `__temp` dataset.
+    pub fn clear_temp_objects(&mut self) {
+        let default_proj = self.catalog.default_project().to_owned();
+        let _ = self
+            .catalog
+            .drop_dataset(&default_proj, "__temp", true, true);
+        self.storage.drop_dataset(&default_proj, "__temp");
+    }
+
     /// Executes a multi-statement `GoogleSQL` script (`DECLARE`, `IF`, `LOOP`, `BEGIN...EXCEPTION`, etc.).
     pub fn exec_script(&mut self, sql: &str) -> BqResult<QueryResult> {
         self.exec_script_with_params(sql, &BTreeMap::new(), &[])
@@ -236,13 +245,15 @@ impl Engine {
         positional: &[BqValue],
     ) -> BqResult<QueryResult> {
         let stmts = parse_script(sql)?;
-        execute_script_stmts_with_governance(
+        let res = execute_script_stmts_with_governance(
             &stmts,
             &mut self.catalog,
             &mut self.storage,
             params,
             positional,
             &self.governance,
-        )
+        );
+        self.clear_temp_objects();
+        res
     }
 }

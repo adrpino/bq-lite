@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
-use crate::ast::{Expr, GroupByClause, GroupByItem, Literal, Select, SelectItem};
+use crate::ast::{Expr, GroupByClause, Ident, OrderByExpr, Select, SelectItem};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::{eval_expr, infer_expr_col_name, values_distinct_eq};
 use crate::types::BqValue;
 
 type BucketList = Vec<(Vec<BqValue>, Vec<EvalRow>)>;
+pub(super) type GroupedSelectOut = (Vec<EvalRow>, Vec<EvalRow>, Vec<OrderByExpr>);
 
 pub(super) struct GroupedBucket {
     pub active_keys: Vec<(Expr, BqValue)>,
@@ -33,9 +34,11 @@ impl GroupedBucket {
 
 use super::agg_builtins::is_aggregate_name;
 use super::agg_eval::eval_grouped_expr;
+use super::agg_grouping::{attach_grouped_order_by, expand_single_gb_item, expr_eq_gb};
 use super::project::{has_untyped_null, merge_inferred_type};
 use super::project_eval_rows;
 use super::type_infer::infer_expr_type;
+use super::window::expr_has_window;
 
 #[must_use]
 pub(super) fn select_uses_grouping(select: &Select) -> bool {
@@ -56,7 +59,9 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
                 return false;
             }
             let name = call.name.normalized_parts().join(".");
-            is_aggregate_name(&name) || call.args.iter().any(|a| expr_has_aggregate(&a.expr))
+            name.eq_ignore_ascii_case("GROUPING")
+                || is_aggregate_name(&name)
+                || call.args.iter().any(|a| expr_has_aggregate(&a.expr))
         }
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Unary { expr: inner, .. }
@@ -119,10 +124,22 @@ pub(super) fn execute_grouped_select(
     schema_row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<EvalRow>> {
+    let (proj, _, _) = execute_grouped_select_with_order(select, &[], rows, schema_row, ctx)?;
+    Ok(proj)
+}
+
+pub(super) fn execute_grouped_select_with_order(
+    select: &Select,
+    order_by: &[OrderByExpr],
+    rows: &[EvalRow],
+    schema_row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<GroupedSelectOut> {
+    let alias_map = build_select_alias_map(select);
     let buckets = execute_grouped_buckets(select, rows, schema_row, ctx)?;
-    let mut result_rows = Vec::with_capacity(buckets.len());
+    let mut projected = Vec::with_capacity(buckets.len());
     for b in &buckets {
-        result_rows.push(project_grouped_row(
+        projected.push(project_grouped_row(
             select,
             &b.rows,
             schema_row,
@@ -130,7 +147,13 @@ pub(super) fn execute_grouped_select(
             ctx,
         )?);
     }
-    Ok(result_rows)
+    let mut src_rows = projected.clone();
+    let rewritten_order = if order_by.is_empty() {
+        Vec::new()
+    } else {
+        attach_grouped_order_by(&buckets, &mut src_rows, order_by, &alias_map, ctx)
+    };
+    Ok((projected, src_rows, rewritten_order))
 }
 
 pub(super) fn execute_grouped_buckets(
@@ -148,7 +171,7 @@ pub(super) fn execute_grouped_buckets(
     let mut all_keys: Vec<Expr> = Vec::new();
     for set in &grouping_sets {
         for k in set {
-            if !all_keys.contains(k) {
+            if !all_keys.iter().any(|existing| expr_eq_gb(existing, k)) {
                 all_keys.push(k.clone());
             }
         }
@@ -158,11 +181,11 @@ pub(super) fn execute_grouped_buckets(
     for key_exprs in grouping_sets {
         let rolled_up: Vec<Expr> = all_keys
             .iter()
-            .filter(|k| !key_exprs.contains(k))
+            .filter(|k| !key_exprs.iter().any(|ek| expr_eq_gb(ek, k)))
             .cloned()
             .collect();
         let buckets = bucket_rows(rows, &key_exprs, ctx)?;
-        let buckets = if buckets.is_empty() && select.group_by.is_none() {
+        let buckets = if buckets.is_empty() && key_exprs.is_empty() {
             vec![(Vec::new(), Vec::new())]
         } else {
             buckets
@@ -173,8 +196,8 @@ pub(super) fn execute_grouped_buckets(
             append_alias_keys(&alias_map, &mut active_pairs);
             let mut rolled_full = rolled_up.clone();
             for (alias, target) in &alias_map {
-                if rolled_up.contains(target) {
-                    rolled_full.push(Expr::Ident(crate::ast::Ident::unquoted(alias.clone())));
+                if rolled_up.iter().any(|r| expr_eq_gb(r, target)) {
+                    rolled_full.push(Expr::Ident(Ident::unquoted(alias.clone())));
                 }
             }
             if let Some(ref having) = select.having {
@@ -198,7 +221,7 @@ pub(super) fn execute_grouped_buckets(
     Ok(out)
 }
 
-fn build_select_alias_map(select: &Select) -> BTreeMap<String, Expr> {
+pub(super) fn build_select_alias_map(select: &Select) -> BTreeMap<String, Expr> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut raw: Vec<(String, Expr)> = Vec::new();
     for item in &select.projection {
@@ -226,9 +249,12 @@ fn build_select_alias_map(select: &Select) -> BTreeMap<String, Expr> {
 fn append_alias_keys(alias_map: &BTreeMap<String, Expr>, active_pairs: &mut Vec<(Expr, BqValue)>) {
     let mut extra = Vec::new();
     for (alias, target_expr) in alias_map {
-        if let Some((_, val)) = active_pairs.iter().find(|(k, _)| k == target_expr) {
-            let ident_expr = Expr::Ident(crate::ast::Ident::unquoted(alias.clone()));
-            if !active_pairs.iter().any(|(k, _)| k == &ident_expr) {
+        if let Some((_, val)) = active_pairs
+            .iter()
+            .find(|(k, _)| expr_eq_gb(k, target_expr))
+        {
+            let ident_expr = Expr::Ident(Ident::unquoted(alias.clone()));
+            if !active_pairs.iter().any(|(k, _)| expr_eq_gb(k, &ident_expr)) {
                 extra.push((ident_expr, val.clone()));
             }
         }
@@ -254,9 +280,40 @@ fn expand_group_by(
         GroupByClause::All => {
             let mut keys = Vec::new();
             for item in &select.projection {
-                if let SelectItem::Expr { expr, .. } = item {
-                    if !expr_has_aggregate(expr) {
-                        keys.push((**expr).clone());
+                match item {
+                    SelectItem::Expr { expr, .. } => {
+                        if !expr_has_aggregate(expr) && !expr_has_window(expr) {
+                            keys.push((**expr).clone());
+                        }
+                    }
+                    SelectItem::Wildcard {
+                        qualifier, except, ..
+                    } => {
+                        let qual_str = qualifier
+                            .as_ref()
+                            .and_then(|q| q.parts.last())
+                            .map(|i| &i.value);
+                        for col in &schema_row.cols {
+                            if col.name.starts_with("__win_") {
+                                continue;
+                            }
+                            if let Some(qs) = qual_str {
+                                if !col
+                                    .qualifier
+                                    .as_deref()
+                                    .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
+                                {
+                                    continue;
+                                }
+                            }
+                            if except
+                                .iter()
+                                .any(|e| e.value.eq_ignore_ascii_case(&col.name))
+                            {
+                                continue;
+                            }
+                            keys.push(Expr::Ident(Ident::unquoted(col.name.clone())));
+                        }
                     }
                 }
             }
@@ -278,85 +335,6 @@ fn expand_group_by(
             }
             Ok(acc)
         }
-    }
-}
-
-fn resolve_gb_expr(
-    expr: &Expr,
-    proj_exprs: &[Option<Expr>],
-    alias_map: &BTreeMap<String, Expr>,
-    schema_row: &EvalRow,
-) -> BqResult<Expr> {
-    if let Expr::Literal(Literal::Int(pos)) = expr {
-        let idx = usize::try_from(pos - 1)
-            .map_err(|_| BqError::query(format!("GROUP BY position {pos} is out of range")))?;
-        let target = proj_exprs
-            .get(idx)
-            .and_then(|opt| opt.as_ref())
-            .ok_or_else(|| BqError::query(format!("GROUP BY position {pos} out of range")))?;
-        return Ok(target.clone());
-    }
-    if let Expr::Ident(id) = expr {
-        let unambiguous_in_from = matches!(schema_row.resolve_ident(&id.value), Ok(Some(_)));
-        if !unambiguous_in_from {
-            if let Some(aliased) = alias_map.get(&id.value.to_ascii_lowercase()) {
-                return Ok(aliased.clone());
-            }
-        }
-    }
-    Ok(expr.clone())
-}
-
-fn expand_single_gb_item(
-    item: &GroupByItem,
-    proj_exprs: &[Option<Expr>],
-    alias_map: &BTreeMap<String, Expr>,
-    schema_row: &EvalRow,
-) -> BqResult<Vec<Vec<Expr>>> {
-    match item {
-        GroupByItem::Expr(e) => Ok(vec![vec![resolve_gb_expr(
-            e, proj_exprs, alias_map, schema_row,
-        )?]]),
-        GroupByItem::Rollup(exprs) => {
-            let resolved: Vec<Expr> = exprs
-                .iter()
-                .map(|e| resolve_gb_expr(e, proj_exprs, alias_map, schema_row))
-                .collect::<BqResult<_>>()?;
-            let mut sets = Vec::with_capacity(resolved.len() + 1);
-            for len in (0..=resolved.len()).rev() {
-                sets.push(resolved.get(..len).unwrap_or(&[]).to_vec());
-            }
-            Ok(sets)
-        }
-        GroupByItem::Cube(exprs) => {
-            if exprs.len() > 10 {
-                return Err(BqError::query("CUBE supports at most 10 expressions"));
-            }
-            let resolved: Vec<Expr> = exprs
-                .iter()
-                .map(|e| resolve_gb_expr(e, proj_exprs, alias_map, schema_row))
-                .collect::<BqResult<_>>()?;
-            let count = 1_usize << resolved.len();
-            let mut sets = Vec::with_capacity(count);
-            for mask in 0..count {
-                let mut subset = Vec::new();
-                for (i, expr) in resolved.iter().enumerate() {
-                    if (mask & (1_usize << i)) != 0 {
-                        subset.push(expr.clone());
-                    }
-                }
-                sets.push(subset);
-            }
-            Ok(sets)
-        }
-        GroupByItem::GroupingSets(sets) => sets
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|e| resolve_gb_expr(e, proj_exprs, alias_map, schema_row))
-                    .collect::<BqResult<Vec<_>>>()
-            })
-            .collect(),
     }
 }
 

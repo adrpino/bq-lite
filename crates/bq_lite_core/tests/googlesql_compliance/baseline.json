@@ -5,13 +5,13 @@
     "skipped": 4
   },
   "aggregation_distinct_queries.test": {
-    "passed": 55,
-    "failed": 32,
+    "passed": 58,
+    "failed": 29,
     "skipped": 71
   },
   "aggregation_having_modifier_queries.test": {
-    "passed": 16,
-    "failed": 18,
+    "passed": 25,
+    "failed": 9,
     "skipped": 9
   },
   "aggregation_order_by_queries.test": {
@@ -20,8 +20,8 @@
     "skipped": 34
   },
   "aggregation_queries.test": {
-    "passed": 85,
-    "failed": 50,
+    "passed": 88,
+    "failed": 47,
     "skipped": 132
   },
   "analytic_any_value.test": {
@@ -145,8 +145,8 @@
     "skipped": 0
   },
   "analytic_string_aggregation.test": {
-    "passed": 4,
-    "failed": 14,
+    "passed": 7,
+    "failed": 11,
     "skipped": 0
   },
   "analytic_sum.test": {
@@ -160,8 +160,8 @@
     "skipped": 64
   },
   "any_value_aggregation.test": {
-    "passed": 3,
-    "failed": 8,
+    "passed": 5,
+    "failed": 6,
     "skipped": 4
   },
   "arithmetic_functions.test": {
@@ -300,23 +300,23 @@
     "skipped": 0
   },
   "group_by_all.test": {
-    "passed": 19,
-    "failed": 5,
+    "passed": 24,
+    "failed": 0,
     "skipped": 5
   },
   "groupby_queries.test": {
-    "passed": 32,
-    "failed": 7,
+    "passed": 33,
+    "failed": 6,
     "skipped": 46
   },
   "groupby_queries_2.test": {
-    "passed": 29,
-    "failed": 6,
+    "passed": 35,
+    "failed": 0,
     "skipped": 32
   },
   "grouping_sets_queries.test": {
-    "passed": 27,
-    "failed": 62,
+    "passed": 73,
+    "failed": 16,
     "skipped": 18
   },
   "hash.test": {
@@ -345,8 +345,8 @@
     "skipped": 0
   },
   "join_queries.test": {
-    "passed": 30,
-    "failed": 21,
+    "passed": 38,
+    "failed": 13,
     "skipped": 10
   },
   "json_queries.test": {
@@ -385,8 +385,8 @@
     "skipped": 0
   },
   "orderby_queries.test": {
-    "passed": 49,
-    "failed": 4,
+    "passed": 53,
+    "failed": 0,
     "skipped": 86
   },
   "pipe_operators.test": {
@@ -405,8 +405,8 @@
     "skipped": 10
   },
   "qualify.test": {
-    "passed": 8,
-    "failed": 4,
+    "passed": 12,
+    "failed": 0,
     "skipped": 0
   },
   "rand.test": {

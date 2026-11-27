@@ -11,6 +11,7 @@ use crate::types::{BqStructFieldValue, BqValue};
 
 use super::agg::GroupedKeys;
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
+use super::agg_grouping::expr_eq_gb;
 
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -22,10 +23,10 @@ pub(super) fn eval_grouped_expr(
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    if let Some((_, key_val)) = keys.active.iter().find(|(k, _)| k == expr) {
+    if let Some((_, key_val)) = keys.active.iter().find(|(k, _)| expr_eq_gb(k, expr)) {
         return Ok(key_val.clone());
     }
-    if keys.rolled_up.iter().any(|k| k == expr) {
+    if keys.rolled_up.iter().any(|k| expr_eq_gb(k, expr)) {
         return Ok(BqValue::Null);
     }
     match expr {
@@ -327,7 +328,17 @@ fn eval_grouping_fn(call: &crate::ast::FunctionCall, keys: &GroupedKeys<'_>) -> 
         .args
         .first()
         .ok_or_else(|| BqError::query("GROUPING requires 1 argument"))?;
-    let is_active = keys.active.iter().any(|(k, _)| k == &arg.expr);
+    let target = if let Expr::Ident(id) = &arg.expr {
+        keys.select_aliases
+            .and_then(|m| m.get(&id.value.to_ascii_lowercase()))
+            .unwrap_or(&arg.expr)
+    } else {
+        &arg.expr
+    };
+    let is_active = keys
+        .active
+        .iter()
+        .any(|(k, _)| expr_eq_gb(k, &arg.expr) || expr_eq_gb(k, target));
     Ok(BqValue::Int64(i64::from(!is_active)))
 }
 

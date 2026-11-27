@@ -330,36 +330,67 @@ fn parse_optional_group_by(p: &mut Parser) -> BqResult<Option<GroupByClause>> {
     Ok(Some(GroupByClause::Items(items)))
 }
 
+fn parse_gb_tuple_or_expr(p: &mut Parser) -> BqResult<Vec<Expr>> {
+    if p.check(&TokenKind::LParen) {
+        let saved = p.save_pos();
+        let _ = p.advance();
+        if p.eat(&TokenKind::RParen) {
+            return Ok(Vec::new());
+        }
+        if let Ok(inner) = p.parse_comma_list(parse_expr) {
+            let at_boundary = p.eat(&TokenKind::RParen)
+                && (matches!(
+                    p.peek().kind,
+                    TokenKind::Comma | TokenKind::RParen | TokenKind::Semicolon | TokenKind::Eof
+                ) || [
+                    "HAVING",
+                    "WINDOW",
+                    "QUALIFY",
+                    "ORDER",
+                    "LIMIT",
+                    "UNION",
+                    "INTERSECT",
+                    "EXCEPT",
+                ]
+                .iter()
+                .any(|kw| p.is_kw(kw)));
+            if at_boundary {
+                return Ok(inner);
+            }
+        }
+        p.restore_pos(saved);
+    }
+    Ok(vec![parse_expr(p)?])
+}
+
 fn parse_group_by_item(p: &mut Parser) -> BqResult<GroupByItem> {
     if p.eat_kw("ROLLUP") {
         p.expect(&TokenKind::LParen, "'('")?;
-        let exprs = p.parse_comma_list(parse_expr)?;
+        let groups = p.parse_comma_list(parse_gb_tuple_or_expr)?;
         p.expect(&TokenKind::RParen, "')'")?;
-        return Ok(GroupByItem::Rollup(exprs));
+        return Ok(GroupByItem::Rollup(groups));
     }
     if p.eat_kw("CUBE") {
         p.expect(&TokenKind::LParen, "'('")?;
-        let exprs = p.parse_comma_list(parse_expr)?;
+        let groups = p.parse_comma_list(parse_gb_tuple_or_expr)?;
         p.expect(&TokenKind::RParen, "')'")?;
-        return Ok(GroupByItem::Cube(exprs));
+        return Ok(GroupByItem::Cube(groups));
     }
     if p.eat_kw("GROUPING") {
         p.expect_kw("SETS")?;
         p.expect(&TokenKind::LParen, "'('")?;
-        let sets = p.parse_comma_list(|p| {
-            if p.eat(&TokenKind::LParen) {
-                if p.eat(&TokenKind::RParen) {
-                    return Ok(Vec::new());
-                }
-                let inner = p.parse_comma_list(parse_expr)?;
-                p.expect(&TokenKind::RParen, "')'")?;
-                Ok(inner)
-            } else {
-                Ok(vec![parse_expr(p)?])
-            }
-        })?;
+        let sets = p.parse_comma_list(parse_group_by_item)?;
         p.expect(&TokenKind::RParen, "')'")?;
         return Ok(GroupByItem::GroupingSets(sets));
+    }
+    if p.check(&TokenKind::LParen) {
+        let exprs = parse_gb_tuple_or_expr(p)?;
+        if exprs.len() != 1 {
+            return Ok(GroupByItem::Tuple(exprs));
+        }
+        if let Some(only) = exprs.into_iter().next() {
+            return Ok(GroupByItem::Expr(Box::new(only)));
+        }
     }
     Ok(GroupByItem::Expr(Box::new(parse_expr(p)?)))
 }

@@ -23,6 +23,8 @@ pub(super) const MATH_HASH_FUNCTIONS: &[&str] = &[
     "FLOOR",
     "GREATEST",
     "IEEE_DIVIDE",
+    "IS_INF",
+    "IS_NAN",
     "LEAST",
     "LN",
     "LOG",
@@ -65,6 +67,8 @@ pub(super) fn eval_math_hash_fn(name: &str, args: Vec<BqValue>) -> BqResult<Opti
         "MOD" => eval_mod(args).map(Some),
         "DIV" => eval_int_div(args).map(Some),
         "IEEE_DIVIDE" => eval_ieee_divide(args).map(Some),
+        "IS_INF" => eval_float_pred(args, "IS_INF", f64::is_infinite).map(Some),
+        "IS_NAN" => eval_float_pred(args, "IS_NAN", f64::is_nan).map(Some),
         "SAFE_DIVIDE" => eval_safe_binary(crate::ast::BinaryOp::Div, args).map(Some),
         "SAFE_ADD" => eval_safe_binary(crate::ast::BinaryOp::Add, args).map(Some),
         "SAFE_SUBTRACT" => eval_safe_binary(crate::ast::BinaryOp::Sub, args).map(Some),
@@ -81,6 +85,16 @@ pub(super) fn eval_math_hash_fn(name: &str, args: Vec<BqValue>) -> BqResult<Opti
         "FARM_FINGERPRINT" => eval_farm_fingerprint(args).map(Some),
         _ => Ok(None),
     }
+}
+
+fn eval_float_pred(args: Vec<BqValue>, name: &str, pred: fn(f64) -> bool) -> BqResult<BqValue> {
+    let [arg]: [BqValue; 1] = args
+        .try_into()
+        .map_err(|_| BqError::query(format!("{name} expects 1 argument")))?;
+    if arg.is_null() {
+        return Ok(BqValue::Null);
+    }
+    Ok(BqValue::Bool(pred(to_f64(&arg, name)?)))
 }
 
 #[expect(

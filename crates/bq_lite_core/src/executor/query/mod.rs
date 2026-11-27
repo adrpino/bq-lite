@@ -2,6 +2,7 @@ mod agg;
 mod agg_approx;
 mod agg_builtins;
 mod agg_eval;
+mod agg_grouping;
 mod from;
 mod governance;
 mod joins;
@@ -33,7 +34,7 @@ pub(in crate::executor) use from::{
     eval_table_factor_standalone as eval_table_factor_public,
 };
 
-use agg::{execute_grouped_select, select_uses_grouping};
+use agg::{execute_grouped_select_with_order, select_uses_grouping};
 use from::eval_from_clause_with_schema;
 use pipe::apply_pipe_ops;
 use project::{has_untyped_null, project_eval_rows};
@@ -250,20 +251,21 @@ fn execute_select_full(
         rows = filtered;
     }
 
-    let (mut projected, mut qualify_src) = if select_uses_grouping(select) {
+    let (mut projected, mut qualify_src, effective_order) = if select_uses_grouping(select) {
         if select_has_windows(select) {
-            execute_grouped_with_windows(select, &rows, &schema_row, ctx)?
+            execute_grouped_with_windows(select, order_by, &rows, &schema_row, ctx)?
         } else {
-            let grouped = execute_grouped_select(select, &rows, &schema_row, ctx)?;
-            (grouped.clone(), grouped)
+            execute_grouped_select_with_order(select, order_by, &rows, &schema_row, ctx)?
         }
     } else if select_has_windows(select) {
         let (rewritten, aug_rows) = apply_windows(select, rows, ctx)?;
         let out = project_eval_rows(&rewritten, &aug_rows, ctx)?;
-        filter_qualify_with_src(&rewritten, out, &aug_rows, ctx)?
+        let (p, s) = filter_qualify_with_src(&rewritten, out, &aug_rows, ctx)?;
+        (p, s, order_by.to_vec())
     } else {
         let out = project_eval_rows(select, &rows, ctx)?;
-        filter_qualify_with_src(select, out, &rows, ctx)?
+        let (p, s) = filter_qualify_with_src(select, out, &rows, ctx)?;
+        (p, s, order_by.to_vec())
     };
 
     if select.distinct {
@@ -272,8 +274,8 @@ fn execute_select_full(
         qualify_src = deduped_src;
     }
 
-    if !order_by.is_empty() {
-        apply_order_by_with_source(&mut projected, &qualify_src, order_by, ctx)?;
+    if !effective_order.is_empty() {
+        apply_order_by_with_source(&mut projected, &qualify_src, &effective_order, ctx)?;
     }
     apply_limit_offset(&mut projected, limit, offset, ctx)?;
 

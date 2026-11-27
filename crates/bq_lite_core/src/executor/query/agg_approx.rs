@@ -6,7 +6,7 @@ use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::evaluator::{compare_values, eval_expr};
 use crate::types::BqValue;
 
-use super::agg_builtins::dedup_values;
+use super::agg_builtins::{collect_arg_values, dedup_values};
 
 const MAX_APPROX_QUANTILES: i64 = 1_000_000;
 
@@ -129,4 +129,44 @@ fn compare_nan_aware(a: &BqValue, b: &BqValue) -> Option<Ordering> {
         (false, true) => Some(Ordering::Greater),
         (false, false) => None,
     }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Statistical variance/stddev converts integer/numeric values to IEEE-754 FLOAT64"
+)]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only numeric variants are valid statistical aggregate inputs"
+)]
+pub(super) fn eval_stat_agg(
+    call: &FunctionCall,
+    rows: &[EvalRow],
+    ctx: &ExecContext<'_>,
+    is_stddev: bool,
+    is_pop: bool,
+) -> BqResult<BqValue> {
+    let vals = collect_arg_values(call, rows, ctx)?;
+    if vals.is_empty() || (!is_pop && vals.len() < 2) {
+        return Ok(BqValue::Null);
+    }
+    let nums: Vec<f64> = vals
+        .into_iter()
+        .map(|v| match v {
+            BqValue::Int64(n) => Ok(n as f64),
+            BqValue::Float64(f) => Ok(f),
+            BqValue::Numeric(n) => Ok(n.to_f64()),
+            BqValue::BigNumeric(bn) => Ok(bn.to_f64()),
+            other => Err(BqError::query(format!(
+                "Statistical aggregate expects numeric input, got {}",
+                other.infer_type()?
+            ))),
+        })
+        .collect::<BqResult<_>>()?;
+    let n = nums.len() as f64;
+    let mean = nums.iter().sum::<f64>() / n;
+    let sq_sum: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
+    let denom = if is_pop { n } else { n - 1.0 };
+    let var = sq_sum / denom;
+    Ok(BqValue::Float64(if is_stddev { var.sqrt() } else { var }))
 }

@@ -377,7 +377,12 @@ fn classify_bq_error(err: &bq_lite_core::BqError) -> String {
 fn record_failure(report: &mut FileReport, case_name: &str, bucket: &str, detail: &str) {
     report.failed += 1;
     *report.failure_buckets.entry(bucket.to_owned()).or_insert(0) += 1;
-    if report.sample_failures.len() < 5 {
+    let cap = if std::env::var_os("BQ_LITE_COMPLIANCE_FILTER").is_some() {
+        60
+    } else {
+        5
+    };
+    if report.sample_failures.len() < cap {
         report
             .sample_failures
             .push(format!("{case_name}: {detail}"));

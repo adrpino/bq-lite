@@ -7,7 +7,7 @@ use crate::executor::evaluator::{compare_values, eval_expr, values_distinct_eq};
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqType, BqValue};
 
-use super::agg_approx::{eval_approx_count_distinct, eval_approx_quantiles};
+use super::agg_approx::{eval_approx_count_distinct, eval_approx_quantiles, eval_stat_agg};
 use super::sort::sort_with_order_keys;
 
 const AGGREGATE_FUNCTIONS: &[&str] = &[
@@ -79,7 +79,7 @@ pub(super) fn eval_aggregate_call(
     }
 }
 
-fn collect_arg_values(
+pub(super) fn collect_arg_values(
     call: &FunctionCall,
     rows: &[EvalRow],
     ctx: &ExecContext<'_>,
@@ -209,6 +209,9 @@ fn eval_min_max(
     let vals = collect_arg_values(call, rows, ctx)?;
     let mut best: Option<BqValue> = None;
     for v in vals {
+        if matches!(v, BqValue::Float64(f) if f.is_nan()) {
+            return Ok(v);
+        }
         best = match best {
             None => Some(v),
             Some(cur) => {
@@ -261,6 +264,9 @@ fn filter_rows_by_having(
         if key.is_null() {
             continue;
         }
+        if matches!(key, BqValue::Float64(f) if f.is_nan()) {
+            return Ok(Vec::new());
+        }
         match &best_key {
             None => {
                 best_key = Some(key);
@@ -282,9 +288,6 @@ fn filter_rows_by_having(
                 }
             }
         }
-    }
-    if best_key.is_none() {
-        return Ok(rows.to_vec());
     }
     Ok(winners)
 }
@@ -334,10 +337,33 @@ fn eval_array_agg(
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "Only STRING values are valid STRING_AGG elements"
+    reason = "STRING_AGG elements must be STRING or BYTES"
 )]
-fn join_string_values(strs: Vec<BqValue>, delim: &str) -> BqResult<BqValue> {
-    let joined = strs
+fn join_string_or_bytes(vals: Vec<BqValue>, delim: Option<BqValue>) -> BqResult<BqValue> {
+    if matches!(vals.first(), Some(BqValue::Bytes(_))) {
+        let sep = match delim {
+            None => b",".to_vec(),
+            Some(BqValue::Bytes(b)) => b,
+            _ => return Err(BqError::query("STRING_AGG delimiter must be BYTES")),
+        };
+        let mut out = Vec::new();
+        for (i, v) in vals.into_iter().enumerate() {
+            let BqValue::Bytes(b) = v else {
+                return Err(BqError::query("STRING_AGG expects BYTES"));
+            };
+            if i > 0 {
+                out.extend_from_slice(&sep);
+            }
+            out.extend_from_slice(&b);
+        }
+        return Ok(BqValue::Bytes(out));
+    }
+    let sep = match delim {
+        None => ",".to_owned(),
+        Some(BqValue::String(s)) => s,
+        _ => return Err(BqError::query("STRING_AGG delimiter must be STRING")),
+    };
+    let joined = vals
         .into_iter()
         .map(|v| match v {
             BqValue::String(s) => Ok(s),
@@ -347,13 +373,13 @@ fn join_string_values(strs: Vec<BqValue>, delim: &str) -> BqResult<BqValue> {
             ))),
         })
         .collect::<BqResult<Vec<_>>>()?
-        .join(delim);
+        .join(&sep);
     Ok(BqValue::String(joined))
 }
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "STRING_AGG delimiter must be STRING or NULL"
+    reason = "STRING_AGG delimiter must be STRING, BYTES, or NULL"
 )]
 fn eval_string_agg(
     call: &FunctionCall,
@@ -366,11 +392,15 @@ fn eval_string_agg(
         .ok_or_else(|| BqError::query("STRING_AGG requires 1 or 2 arguments"))?;
     let delim = match call.args.get(1) {
         Some(d) => match eval_expr(&d.expr, &EvalRow::default(), ctx)? {
-            BqValue::String(s) => s,
             BqValue::Null => return Ok(BqValue::Null),
-            _ => return Err(BqError::query("STRING_AGG delimiter must be STRING")),
+            v @ (BqValue::String(_) | BqValue::Bytes(_)) => Some(v),
+            _ => {
+                return Err(BqError::query(
+                    "STRING_AGG delimiter must be STRING or BYTES",
+                ))
+            }
         },
-        None => ",".to_owned(),
+        None => None,
     };
     let mut items = Vec::new();
     for row in rows {
@@ -395,7 +425,7 @@ fn eval_string_agg(
     if strs.is_empty() {
         return Ok(BqValue::Null);
     }
-    join_string_values(strs, &delim)
+    join_string_or_bytes(strs, delim)
 }
 
 fn eval_logical(
@@ -442,44 +472,4 @@ fn eval_bitwise_agg(
         _ => a ^ b,
     });
     Ok(BqValue::Int64(acc))
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "Statistical variance/stddev converts integer/numeric values to IEEE-754 FLOAT64"
-)]
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only numeric variants are valid statistical aggregate inputs"
-)]
-fn eval_stat_agg(
-    call: &FunctionCall,
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-    is_stddev: bool,
-    is_pop: bool,
-) -> BqResult<BqValue> {
-    let vals = collect_arg_values(call, rows, ctx)?;
-    if vals.is_empty() || (!is_pop && vals.len() < 2) {
-        return Ok(BqValue::Null);
-    }
-    let nums: Vec<f64> = vals
-        .into_iter()
-        .map(|v| match v {
-            BqValue::Int64(n) => Ok(n as f64),
-            BqValue::Float64(f) => Ok(f),
-            BqValue::Numeric(n) => Ok(n.to_f64()),
-            BqValue::BigNumeric(bn) => Ok(bn.to_f64()),
-            other => Err(BqError::query(format!(
-                "Statistical aggregate expects numeric input, got {}",
-                other.infer_type()?
-            ))),
-        })
-        .collect::<BqResult<_>>()?;
-    let n = nums.len() as f64;
-    let mean = nums.iter().sum::<f64>() / n;
-    let sq_sum: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
-    let denom = if is_pop { n } else { n - 1.0 };
-    let var = sq_sum / denom;
-    Ok(BqValue::Float64(if is_stddev { var.sqrt() } else { var }))
 }

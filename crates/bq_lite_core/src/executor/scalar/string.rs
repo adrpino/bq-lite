@@ -53,8 +53,8 @@ pub(super) fn eval_string_fn(name: &str, args: Vec<BqValue>) -> BqResult<Option<
         "SUBSTR" | "SUBSTRING" => eval_substr(args).map(Some),
         "LENGTH" | "CHAR_LENGTH" => eval_length(args, false).map(Some),
         "BYTE_LENGTH" => eval_length(args, true).map(Some),
-        "LOWER" => eval_unary_str(args, "LOWER", str::to_lowercase).map(Some),
-        "UPPER" => eval_unary_str(args, "UPPER", str::to_uppercase).map(Some),
+        "LOWER" => eval_case_change(args, "LOWER", true).map(Some),
+        "UPPER" => eval_case_change(args, "UPPER", false).map(Some),
         "INITCAP" => eval_initcap(args).map(Some),
         "REVERSE" => eval_reverse(args).map(Some),
         "STRPOS" => eval_strpos(args).map(Some),
@@ -111,21 +111,29 @@ fn eval_concat_fn(args: Vec<BqValue>) -> BqResult<BqValue> {
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "Unary string helpers accept STRING or NULL"
+    reason = "LOWER/UPPER accept STRING, BYTES, or NULL"
 )]
-fn eval_unary_str(
-    args: Vec<BqValue>,
-    name: &str,
-    f: impl FnOnce(&str) -> String,
-) -> BqResult<BqValue> {
+fn eval_case_change(args: Vec<BqValue>, name: &str, lower: bool) -> BqResult<BqValue> {
     let [arg]: [BqValue; 1] = args
         .try_into()
         .map_err(|_| BqError::query(format!("{name} expects 1 argument")))?;
     match arg {
         BqValue::Null => Ok(BqValue::Null),
-        BqValue::String(s) => Ok(BqValue::String(f(&s))),
+        BqValue::String(s) => Ok(BqValue::String(if lower {
+            s.to_lowercase()
+        } else {
+            s.to_uppercase()
+        })),
+        BqValue::Bytes(mut b) => {
+            if lower {
+                b.make_ascii_lowercase();
+            } else {
+                b.make_ascii_uppercase();
+            }
+            Ok(BqValue::Bytes(b))
+        }
         other => Err(BqError::query(format!(
-            "{name} expects STRING, got {}",
+            "{name} expects STRING or BYTES, got {}",
             other.infer_type()?
         ))),
     }

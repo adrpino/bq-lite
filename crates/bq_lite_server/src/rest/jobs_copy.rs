@@ -32,6 +32,7 @@ pub(super) fn run_sql_on_engine_ref(
         fork.catalog_mut().set_default_dataset(default_ds);
     }
     let res = fork.exec_script_with_params(sql, named, pos);
+    fork.clear_temp_objects();
     fork.catalog_mut().set_default_dataset(prev_ds);
     match res {
         Ok(qr) => {

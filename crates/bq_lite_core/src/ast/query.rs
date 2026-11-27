@@ -99,9 +99,10 @@ pub enum GroupByClause {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupByItem {
     Expr(Box<Expr>),
-    Rollup(Vec<Expr>),
-    Cube(Vec<Expr>),
-    GroupingSets(Vec<Vec<Expr>>),
+    Tuple(Vec<Expr>),
+    Rollup(Vec<Vec<Expr>>),
+    Cube(Vec<Vec<Expr>>),
+    GroupingSets(Vec<Self>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

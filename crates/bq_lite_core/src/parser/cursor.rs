@@ -66,6 +66,16 @@ impl Parser {
     }
 
     #[must_use]
+    pub(super) const fn save_pos(&self) -> usize {
+        self.pos
+    }
+
+    pub(super) fn restore_pos(&mut self, pos: usize) {
+        self.pos = pos;
+        self.pending_gt = 0;
+    }
+
+    #[must_use]
     pub(super) fn peek(&self) -> &Token {
         self.tokens
             .get(self.pos)

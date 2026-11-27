@@ -64,6 +64,8 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `GENERATE_UUID` | `implemented` | Random UUID v4 |
 | `GREATEST` | `implemented` | Maximum of arguments |
 | `IEEE_DIVIDE` | `implemented` | IEEE-754 division |
+| `IS_INF` | `implemented` | Check for positive/negative infinity |
+| `IS_NAN` | `implemented` | Check for NaN |
 | `IF` | `implemented` | Conditional expression |
 | `IFNULL` | `implemented` | Null fallback |
 | `INITCAP` | `implemented` | Title case |

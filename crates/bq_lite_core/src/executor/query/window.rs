@@ -1,12 +1,14 @@
-use crate::ast::{Expr, FunctionCall, NamedWindowDef, Select, SelectItem, WindowSpec};
+use crate::ast::{Expr, FunctionCall, NamedWindowDef, OrderByExpr, Select, SelectItem, WindowSpec};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::{eval_expr, values_distinct_eq};
 use crate::types::BqValue;
 
-use super::agg::{execute_grouped_buckets, project_grouped_row};
+use super::agg::{
+    build_select_alias_map, execute_grouped_buckets, project_grouped_row, GroupedSelectOut,
+};
 use super::agg_eval::eval_grouped_expr;
-use super::filter_qualify_with_src;
+use super::agg_grouping::attach_grouped_order_by;
 use super::sort::sort_with_order_keys;
 use super::window_fns::eval_window_partition;
 
@@ -21,7 +23,7 @@ pub(super) fn select_has_windows(select: &Select) -> bool {
         })
 }
 
-fn expr_has_window(expr: &Expr) -> bool {
+pub(super) fn expr_has_window(expr: &Expr) -> bool {
     match expr {
         Expr::Function(call) => {
             call.over.is_some() || call.args.iter().any(|a| expr_has_window(&a.expr))
@@ -110,10 +112,12 @@ pub(super) fn apply_windows(
 
 pub(super) fn execute_grouped_with_windows(
     select: &Select,
+    order_by: &[OrderByExpr],
     rows: &[EvalRow],
     schema_row: &EvalRow,
     ctx: &ExecContext<'_>,
-) -> BqResult<(Vec<EvalRow>, Vec<EvalRow>)> {
+) -> BqResult<GroupedSelectOut> {
+    let alias_map = build_select_alias_map(select);
     let mut buckets = execute_grouped_buckets(select, rows, schema_row, ctx)?;
     let mut calls: Vec<FunctionCall> = Vec::new();
     let mut rewritten = select.clone();
@@ -149,8 +153,52 @@ pub(super) fn execute_grouped_with_windows(
             ctx,
         )?);
     }
-    let src_rows = projected.clone();
-    filter_qualify_with_src(&rewritten, projected, &src_rows, ctx)
+    let mut src_rows = projected.clone();
+    let rewritten_order = if order_by.is_empty() {
+        Vec::new()
+    } else {
+        attach_grouped_order_by(&buckets, &mut src_rows, order_by, &alias_map, ctx)
+    };
+    let (out_proj, out_src) = if let Some(ref qual) = rewritten.qualify {
+        filter_grouped_qualify(qual, &buckets, projected, &src_rows, &alias_map, ctx)?
+    } else {
+        (projected, src_rows)
+    };
+    Ok((out_proj, out_src, rewritten_order))
+}
+
+fn filter_grouped_qualify(
+    qualify: &Expr,
+    buckets: &[super::agg::GroupedBucket],
+    projected: Vec<EvalRow>,
+    src_rows: &[EvalRow],
+    alias_map: &std::collections::BTreeMap<String, Expr>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<(Vec<EvalRow>, Vec<EvalRow>)> {
+    let mut out_proj = Vec::new();
+    let mut out_src = Vec::new();
+    for ((bucket, proj_row), src_row) in buckets.iter().zip(projected).zip(src_rows.iter()) {
+        let mut active = bucket.active_keys.clone();
+        for col in &proj_row.cols {
+            let ident = Expr::Ident(crate::ast::Ident::unquoted(col.name.clone()));
+            if !active.iter().any(|(k, _)| k == &ident) {
+                active.push((ident, col.value.clone()));
+            }
+        }
+        let keys = super::agg::GroupedKeys {
+            active: &active,
+            rolled_up: &bucket.rolled_up_keys,
+            select_aliases: Some(alias_map),
+        };
+        if matches!(
+            eval_grouped_expr(qualify, &bucket.rows, &keys, ctx)?,
+            BqValue::Bool(true)
+        ) {
+            out_proj.push(proj_row);
+            out_src.push(src_row.clone());
+        }
+    }
+    Ok((out_proj, out_src))
 }
 
 fn eval_grouped_window_call(
@@ -167,6 +215,9 @@ fn eval_grouped_window_call(
     let mut syn_rows = vec![EvalRow::default(); buckets.len()];
     let mut syn_call = call.clone();
     for (i, arg) in syn_call.args.iter_mut().enumerate() {
+        if matches!(arg.expr, Expr::Star) {
+            continue;
+        }
         let col_name = format!("__warg_{i}");
         for (b_idx, bucket) in buckets.iter().enumerate() {
             let val = eval_grouped_expr(&arg.expr, &bucket.rows, &bucket.keys(), ctx)?;

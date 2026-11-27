@@ -218,8 +218,14 @@ ARRAY<STRUCT<INT64>>[{42}]
             root.display()
         );
 
+        let filter = std::env::var("BQ_LITE_COMPLIANCE_FILTER").ok();
         let reports: Vec<FileReport> = BUCKET_A_FILES
             .iter()
+            .filter(|fname| {
+                filter
+                    .as_deref()
+                    .is_none_or(|f| f.split(',').any(|pat| fname.contains(pat)))
+            })
             .map(|&fname| {
                 let p = root.join(fname);
                 assert!(
@@ -233,6 +239,10 @@ ARRAY<STRUCT<INT64>>[{42}]
             .collect();
 
         print_scorecard(&reports);
+        if filter.is_some() {
+            print_filtered_failures(&reports);
+            return;
+        }
 
         let baseline_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/googlesql_compliance/baseline.json");
@@ -275,6 +285,18 @@ ARRAY<STRUCT<INT64>>[{42}]
                 "GoogleSQL compliance regressions detected:\n{}",
                 regressions.join("\n")
             );
+        }
+    }
+
+    fn print_filtered_failures(reports: &[FileReport]) {
+        let mut out = std::io::stdout();
+        for r in reports {
+            if !r.sample_failures.is_empty() {
+                let _ = writeln!(out, "\n--- Failures in {} ---", r.file_name);
+                for s in &r.sample_failures {
+                    let _ = writeln!(out, "  {s}");
+                }
+            }
         }
     }
 
