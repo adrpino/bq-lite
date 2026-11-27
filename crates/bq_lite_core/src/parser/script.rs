@@ -48,16 +48,20 @@ pub(super) fn parse_declare(p: &mut Parser) -> BqResult<DeclareStmt> {
 
 pub(super) fn parse_set(p: &mut Parser) -> BqResult<SetStmt> {
     p.expect_kw("SET")?;
-    let targets = if p.eat(&TokenKind::LParen) {
+    let (targets, parenthesized) = if p.eat(&TokenKind::LParen) {
         let vars = p.parse_comma_list(Parser::parse_ident)?;
         p.expect(&TokenKind::RParen, "')'")?;
-        vars
+        (vars, true)
     } else {
-        vec![p.parse_ident()?]
+        (vec![p.parse_ident()?], false)
     };
     p.expect(&TokenKind::Eq, "'='")?;
     let value = parse_expr(p)?;
-    Ok(SetStmt { targets, value })
+    Ok(SetStmt {
+        targets,
+        parenthesized,
+        value,
+    })
 }
 
 pub(super) fn parse_if(p: &mut Parser) -> BqResult<IfStmt> {

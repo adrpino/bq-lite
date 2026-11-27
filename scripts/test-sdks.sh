@@ -405,57 +405,9 @@ else
     echo "cargo not installed, skipping Rust SDK"
 fi
 
-echo "==> 5. dbt-bigquery smoke test"
+echo "==> 5. dbt-bigquery advanced E2E suite"
 if command -v python3 >/dev/null 2>&1; then
-    DBT_VENV="$CACHE_DIR/dbt_venv"
-    if [ ! -x "$DBT_VENV/bin/dbt" ]; then
-        python3 -m venv "$DBT_VENV"
-        "$DBT_VENV/bin/pip" install --quiet --upgrade pip certifi
-        CERT_PATH="$("$DBT_VENV/bin/python" -c 'import certifi; print(certifi.where())')"
-        SSL_CERT_FILE="$CERT_PATH" "$DBT_VENV/bin/pip" install --quiet dbt-bigquery
-    fi
-    DBT_PROJ="$CACHE_DIR/dbt_proj"
-    rm -rf "$DBT_PROJ"
-    mkdir -p "$DBT_PROJ/models"
-    cat >"$DBT_PROJ/dbt_project.yml" <<'DBTYML'
-name: 'bqlite_smoke'
-version: '1.0.0'
-profile: 'bqlite_smoke'
-model-paths: ["models"]
-DBTYML
-    cat >"$DBT_PROJ/profiles.yml" <<PROFYML
-bqlite_smoke:
-  target: dev
-  outputs:
-    dev:
-      type: bigquery
-      method: oauth-secrets
-      token: "local-token"
-      project: test-proj
-      dataset: dbt_smoke
-      threads: 1
-      api_endpoint: "http://127.0.0.1:$PORT"
-PROFYML
-    cat >"$DBT_PROJ/models/base_items.sql" <<'MSQL'
-{{ config(materialized='table') }}
-SELECT 1 AS id, 'alpha' AS label
-UNION ALL
-SELECT 2 AS id, 'beta' AS label
-MSQL
-    cat >"$DBT_PROJ/models/view_items.sql" <<'VSQL'
-{{ config(materialized='view') }}
-SELECT id, UPPER(label) AS upper_label FROM {{ ref('base_items') }}
-VSQL
-    cat >"$DBT_PROJ/models/schema.yml" <<'SYML'
-version: 2
-models:
-  - name: base_items
-    columns:
-      - name: id
-        tests: [unique, not_null]
-SYML
-    (cd "$DBT_PROJ" && GOOGLE_OAUTH_ACCESS_TOKEN="local-token" "$DBT_VENV/bin/dbt" run --profiles-dir "$DBT_PROJ" --quiet && GOOGLE_OAUTH_ACCESS_TOKEN="local-token" "$DBT_VENV/bin/dbt" test --profiles-dir "$DBT_PROJ" --quiet)
-    echo "dbt-bigquery smoke E2E PASSED"
+    BQ_LITE_ENDPOINT="http://127.0.0.1:$PORT" "$ROOT_DIR/scripts/test-dbt.sh"
 fi
 
 echo "==> SDK E2E suite PASSED"

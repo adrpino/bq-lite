@@ -205,6 +205,7 @@ fn update_table_impl(
             Ok(m) => m.clone(),
             Err(err) => return bq_error_response(&err),
         };
+        let old_cols = existing.columns.clone();
         let mut updated = existing;
         if let Err(err) = apply_table_updates(&mut updated, body, is_put) {
             return bq_error_response(&err);
@@ -215,6 +216,34 @@ fn update_table_impl(
             .put_table(&canonical, updated.clone(), true, false)
         {
             return bq_error_response(&err);
+        }
+        if updated.columns != old_cols {
+            let mapping: Vec<Option<usize>> = updated
+                .columns
+                .iter()
+                .map(|nc| {
+                    old_cols
+                        .iter()
+                        .position(|oc| oc.name.eq_ignore_ascii_case(&nc.name))
+                })
+                .collect();
+            let old_rows = eng.storage().read_rows(&canonical);
+            if !old_rows.is_empty() {
+                let realigned: Vec<Vec<bq_lite_core::BqValue>> = old_rows
+                    .into_iter()
+                    .map(|row| {
+                        mapping
+                            .iter()
+                            .map(|opt_idx| {
+                                opt_idx
+                                    .and_then(|i| row.get(i).cloned())
+                                    .unwrap_or(bq_lite_core::BqValue::Null)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                eng.storage_mut().replace_rows(&canonical, realigned);
+            }
         }
         let cnt = eng.storage().read_rows(&canonical).len();
         drop(eng);

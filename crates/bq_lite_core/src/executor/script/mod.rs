@@ -230,7 +230,7 @@ fn exec_set(
     storage: &StorageEngine,
     state: &mut ScriptState,
 ) -> BqResult<FlowSignal> {
-    if stmt.targets.len() == 1 {
+    if !stmt.parenthesized && stmt.targets.len() == 1 {
         let val = eval_in_state(&stmt.value, catalog, storage, state)?;
         if let Some(first) = stmt.targets.first() {
             state.vars.insert(first.value.to_ascii_lowercase(), val);
@@ -240,7 +240,26 @@ fn exec_set(
     if let crate::ast::Expr::Subquery(ref q) = stmt.value {
         let ctx = state.make_ctx(catalog, storage);
         let qr = execute_query(q, &ctx)?;
-        let row = qr.rows.into_iter().next().unwrap_or_default();
+        let Some(row) = qr.rows.into_iter().next() else {
+            for target in &stmt.targets {
+                state
+                    .vars
+                    .insert(target.value.to_ascii_lowercase(), BqValue::Null);
+            }
+            return Ok(FlowSignal::Normal);
+        };
+        if row.len() == 1 {
+            if let Some(BqValue::Struct(fields)) = row.first() {
+                if fields.len() == stmt.targets.len() {
+                    for (target, field) in stmt.targets.iter().zip(fields.iter()) {
+                        state
+                            .vars
+                            .insert(target.value.to_ascii_lowercase(), field.value.clone());
+                    }
+                    return Ok(FlowSignal::Normal);
+                }
+            }
+        }
         if row.len() != stmt.targets.len() {
             return Err(BqError::query("Multi-variable SET column count mismatch"));
         }
@@ -250,20 +269,26 @@ fn exec_set(
         return Ok(FlowSignal::Normal);
     }
     let val = eval_in_state(&stmt.value, catalog, storage, state)?;
-    let BqValue::Struct(fields) = val else {
-        return Err(BqError::query(
-            "Multi-variable SET requires a STRUCT or subquery value",
-        ));
-    };
-    if fields.len() != stmt.targets.len() {
-        return Err(BqError::query("Multi-variable SET field count mismatch"));
+    if let BqValue::Struct(fields) = val {
+        if fields.len() != stmt.targets.len() {
+            return Err(BqError::query("Multi-variable SET field count mismatch"));
+        }
+        for (target, field) in stmt.targets.iter().zip(fields) {
+            state
+                .vars
+                .insert(target.value.to_ascii_lowercase(), field.value);
+        }
+        return Ok(FlowSignal::Normal);
     }
-    for (target, field) in stmt.targets.iter().zip(fields) {
-        state
-            .vars
-            .insert(target.value.to_ascii_lowercase(), field.value);
+    if stmt.targets.len() == 1 {
+        if let Some(first) = stmt.targets.first() {
+            state.vars.insert(first.value.to_ascii_lowercase(), val);
+        }
+        return Ok(FlowSignal::Normal);
     }
-    Ok(FlowSignal::Normal)
+    Err(BqError::query(
+        "Multi-variable SET requires a STRUCT or subquery value",
+    ))
 }
 
 fn exec_transaction(

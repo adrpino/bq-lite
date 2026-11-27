@@ -12,6 +12,7 @@ pub struct DeclareStmt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetStmt {
     pub targets: Vec<Ident>,
+    pub parenthesized: bool,
     pub value: Expr,
 }
 

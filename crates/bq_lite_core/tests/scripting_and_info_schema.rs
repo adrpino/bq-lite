@@ -147,3 +147,38 @@ fn information_schema_exposes_schemata_tables_columns_views_and_routines() {
         ]]
     );
 }
+
+#[test]
+fn script_parenthesized_set_unpacks_select_as_struct_single_and_multi() {
+    let mut e = Engine::new();
+    let res = e
+        .exec_script(
+            "DECLARE parts ARRAY<DATE>;
+             DECLARE a INT64;
+             DECLARE b STRING;
+             DECLARE raw STRUCT<x INT64>;
+             SET (parts) = (
+                 SELECT AS STRUCT ARRAY_AGG(DISTINCT d ORDER BY d)
+                 FROM UNNEST([DATE '2026-01-01', DATE '2026-01-02', DATE '2026-01-01']) AS d
+             );
+             SET (a, b) = (SELECT AS STRUCT 7, 'ok');
+             SET raw = STRUCT(99 AS x);
+             SELECT
+               ARRAY_LENGTH(parts) AS n,
+               DATE '2026-01-02' IN UNNEST(parts) AS has_d2,
+               a,
+               b,
+               raw.x AS rx;",
+        )
+        .unwrap();
+    assert_eq!(
+        res.rows,
+        vec![vec![
+            BqValue::Int64(2),
+            BqValue::Bool(true),
+            BqValue::Int64(7),
+            BqValue::String("ok".to_owned()),
+            BqValue::Int64(99),
+        ]]
+    );
+}

@@ -422,3 +422,66 @@ async fn rest_bounded_job_history_across_many_queries() {
         jobs_ref.read().len()
     );
 }
+
+#[tokio::test]
+async fn rest_patch_table_schema_pads_existing_rows_with_null() {
+    let state = ServerState::new("test-proj");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, build_router(state)).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base}/bigquery/v2/projects/test-proj/datasets"))
+        .json(&json!({ "datasetReference": { "datasetId": "ev" } }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/bigquery/v2/projects/test-proj/queries"))
+        .json(&json!({
+            "query": "CREATE TABLE ev.t AS SELECT 1 AS id, 'a' AS v",
+            "useLegacySql": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let patch_resp = client
+        .patch(format!(
+            "{base}/bigquery/v2/projects/test-proj/datasets/ev/tables/t"
+        ))
+        .json(&json!({
+            "schema": {
+                "fields": [
+                    { "name": "id", "type": "INT64", "mode": "NULLABLE" },
+                    { "name": "v", "type": "STRING", "mode": "NULLABLE" },
+                    { "name": "extra_tag", "type": "STRING", "mode": "NULLABLE" }
+                ]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+
+    let q_resp: serde_json::Value = client
+        .post(format!("{base}/bigquery/v2/projects/test-proj/queries"))
+        .json(&json!({
+            "query": "SELECT id, v, extra_tag FROM ev.t",
+            "useLegacySql": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(q_resp["totalRows"], "1");
+    assert_eq!(q_resp["rows"][0]["f"][0]["v"], "1");
+    assert_eq!(q_resp["rows"][0]["f"][1]["v"], "a");
+    assert!(q_resp["rows"][0]["f"][2]["v"].is_null());
+}
