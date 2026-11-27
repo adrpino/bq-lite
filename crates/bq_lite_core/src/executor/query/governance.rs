@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::ast::{Expr, Ident};
 use crate::catalog::{ColumnSchema, RowAccessPolicyMeta};
 use crate::error::{BqError, BqResult};
@@ -11,13 +13,13 @@ pub(super) fn unpack_struct_unnest(
     whole_val: &BqValue,
     whole_ty: &BqType,
 ) -> (Vec<RowBinding>, Vec<RowBinding>) {
-    let qual = alias.map(|a| a.value.clone());
+    let qual: Option<Arc<str>> = alias.map(|a| Arc::from(a.value.as_str()));
     let cols = fields
         .iter()
         .enumerate()
         .map(|(i, sf)| RowBinding {
             qualifier: qual.clone(),
-            name: sf.name.clone().unwrap_or_else(|| format!("f{i}_")),
+            name: Arc::from(sf.name.clone().unwrap_or_else(|| format!("f{i}_"))),
             ty: sf.value.infer_type().unwrap_or(BqType::UntypedNull),
             value: sf.value.clone(),
         })
@@ -37,13 +39,13 @@ pub(super) fn unpack_null_struct_unnest(
     fields: &[StructField],
     alias: Option<&Ident>,
 ) -> (Vec<RowBinding>, Vec<RowBinding>) {
-    let qual = alias.map(|a| a.value.clone());
+    let qual: Option<Arc<str>> = alias.map(|a| Arc::from(a.value.as_str()));
     let cols = fields
         .iter()
         .enumerate()
         .map(|(i, sf)| RowBinding {
             qualifier: qual.clone(),
-            name: sf.name.clone().unwrap_or_else(|| format!("f{i}_")),
+            name: Arc::from(sf.name.clone().unwrap_or_else(|| format!("f{i}_"))),
             ty: sf.ty.clone(),
             value: BqValue::Null,
         })
@@ -141,28 +143,29 @@ pub(super) fn unnest_schema_row(
 ) -> EvalRow {
     let mut cols = Vec::new();
     let mut pseudo = Vec::new();
+    let qual_arc: Option<Arc<str>> = alias.map(Arc::from);
     if let BqType::Struct(fields) = elem_ty {
         for (i, sf) in fields.iter().enumerate() {
             let fname = sf.name.clone().unwrap_or_else(|| format!("f{i}_"));
             cols.push(RowBinding {
-                qualifier: alias.map(str::to_owned),
-                name: fname,
+                qualifier: qual_arc.clone(),
+                name: Arc::from(fname),
                 ty: sf.ty.clone(),
                 value: BqValue::Null,
             });
         }
-        if let Some(a) = alias {
+        if let Some(a) = qual_arc {
             pseudo.push(RowBinding {
                 qualifier: None,
-                name: a.to_owned(),
+                name: a,
                 ty: elem_ty.clone(),
                 value: BqValue::Null,
             });
         }
     } else {
-        let elem_name = alias.map_or_else(|| "f0_".to_owned(), str::to_owned);
+        let elem_name: Arc<str> = Arc::from(alias.unwrap_or("f0_"));
         cols.push(RowBinding {
-            qualifier: alias.map(str::to_owned),
+            qualifier: qual_arc,
             name: elem_name,
             ty: elem_ty.clone(),
             value: BqValue::Null,
@@ -171,7 +174,7 @@ pub(super) fn unnest_schema_row(
     if let Some(off) = offset_name {
         cols.push(RowBinding {
             qualifier: None,
-            name: off.to_owned(),
+            name: Arc::from(off),
             ty: BqType::Int64,
             value: BqValue::Null,
         });

@@ -9,20 +9,20 @@ use crate::types::BqValue;
 pub(super) fn frame_bounds(
     spec: &WindowSpec,
     pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
+    part_len: usize,
+    part_keys: &[Vec<BqValue>],
     ctx: &ExecContext<'_>,
 ) -> BqResult<(usize, usize)> {
-    let last = part.len().saturating_sub(1);
+    let last = part_len.saturating_sub(1);
     let Some(ref frame) = spec.frame else {
         if spec.order_by.is_empty() {
             return Ok((0, last));
         }
-        let peer_end = find_peer_end(spec, pos, part, rows, ctx)?;
+        let peer_end = find_peer_end(pos, part_keys)?;
         return Ok((0, peer_end));
     };
     if frame.unit == WindowFrameUnit::Range {
-        return range_frame_bounds(spec, frame, pos, part, rows, ctx);
+        return range_frame_bounds(spec, frame, pos, part_len, part_keys, ctx);
     }
     let last_i = i128::try_from(last).unwrap_or(i128::MAX);
     let pos_i = i128::try_from(pos).unwrap_or(0);
@@ -43,12 +43,12 @@ fn range_frame_bounds(
     spec: &WindowSpec,
     frame: &WindowFrame,
     pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
+    part_len: usize,
+    part_keys: &[Vec<BqValue>],
     ctx: &ExecContext<'_>,
 ) -> BqResult<(usize, usize)> {
     if !frame_has_numeric_offsets(frame) {
-        return range_peer_bounds(spec, frame, pos, part, rows, ctx);
+        return range_peer_bounds(spec, frame, pos, part_len, part_keys);
     }
     let Some(ob) = spec.order_by.first() else {
         return Err(BqError::semantic(
@@ -60,35 +60,34 @@ fn range_frame_bounds(
             "RANGE frame with offset requires exactly one ORDER BY expression",
         ));
     }
-    let cur_row = rows
-        .get(*part.get(pos).unwrap_or(&0))
-        .ok_or_else(|| BqError::internal("row"))?;
-    let cur_val = eval_expr(&ob.expr, cur_row, ctx)?;
+    let cur_val = part_keys
+        .get(pos)
+        .and_then(|k| k.first())
+        .ok_or_else(|| BqError::internal("missing order key"))?;
     if cur_val.is_null() || matches!(cur_val, BqValue::Float64(f) if f.is_nan()) {
-        return range_null_bounds(spec, frame, pos, part, rows, ctx);
+        return range_null_bounds(frame, pos, part_len, part_keys);
     }
-    range_offset_bounds(ob, frame, &cur_val, part, rows, ctx)
+    range_offset_bounds(ob, frame, cur_val, part_keys, ctx)
 }
 
 fn range_peer_bounds(
     spec: &WindowSpec,
     frame: &WindowFrame,
     pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
+    part_len: usize,
+    part_keys: &[Vec<BqValue>],
 ) -> BqResult<(usize, usize)> {
-    let last = part.len().saturating_sub(1);
+    let last = part_len.saturating_sub(1);
     let end_bound = frame.end.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
     let start = match frame.start {
         WindowFrameBound::CurrentRow if spec.order_by.is_empty() => 0,
-        WindowFrameBound::CurrentRow => find_peer_start(spec, pos, part, rows, ctx)?,
+        WindowFrameBound::CurrentRow => find_peer_start(pos, part_keys)?,
         WindowFrameBound::Following(None) => last,
         WindowFrameBound::Preceding(_) | WindowFrameBound::Following(Some(_)) => 0,
     };
     let end = match end_bound {
         WindowFrameBound::CurrentRow if spec.order_by.is_empty() => last,
-        WindowFrameBound::CurrentRow => find_peer_end(spec, pos, part, rows, ctx)?,
+        WindowFrameBound::CurrentRow => find_peer_end(pos, part_keys)?,
         WindowFrameBound::Preceding(None) => 0,
         WindowFrameBound::Following(_) | WindowFrameBound::Preceding(Some(_)) => last,
     };
@@ -96,17 +95,15 @@ fn range_peer_bounds(
 }
 
 fn range_null_bounds(
-    spec: &WindowSpec,
     frame: &WindowFrame,
     pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
+    part_len: usize,
+    part_keys: &[Vec<BqValue>],
 ) -> BqResult<(usize, usize)> {
-    let last = part.len().saturating_sub(1);
+    let last = part_len.saturating_sub(1);
     let end_bound = frame.end.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
-    let p_start = find_peer_start(spec, pos, part, rows, ctx)?;
-    let p_end = find_peer_end(spec, pos, part, rows, ctx)?;
+    let p_start = find_peer_start(pos, part_keys)?;
+    let p_end = find_peer_end(pos, part_keys)?;
     let start = if matches!(frame.start, WindowFrameBound::Preceding(None)) {
         0
     } else {
@@ -129,12 +126,15 @@ enum RangeBoundVal {
     Value(BqValue),
 }
 
+fn is_special_range_key(v: &BqValue) -> bool {
+    v.is_null() || matches!(v, BqValue::Float64(f) if f.is_nan())
+}
+
 fn range_offset_bounds(
     ob: &crate::ast::OrderByExpr,
     frame: &WindowFrame,
     cur_val: &BqValue,
-    part: &[usize],
-    rows: &[EvalRow],
+    part_keys: &[Vec<BqValue>],
     ctx: &ExecContext<'_>,
 ) -> BqResult<(usize, usize)> {
     let asc = ob.asc.unwrap_or(true);
@@ -142,35 +142,136 @@ fn range_offset_bounds(
     let end_bound = frame.end.as_ref().unwrap_or(&WindowFrameBound::CurrentRow);
     let lower = eval_range_bound(&frame.start, cur_val, asc, ctx)?;
     let upper = eval_range_bound(end_bound, cur_val, asc, ctx)?;
+
+    let n = part_keys.len();
+    let mut fin_lo = 0_usize;
+    while fin_lo < n
+        && part_keys
+            .get(fin_lo)
+            .and_then(|k| k.first())
+            .is_some_and(is_special_range_key)
+    {
+        fin_lo += 1;
+    }
+    let mut fin_hi = n;
+    while fin_hi > fin_lo
+        && part_keys
+            .get(fin_hi - 1)
+            .and_then(|k| k.first())
+            .is_some_and(is_special_range_key)
+    {
+        fin_hi -= 1;
+    }
+
+    let (lo_rel, hi_rel) = bsearch_finite_range(
+        part_keys.get(fin_lo..fin_hi).unwrap_or(&[]),
+        &lower,
+        &upper,
+        asc,
+    )?;
+    let (mut first_idx, mut last_idx) = if lo_rel < hi_rel {
+        (Some(fin_lo + lo_rel), fin_lo + hi_rel - 1)
+    } else {
+        (None, 0)
+    };
+
     let include_nulls = if nulls_first {
         matches!(frame.start, WindowFrameBound::Preceding(None))
     } else {
         matches!(end_bound, WindowFrameBound::Following(None))
     };
-    let mut first_idx: Option<usize> = None;
-    let mut last_idx: usize = 0;
-    for (idx, &row_idx) in part.iter().enumerate() {
-        let row = rows.get(row_idx).ok_or_else(|| BqError::internal("row"))?;
-        let key = eval_expr(&ob.expr, row, ctx)?;
-        let matches = if key.is_null() {
-            include_nulls
-        } else if matches!(key, BqValue::Float64(f) if f.is_nan()) {
-            if asc {
-                matches!(frame.start, WindowFrameBound::Preceding(None))
-            } else {
-                matches!(end_bound, WindowFrameBound::Following(None))
-            }
-        } else {
-            key_in_range(&key, &lower, &upper, asc)?
+    let include_nan = if asc {
+        matches!(frame.start, WindowFrameBound::Preceding(None))
+    } else {
+        matches!(end_bound, WindowFrameBound::Following(None))
+    };
+    for idx in (0..fin_lo).chain(fin_hi..n) {
+        let Some(v) = part_keys.get(idx).and_then(|k| k.first()) else {
+            continue;
         };
-        if matches {
-            if first_idx.is_none() {
-                first_idx = Some(idx);
-            }
-            last_idx = idx;
+        let ok = if v.is_null() {
+            include_nulls
+        } else {
+            include_nan
+        };
+        if ok {
+            first_idx = Some(first_idx.map_or(idx, |f| f.min(idx)));
+            last_idx = last_idx.max(idx);
         }
     }
     Ok(first_idx.map_or((1, 0), |s| (s, last_idx)))
+}
+
+fn bsearch_finite_range(
+    fin_slice: &[Vec<BqValue>],
+    lower: &RangeBoundVal,
+    upper: &RangeBoundVal,
+    asc: bool,
+) -> BqResult<(usize, usize)> {
+    let mut err: Option<Box<BqError>> = None;
+    let lo_rel = if matches!(lower, RangeBoundVal::Unbounded) {
+        0
+    } else {
+        fin_slice.partition_point(|k| {
+            if err.is_some() {
+                return false;
+            }
+            let Some(v) = k.first() else {
+                return false;
+            };
+            match key_ge_lower(v, lower, asc) {
+                Ok(ge) => !ge,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            }
+        })
+    };
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let hi_rel = if matches!(upper, RangeBoundVal::Unbounded) {
+        fin_slice.len()
+    } else {
+        fin_slice.partition_point(|k| {
+            if err.is_some() {
+                return false;
+            }
+            let Some(v) = k.first() else {
+                return false;
+            };
+            match key_le_upper(v, upper, asc) {
+                Ok(le) => le,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            }
+        })
+    };
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok((lo_rel, hi_rel))
+}
+
+fn key_ge_lower(key: &BqValue, lower: &RangeBoundVal, asc: bool) -> BqResult<bool> {
+    let ord = compare_key_to_bound(key, lower)?;
+    Ok(if asc {
+        matches!(ord, Some(Ordering::Greater | Ordering::Equal))
+    } else {
+        matches!(ord, Some(Ordering::Less | Ordering::Equal))
+    })
+}
+
+fn key_le_upper(key: &BqValue, upper: &RangeBoundVal, asc: bool) -> BqResult<bool> {
+    let ord = compare_key_to_bound(key, upper)?;
+    Ok(if asc {
+        matches!(ord, Some(Ordering::Less | Ordering::Equal))
+    } else {
+        matches!(ord, Some(Ordering::Greater | Ordering::Equal))
+    })
 }
 
 fn compare_key_to_bound(key: &BqValue, bound: &RangeBoundVal) -> BqResult<Option<Ordering>> {
@@ -194,37 +295,6 @@ fn compare_key_to_bound(key: &BqValue, bound: &RangeBoundVal) -> BqResult<Option
         }
         (_, RangeBoundVal::Value(bv)) => compare_values(key, bv),
     }
-}
-
-fn key_in_range(
-    key: &BqValue,
-    lower: &RangeBoundVal,
-    upper: &RangeBoundVal,
-    asc: bool,
-) -> BqResult<bool> {
-    if !matches!(lower, RangeBoundVal::Unbounded) {
-        let ord = compare_key_to_bound(key, lower)?;
-        let ok = if asc {
-            matches!(ord, Some(Ordering::Greater | Ordering::Equal))
-        } else {
-            matches!(ord, Some(Ordering::Less | Ordering::Equal))
-        };
-        if !ok {
-            return Ok(false);
-        }
-    }
-    if !matches!(upper, RangeBoundVal::Unbounded) {
-        let ord = compare_key_to_bound(key, upper)?;
-        let ok = if asc {
-            matches!(ord, Some(Ordering::Less | Ordering::Equal))
-        } else {
-            matches!(ord, Some(Ordering::Greater | Ordering::Equal))
-        };
-        if !ok {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn eval_range_bound(
@@ -341,64 +411,36 @@ pub(super) fn eval_offset_int(expr: &crate::ast::Expr, ctx: &ExecContext<'_>) ->
     }
 }
 
-fn find_peer_start(
-    spec: &WindowSpec,
-    pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-) -> BqResult<usize> {
-    let cur_row = rows
-        .get(*part.get(pos).unwrap_or(&0))
-        .ok_or_else(|| BqError::internal("row"))?;
-    let cur_keys = order_keys(spec, cur_row, ctx)?;
+fn find_peer_start(pos: usize, part_keys: &[Vec<BqValue>]) -> BqResult<usize> {
+    let Some(cur_keys) = part_keys.get(pos) else {
+        return Ok(pos);
+    };
     let mut start = pos;
     while start > 0 {
-        let prev_idx = *part.get(start - 1).unwrap_or(&0);
-        let prev_row = rows.get(prev_idx).ok_or_else(|| BqError::internal("row"))?;
-        let prev_keys = order_keys(spec, prev_row, ctx)?;
-        if keys_equal(&cur_keys, &prev_keys)? {
-            start -= 1;
-        } else {
-            break;
+        if let Some(prev_keys) = part_keys.get(start - 1) {
+            if keys_equal(cur_keys, prev_keys)? {
+                start -= 1;
+                continue;
+            }
         }
+        break;
     }
     Ok(start)
 }
 
-pub(super) fn find_peer_end(
-    spec: &WindowSpec,
-    pos: usize,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-) -> BqResult<usize> {
-    let cur_row = rows
-        .get(*part.get(pos).unwrap_or(&0))
-        .ok_or_else(|| BqError::internal("row"))?;
-    let cur_keys = order_keys(spec, cur_row, ctx)?;
+pub(super) fn find_peer_end(pos: usize, part_keys: &[Vec<BqValue>]) -> BqResult<usize> {
+    let Some(cur_keys) = part_keys.get(pos) else {
+        return Ok(pos);
+    };
     let mut end = pos;
-    while let Some(&next_idx) = part.get(end + 1) {
-        let next_row = rows.get(next_idx).ok_or_else(|| BqError::internal("row"))?;
-        let next_keys = order_keys(spec, next_row, ctx)?;
-        if keys_equal(&cur_keys, &next_keys)? {
+    while let Some(next_keys) = part_keys.get(end + 1) {
+        if keys_equal(cur_keys, next_keys)? {
             end += 1;
         } else {
             break;
         }
     }
     Ok(end)
-}
-
-pub(super) fn order_keys(
-    spec: &WindowSpec,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<Vec<BqValue>> {
-    spec.order_by
-        .iter()
-        .map(|ob| eval_expr(&ob.expr, row, ctx))
-        .collect()
 }
 
 pub(super) fn keys_equal(a: &[BqValue], b: &[BqValue]) -> BqResult<bool> {

@@ -429,13 +429,14 @@ fn exec_truncate(
 }
 
 fn row_to_eval(meta: &TableMeta, row: &[BqValue], qual: &str) -> EvalRow {
+    let qual_arc: Option<std::sync::Arc<str>> = Some(std::sync::Arc::from(qual));
     EvalRow::new(
         meta.columns
             .iter()
             .zip(row)
             .map(|(col, val)| RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: col.name.clone(),
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from(col.name.as_str()),
                 ty: col.ty.clone(),
                 value: val.clone(),
             })
@@ -469,7 +470,7 @@ fn build_returning_result(
         .map(|r| {
             r.cols
                 .iter()
-                .map(|c| QueryColumn::new(c.name.clone(), c.ty.clone()))
+                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                 .collect()
         })
         .unwrap_or_default();

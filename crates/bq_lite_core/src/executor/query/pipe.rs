@@ -86,7 +86,7 @@ fn pipe_select(
                 .iter()
                 .map(|c| RowBinding {
                     qualifier: None,
-                    name: c.name.clone(),
+                    name: std::sync::Arc::from(c.name.as_str()),
                     ty: c.ty.clone(),
                     value: BqValue::Null,
                 })
@@ -118,7 +118,7 @@ fn pipe_extend(
                 .ok_or_else(|| BqError::query("EXTEND expression must have a column alias"))?;
             row.cols.push(RowBinding {
                 qualifier: None,
-                name,
+                name: std::sync::Arc::from(name),
                 ty,
                 value: val,
             });
@@ -131,7 +131,7 @@ fn pipe_extend(
                 .iter()
                 .map(|c| RowBinding {
                     qualifier: None,
-                    name: c.name.clone(),
+                    name: std::sync::Arc::from(c.name.as_str()),
                     ty: c.ty.clone(),
                     value: BqValue::Null,
                 })
@@ -261,7 +261,7 @@ fn eval_rows_to_result_inferred(rows: Vec<EvalRow>) -> QueryResult {
         .map(|r| {
             r.cols
                 .iter()
-                .map(|c| QueryColumn::new(c.name.clone(), c.ty.clone()))
+                .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                 .collect()
         })
         .unwrap_or_default();

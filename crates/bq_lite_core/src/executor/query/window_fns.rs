@@ -1,23 +1,30 @@
-use crate::ast::{FunctionCall, NullHandling, WindowSpec};
+use crate::ast::{BinaryOp, Expr, FunctionCall, NullHandling, WindowSpec};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
-use crate::executor::evaluator::eval_expr;
+use crate::executor::evaluator::{eval_binary, eval_expr};
 use crate::types::BqValue;
 
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
-use super::window_frames::{eval_offset_int, frame_bounds, keys_equal, order_keys};
+use super::exec_util::RowSlice;
+use super::window_frames::{eval_offset_int, frame_bounds, keys_equal};
+
+#[derive(Clone, Copy)]
+pub(super) struct WindowPart<'a> {
+    pub indices: &'a [usize],
+    pub keys: &'a [Vec<BqValue>],
+    pub rows: &'a [EvalRow],
+}
 
 pub(super) fn eval_window_partition(
     call: &FunctionCall,
     spec: &WindowSpec,
-    part: &[usize],
-    rows: &[EvalRow],
+    part: WindowPart<'_>,
     ctx: &ExecContext<'_>,
     out: &mut [BqValue],
 ) -> BqResult<()> {
     let upper = call.name.normalized_parts().join(".").to_ascii_uppercase();
     if is_aggregate_name(&upper) {
-        return eval_window_agg(call, spec, part, rows, ctx, out);
+        return eval_window_agg(&upper, call, spec, part, ctx, out);
     }
     if spec.frame.is_some()
         && matches!(
@@ -38,7 +45,7 @@ pub(super) fn eval_window_partition(
     }
     match upper.as_str() {
         "ROW_NUMBER" => {
-            for (pos, &row_idx) in part.iter().enumerate() {
+            for (pos, &row_idx) in part.indices.iter().enumerate() {
                 set_out(
                     out,
                     row_idx,
@@ -47,12 +54,15 @@ pub(super) fn eval_window_partition(
             }
             Ok(())
         }
-        "RANK" | "DENSE_RANK" => eval_rank_family(&upper, spec, part, rows, ctx, out),
-        "NTILE" => eval_ntile(call, part, ctx, out),
-        "PERCENT_RANK" | "CUME_DIST" => eval_dist_family(&upper, spec, part, rows, ctx, out),
-        "LAG" | "LEAD" => eval_lag_lead(&upper, call, part, rows, ctx, out),
+        "RANK" | "DENSE_RANK" => eval_rank_family(&upper, part.indices, part.keys, out),
+        "NTILE" => eval_ntile(call, part.indices, ctx, out),
+        "PERCENT_RANK" | "CUME_DIST" => {
+            eval_dist_family(&upper, part.indices, part.keys, out);
+            Ok(())
+        }
+        "LAG" | "LEAD" => eval_lag_lead(&upper, call, part.indices, part.rows, ctx, out),
         "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
-            eval_value_fn(&upper, call, part, (spec, rows, ctx), out)
+            eval_value_fn(&upper, call, part, spec, ctx, out)
         }
         _ => Err(BqError::unimplemented(format!(
             "Window function '{upper}' is not implemented"
@@ -62,22 +72,17 @@ pub(super) fn eval_window_partition(
 
 fn eval_rank_family(
     name: &str,
-    spec: &WindowSpec,
     part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
+    part_keys: &[Vec<BqValue>],
     out: &mut [BqValue],
 ) -> BqResult<()> {
     let mut rank = 1_i64;
     let mut dense = 1_i64;
-    let mut prev_keys: Option<Vec<BqValue>> = None;
+    let mut prev_keys: Option<&[BqValue]> = None;
     for (pos, &row_idx) in part.iter().enumerate() {
-        let row = rows
-            .get(row_idx)
-            .ok_or_else(|| BqError::internal("row idx"))?;
-        let keys = order_keys(spec, row, ctx)?;
-        if let Some(ref prev) = prev_keys {
-            if !keys_equal(prev, &keys)? {
+        let keys = part_keys.get(pos).map_or(&[][..], Vec::as_slice);
+        if let Some(prev) = prev_keys {
+            if !keys_equal(prev, keys)? {
                 rank = i64::try_from(pos + 1).unwrap_or(i64::MAX);
                 dense += 1;
             }
@@ -96,44 +101,29 @@ fn eval_rank_family(
     clippy::cast_precision_loss,
     reason = "PERCENT_RANK and CUME_DIST return IEEE-754 FLOAT64 in GoogleSQL"
 )]
-fn eval_dist_family(
-    name: &str,
-    spec: &WindowSpec,
-    part: &[usize],
-    rows: &[EvalRow],
-    ctx: &ExecContext<'_>,
-    out: &mut [BqValue],
-) -> BqResult<()> {
+fn eval_dist_family(name: &str, part: &[usize], part_keys: &[Vec<BqValue>], out: &mut [BqValue]) {
     let total = part.len();
-    let all_keys: Vec<Vec<BqValue>> = part
-        .iter()
-        .map(|&idx| {
-            let row = rows.get(idx).ok_or_else(|| BqError::internal("row idx"))?;
-            order_keys(spec, row, ctx)
-        })
-        .collect::<BqResult<_>>()?;
-
     for (pos, &row_idx) in part.iter().enumerate() {
+        let cur = part_keys.get(pos).map_or(&[][..], Vec::as_slice);
         let val = if name == "PERCENT_RANK" {
             if total <= 1 {
                 0.0
             } else {
-                let first_peer = all_keys
+                let first_peer = part_keys
                     .iter()
-                    .position(|k| keys_equal(k, all_keys.get(pos).unwrap_or(k)).unwrap_or(false))
+                    .position(|k| keys_equal(k, cur).unwrap_or(false))
                     .unwrap_or(pos);
                 (first_peer as f64) / ((total - 1) as f64)
             }
         } else {
-            let last_peer = all_keys
+            let last_peer = part_keys
                 .iter()
-                .rposition(|k| keys_equal(k, all_keys.get(pos).unwrap_or(k)).unwrap_or(false))
+                .rposition(|k| keys_equal(k, cur).unwrap_or(false))
                 .unwrap_or(pos);
             ((last_peer + 1) as f64) / (total as f64)
         };
         set_out(out, row_idx, BqValue::Float64(val));
     }
-    Ok(())
 }
 
 fn eval_ntile(
@@ -269,11 +259,11 @@ fn step_forward(
 fn eval_value_fn(
     name: &str,
     call: &FunctionCall,
-    part: &[usize],
-    win_ctx: (&WindowSpec, &[EvalRow], &ExecContext<'_>),
+    part: WindowPart<'_>,
+    spec: &WindowSpec,
+    ctx: &ExecContext<'_>,
     out: &mut [BqValue],
 ) -> BqResult<()> {
-    let (spec, rows, ctx) = win_ctx;
     let expr = &call
         .args
         .first()
@@ -292,22 +282,33 @@ fn eval_value_fn(
         0
     };
     let ignore_nulls = call.null_handling == Some(NullHandling::IgnoreNulls);
-    for (pos, &row_idx) in part.iter().enumerate() {
-        let (start, end) = frame_bounds(spec, pos, part, rows, ctx)?;
-        let mut frame_vals = Vec::new();
-        for &r_idx in part.get(start..=end).unwrap_or(&[]) {
-            let row = rows
-                .get(r_idx)
+    let vals: Vec<BqValue> = part
+        .indices
+        .iter()
+        .map(|&idx| {
+            let row = part
+                .rows
+                .get(idx)
                 .ok_or_else(|| BqError::internal("row idx"))?;
-            let v = eval_expr(expr, row, ctx)?;
-            if !ignore_nulls || !v.is_null() {
-                frame_vals.push(v);
+            eval_expr(expr, row, ctx)
+        })
+        .collect::<BqResult<_>>()?;
+    for (pos, &row_idx) in part.indices.iter().enumerate() {
+        let (start, end) = frame_bounds(spec, pos, part.indices.len(), part.keys, ctx)?;
+        let slice = vals.get(start..=end).unwrap_or(&[]);
+        let picked = if ignore_nulls {
+            let mut iter = slice.iter().filter(|v| !v.is_null());
+            match name {
+                "FIRST_VALUE" => iter.next().cloned(),
+                "LAST_VALUE" => iter.next_back().cloned(),
+                _ => iter.nth(nth).cloned(),
             }
-        }
-        let picked = match name {
-            "FIRST_VALUE" => frame_vals.first().cloned(),
-            "LAST_VALUE" => frame_vals.last().cloned(),
-            _ => frame_vals.get(nth).cloned(),
+        } else {
+            match name {
+                "FIRST_VALUE" => slice.first().cloned(),
+                "LAST_VALUE" => slice.last().cloned(),
+                _ => slice.get(nth).cloned(),
+            }
         };
         set_out(out, row_idx, picked.unwrap_or(BqValue::Null));
     }
@@ -315,22 +316,82 @@ fn eval_value_fn(
 }
 
 fn eval_window_agg(
+    upper: &str,
     call: &FunctionCall,
     spec: &WindowSpec,
-    part: &[usize],
-    rows: &[EvalRow],
+    part: WindowPart<'_>,
     ctx: &ExecContext<'_>,
     out: &mut [BqValue],
 ) -> BqResult<()> {
-    for (pos, &row_idx) in part.iter().enumerate() {
-        let (start, end) = frame_bounds(spec, pos, part, rows, ctx)?;
-        let slice_rows: Vec<EvalRow> = part
-            .get(start..=end)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|&idx| rows.get(idx).cloned())
-            .collect();
-        let val = eval_aggregate_call(call, &slice_rows, ctx)?;
+    let is_count_star = upper == "COUNT"
+        && call.having.is_none()
+        && matches!(call.args.first().map(|a| &a.expr), Some(Expr::Star));
+    if is_count_star {
+        for (pos, &row_idx) in part.indices.iter().enumerate() {
+            let (start, end) = frame_bounds(spec, pos, part.indices.len(), part.keys, ctx)?;
+            let count = if start <= end && end < part.indices.len() {
+                end - start + 1
+            } else {
+                0
+            };
+            set_out(
+                out,
+                row_idx,
+                BqValue::Int64(i64::try_from(count).unwrap_or(i64::MAX)),
+            );
+        }
+        return Ok(());
+    }
+    if upper == "SUM" && !call.distinct && call.having.is_none() && spec.frame.is_none() {
+        if let Some(arg) = call.args.first() {
+            return eval_cumulative_sum(arg, spec, part, ctx, out);
+        }
+    }
+    for (pos, &row_idx) in part.indices.iter().enumerate() {
+        let (start, end) = frame_bounds(spec, pos, part.indices.len(), part.keys, ctx)?;
+        let indices = part.indices.get(start..=end).unwrap_or(&[]);
+        let val = eval_aggregate_call(
+            call,
+            RowSlice::Indexed {
+                rows: part.rows,
+                indices,
+            },
+            ctx,
+        )?;
+        set_out(out, row_idx, val);
+    }
+    Ok(())
+}
+
+fn eval_cumulative_sum(
+    arg: &crate::ast::FunctionArg,
+    spec: &WindowSpec,
+    part: WindowPart<'_>,
+    ctx: &ExecContext<'_>,
+    out: &mut [BqValue],
+) -> BqResult<()> {
+    let mut vals = Vec::with_capacity(part.indices.len());
+    for &row_idx in part.indices {
+        let row = part
+            .rows
+            .get(row_idx)
+            .ok_or_else(|| BqError::internal("row idx"))?;
+        vals.push(eval_expr(&arg.expr, row, ctx)?);
+    }
+    let mut prefix: Vec<BqValue> = Vec::with_capacity(part.indices.len());
+    let mut acc: Option<BqValue> = None;
+    for v in vals {
+        if !v.is_null() {
+            acc = match acc {
+                None => Some(v),
+                Some(cur) => Some(eval_binary(BinaryOp::Add, cur, v)?),
+            };
+        }
+        prefix.push(acc.clone().unwrap_or(BqValue::Null));
+    }
+    for (pos, &row_idx) in part.indices.iter().enumerate() {
+        let (_, end) = frame_bounds(spec, pos, part.indices.len(), part.keys, ctx)?;
+        let val = prefix.get(end).cloned().unwrap_or(BqValue::Null);
         set_out(out, row_idx, val);
     }
     Ok(())

@@ -4,6 +4,7 @@ mod agg_builtins;
 mod agg_eval;
 mod agg_grouping;
 mod cte;
+mod exec_util;
 mod from;
 mod governance;
 mod joins;
@@ -39,7 +40,7 @@ use from::eval_from_clause_with_schema;
 use pipe::apply_pipe_ops;
 use project::{has_untyped_null, project_eval_rows};
 use schema::infer_select_columns;
-use set_ops::{execute_set_op, rows_equal};
+use set_ops::execute_set_op;
 use sort::{apply_limit_offset, apply_order_by, apply_order_by_with_source, merge_proj_and_source};
 use window::{apply_windows, execute_grouped_with_windows, select_has_windows};
 
@@ -163,6 +164,7 @@ fn execute_select_full(
         rows = filtered;
     }
 
+    let need_src = select.qualify.is_some() || !order_by.is_empty();
     let (mut projected, mut qualify_src, effective_order) = if select_uses_grouping(select) {
         if select_has_windows(select) {
             execute_grouped_with_windows(select, order_by, &rows, &schema_row, ctx)?
@@ -172,11 +174,20 @@ fn execute_select_full(
     } else if select_has_windows(select) {
         let (rewritten, aug_rows) = apply_windows(select, rows, ctx)?;
         let out = project_eval_rows(&rewritten, &aug_rows, ctx)?;
-        let (p, s) = filter_qualify_with_src(&rewritten, out, &aug_rows, ctx)?;
+        let (p, s) = if need_src {
+            filter_qualify_with_src(&rewritten, out, &aug_rows, ctx)?
+        } else {
+            (out, Vec::new())
+        };
         (p, s, order_by.to_vec())
     } else {
         let out = project_eval_rows(select, &rows, ctx)?;
-        let (p, s) = filter_qualify_with_src(select, out, &rows, ctx)?;
+        let (p, s) = if need_src {
+            filter_qualify_with_src(select, out, &rows, ctx)?
+        } else {
+            drop(rows);
+            (out, Vec::new())
+        };
         (p, s, order_by.to_vec())
     };
 
@@ -212,19 +223,33 @@ fn dedup_eval_rows_with_sources(
         }
     }
     let mut out_proj: Vec<EvalRow> = Vec::with_capacity(projected.len());
-    let mut out_src: Vec<EvalRow> = Vec::with_capacity(projected.len());
+    let mut out_src: Vec<EvalRow> = Vec::with_capacity(qualify_src.len());
+    let mut index: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::with_capacity(projected.len());
+    let mut key_buf: Vec<BqValue> = Vec::new();
     for (idx, prow) in projected.iter().enumerate() {
-        let pvals: Vec<BqValue> = prow.cols.iter().map(|c| c.value.clone()).collect();
+        key_buf.clear();
+        key_buf.extend(prow.cols.iter().map(|c| c.value.clone()));
+        let h = exec_util::hash_value_slice(&key_buf);
+        let cands = index.entry(h).or_default();
         let mut dup = false;
-        for existing in &out_proj {
-            let evals: Vec<BqValue> = existing.cols.iter().map(|c| c.value.clone()).collect();
-            if rows_equal(&evals, &pvals)? {
-                dup = true;
-                break;
+        for &ex_idx in cands.iter() {
+            if let Some(existing) = out_proj.get(ex_idx) {
+                if existing.cols.len() == key_buf.len()
+                    && existing.cols.iter().zip(&key_buf).all(|(ec, kv)| {
+                        crate::executor::evaluator::values_distinct_eq(&ec.value, kv)
+                            .unwrap_or(false)
+                    })
+                {
+                    dup = true;
+                    break;
+                }
             }
         }
         if !dup {
+            let new_idx = out_proj.len();
             out_proj.push(prow.clone());
+            cands.push(new_idx);
             if let Some(srow) = qualify_src.get(idx) {
                 out_src.push(srow.clone());
             }
@@ -300,7 +325,7 @@ fn build_select_result(
                 .map(|r| {
                     r.cols
                         .iter()
-                        .map(|c| QueryColumn::new(c.name.clone(), c.ty.clone()))
+                        .map(|c| QueryColumn::new(c.name.as_ref().to_owned(), c.ty.clone()))
                         .collect()
                 })
                 .unwrap_or_default();

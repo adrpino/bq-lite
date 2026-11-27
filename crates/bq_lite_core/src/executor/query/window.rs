@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::ast::{Expr, FunctionCall, NamedWindowDef, OrderByExpr, Select, SelectItem, WindowSpec};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
@@ -9,8 +11,9 @@ use super::agg::{
 };
 use super::agg_eval::eval_grouped_expr;
 use super::agg_grouping::attach_grouped_order_by;
+use super::exec_util::hash_value_slice;
 use super::sort::sort_with_order_keys;
-use super::window_fns::eval_window_partition;
+use super::window_fns::{eval_window_partition, WindowPart};
 
 #[must_use]
 pub(super) fn select_has_windows(select: &Select) -> bool {
@@ -96,7 +99,7 @@ pub(super) fn apply_windows(
 
     for (idx, call) in calls.iter().enumerate() {
         let vals = eval_window_call(call, &rows, &select.window, ctx)?;
-        let col_name = format!("__win_{idx}");
+        let col_name: std::sync::Arc<str> = std::sync::Arc::from(format!("__win_{idx}"));
         for (row, val) in rows.iter_mut().zip(vals) {
             let ty = val.infer_type()?;
             row.cols.push(RowBinding {
@@ -180,7 +183,7 @@ fn filter_grouped_qualify(
     for ((bucket, proj_row), src_row) in buckets.iter().zip(projected).zip(src_rows.iter()) {
         let mut active = bucket.active_keys.clone();
         for col in &proj_row.cols {
-            let ident = Expr::Ident(crate::ast::Ident::unquoted(col.name.clone()));
+            let ident = Expr::Ident(crate::ast::Ident::unquoted(col.name.as_ref()));
             if !active.iter().any(|(k, _)| k == &ident) {
                 active.push((ident, col.value.clone()));
             }
@@ -219,13 +222,14 @@ fn eval_grouped_window_call(
             continue;
         }
         let col_name = format!("__warg_{i}");
+        let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
         for (b_idx, bucket) in buckets.iter().enumerate() {
             let val = eval_grouped_expr(&arg.expr, &bucket.rows, &bucket.keys(), ctx)?;
             let ty = val.infer_type()?;
             if let Some(sr) = syn_rows.get_mut(b_idx) {
                 sr.cols.push(RowBinding {
                     qualifier: None,
-                    name: col_name.clone(),
+                    name: col_arc.clone(),
                     ty,
                     value: val,
                 });
@@ -255,13 +259,14 @@ fn rewrite_spec_exprs(
     let mut out = Vec::with_capacity(exprs.len());
     for (i, expr) in exprs.iter().enumerate() {
         let col_name = format!("__w{prefix}_{i}");
+        let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
         for (b_idx, bucket) in buckets.iter().enumerate() {
             let val = eval_grouped_expr(expr, &bucket.rows, &bucket.keys(), ctx)?;
             let ty = val.infer_type()?;
             if let Some(sr) = syn_rows.get_mut(b_idx) {
                 sr.cols.push(RowBinding {
                     qualifier: None,
-                    name: col_name.clone(),
+                    name: col_arc.clone(),
                     ty,
                     value: val,
                 });
@@ -355,6 +360,7 @@ fn eval_window_call(
     let mut results = vec![BqValue::Null; rows.len()];
 
     for mut part in partitions {
+        let mut part_keys: Vec<Vec<BqValue>> = Vec::new();
         if !spec.order_by.is_empty() {
             let mut keyed: Vec<(usize, Vec<BqValue>)> = Vec::with_capacity(part.len());
             for &idx in &part {
@@ -367,9 +373,19 @@ fn eval_window_call(
                 keyed.push((idx, keys));
             }
             sort_with_order_keys(&mut keyed, &spec.order_by)?;
-            part = keyed.into_iter().map(|(i, _)| i).collect();
+            part = Vec::with_capacity(keyed.len());
+            part_keys = Vec::with_capacity(keyed.len());
+            for (i, k) in keyed {
+                part.push(i);
+                part_keys.push(k);
+            }
         }
-        eval_window_partition(call, &spec, &part, rows, ctx, &mut results)?;
+        let wpart = WindowPart {
+            indices: &part,
+            keys: &part_keys,
+            rows,
+        };
+        eval_window_partition(call, &spec, wpart, ctx, &mut results)?;
     }
     Ok(results)
 }
@@ -403,24 +419,45 @@ fn partition_row_indices(
     spec: &WindowSpec,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<Vec<usize>>> {
+    if spec.partition_by.is_empty() {
+        return Ok(if rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![(0..rows.len()).collect()]
+        });
+    }
     let mut buckets: Vec<(Vec<BqValue>, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
     for (idx, row) in rows.iter().enumerate() {
         let key = spec
             .partition_by
             .iter()
             .map(|e| eval_expr(e, row, ctx))
             .collect::<BqResult<Vec<_>>>()?;
-        let found = buckets.iter_mut().find(|(existing, _)| {
-            existing.len() == key.len()
-                && existing
-                    .iter()
-                    .zip(key.iter())
-                    .all(|(a, b)| values_distinct_eq(a, b).unwrap_or(false))
-        });
-        if let Some((_, list)) = found {
-            list.push(idx);
+        let h = hash_value_slice(&key);
+        let cands = index.entry(h).or_default();
+        let mut found_bucket = None;
+        for &b_idx in cands.iter() {
+            if let Some((existing, _)) = buckets.get(b_idx) {
+                if existing.len() == key.len()
+                    && existing
+                        .iter()
+                        .zip(key.iter())
+                        .all(|(a, b)| values_distinct_eq(a, b).unwrap_or(false))
+                {
+                    found_bucket = Some(b_idx);
+                    break;
+                }
+            }
+        }
+        if let Some(b_idx) = found_bucket {
+            if let Some((_, list)) = buckets.get_mut(b_idx) {
+                list.push(idx);
+            }
         } else {
+            let new_idx = buckets.len();
             buckets.push((key, vec![idx]));
+            cands.push(new_idx);
         }
     }
     Ok(buckets.into_iter().map(|(_, list)| list).collect())

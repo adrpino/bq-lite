@@ -147,12 +147,14 @@ pub(super) fn execute_grouped_select_with_order(
             ctx,
         )?);
     }
-    let mut src_rows = projected.clone();
-    let rewritten_order = if order_by.is_empty() {
-        Vec::new()
+    let (mut src_rows, rewritten_order) = if order_by.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        attach_grouped_order_by(&buckets, &mut src_rows, order_by, &alias_map, ctx)
+        let mut s = projected.clone();
+        let ro = attach_grouped_order_by(&buckets, &mut s, order_by, &alias_map, ctx);
+        (s, ro)
     };
+    let _ = &mut src_rows;
     Ok((projected, src_rows, rewritten_order))
 }
 
@@ -312,7 +314,7 @@ fn expand_group_by(
                             {
                                 continue;
                             }
-                            keys.push(Expr::Ident(Ident::unquoted(col.name.clone())));
+                            keys.push(Expr::Ident(Ident::unquoted(col.name.as_ref())));
                         }
                     }
                 }
@@ -343,7 +345,15 @@ fn bucket_rows(
     key_exprs: &[Expr],
     ctx: &ExecContext<'_>,
 ) -> BqResult<BucketList> {
+    if key_exprs.is_empty() {
+        return Ok(if rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![(Vec::new(), rows.to_vec())]
+        });
+    }
     let mut buckets: BucketList = Vec::new();
+    let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
     for row in rows {
         let mut key_vals = Vec::with_capacity(key_exprs.len());
         for expr in key_exprs {
@@ -355,17 +365,30 @@ fn bucket_rows(
             }
             key_vals.push(val);
         }
-        let found = buckets.iter_mut().find(|(existing, _)| {
-            existing.len() == key_vals.len()
-                && existing
-                    .iter()
-                    .zip(key_vals.iter())
-                    .all(|(a, b)| values_distinct_eq(a, b).unwrap_or(false))
-        });
-        if let Some((_, bucket)) = found {
-            bucket.push(row.clone());
+        let h = super::exec_util::hash_value_slice(&key_vals);
+        let cands = index.entry(h).or_default();
+        let mut found_idx = None;
+        for &b_idx in cands.iter() {
+            if let Some((existing, _)) = buckets.get(b_idx) {
+                if existing.len() == key_vals.len()
+                    && existing
+                        .iter()
+                        .zip(key_vals.iter())
+                        .all(|(a, b)| values_distinct_eq(a, b).unwrap_or(false))
+                {
+                    found_idx = Some(b_idx);
+                    break;
+                }
+            }
+        }
+        if let Some(b_idx) = found_idx {
+            if let Some((_, bucket)) = buckets.get_mut(b_idx) {
+                bucket.push(row.clone());
+            }
         } else {
+            let new_idx = buckets.len();
             buckets.push((key_vals, vec![row.clone()]));
+            cands.push(new_idx);
         }
     }
     Ok(buckets)
@@ -402,7 +425,7 @@ pub(super) fn project_grouped_row(
                     });
                 cols.push(RowBinding {
                     qualifier: None,
-                    name,
+                    name: std::sync::Arc::from(name),
                     ty,
                     value: val,
                 });

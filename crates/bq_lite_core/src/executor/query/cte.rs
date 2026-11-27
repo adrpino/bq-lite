@@ -43,7 +43,7 @@ pub(super) fn eval_with_clause(with: &WithClause, ctx: &mut ExecContext<'_>) -> 
                 col.name.clone_from(&alias.value);
             }
         }
-        ctx.ctes.insert(key, qr);
+        ctx.ctes.insert(key, std::sync::Arc::new(qr));
     }
     Ok(())
 }
@@ -110,7 +110,9 @@ fn eval_recursive_cte(cte: &Cte, ctx: &ExecContext<'_>) -> BqResult<QueryResult>
             return Ok(accumulated);
         }
         let mut step_ctx = ctx.with_outer(&empty_outer);
-        step_ctx.ctes.insert(key.clone(), delta);
+        step_ctx
+            .ctes
+            .insert(key.clone(), std::sync::Arc::new(delta));
         let raw_next = execute_set_expr(rec_expr, &step_ctx)?;
         if raw_next.rows.is_empty() {
             return Ok(accumulated);
@@ -236,17 +238,36 @@ fn filter_new_rows(
     existing: &[Vec<BqValue>],
     candidates: Vec<Vec<BqValue>>,
 ) -> BqResult<Vec<Vec<BqValue>>> {
-    let mut fresh = Vec::new();
+    let mut index: std::collections::HashMap<u64, Vec<(bool, usize)>> =
+        std::collections::HashMap::with_capacity(existing.len() + candidates.len());
+    for (i, ex) in existing.iter().enumerate() {
+        index
+            .entry(super::exec_util::hash_value_slice(ex))
+            .or_default()
+            .push((true, i));
+    }
+    let mut fresh: Vec<Vec<BqValue>> = Vec::new();
     for row in candidates {
+        let h = super::exec_util::hash_value_slice(&row);
+        let cands = index.entry(h).or_default();
         let mut dup = false;
-        for ex in existing.iter().chain(fresh.iter()) {
-            if rows_equal(ex, &row)? {
-                dup = true;
-                break;
+        for &(is_ex, idx) in cands.iter() {
+            let target = if is_ex {
+                existing.get(idx)
+            } else {
+                fresh.get(idx)
+            };
+            if let Some(ex) = target {
+                if rows_equal(ex, &row)? {
+                    dup = true;
+                    break;
+                }
             }
         }
         if !dup {
+            let new_idx = fresh.len();
             fresh.push(row);
+            cands.push((false, new_idx));
         }
     }
     Ok(fresh)

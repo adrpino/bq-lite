@@ -166,7 +166,7 @@ impl Engine {
         row_restriction: &str,
     ) -> BqResult<QueryResult> {
         let mut ctx = ExecContext::new(&self.catalog, &self.storage);
-        ctx.ctes.insert("__src".to_owned(), qr.clone());
+        ctx.ctes.insert("__src".to_owned(), Arc::new(qr.clone()));
         let cols_sql = if selected_fields.is_empty() {
             "*".to_owned()
         } else {

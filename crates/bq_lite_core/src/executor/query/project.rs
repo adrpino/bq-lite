@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::ast::{Expr, ObjectName, Select, SelectItem};
 use crate::error::BqResult;
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
@@ -12,13 +14,32 @@ pub(in crate::executor) fn project_eval_rows(
     rows: &[EvalRow],
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<EvalRow>> {
+    let mut anon_idx = 0_usize;
+    let proj_names: Vec<Option<Arc<str>>> = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, alias } => {
+                let s = alias
+                    .as_ref()
+                    .map(|a| a.value.clone())
+                    .or_else(|| infer_expr_col_name(expr))
+                    .unwrap_or_else(|| {
+                        let n = format!("f{anon_idx}_");
+                        anon_idx += 1;
+                        n
+                    });
+                Some(Arc::from(s))
+            }
+            SelectItem::Wildcard { .. } => None,
+        })
+        .collect();
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut cols = Vec::new();
-        let mut anon_idx = 0_usize;
-        for item in &select.projection {
+        let mut cols = Vec::with_capacity(select.projection.len());
+        for (item, pre_name) in select.projection.iter().zip(&proj_names) {
             match item {
-                SelectItem::Expr { expr, alias } => {
+                SelectItem::Expr { expr, .. } => {
                     let val = eval_expr(expr, row, ctx)?;
                     let raw_ty = val.infer_type()?;
                     let ty = if has_untyped_null(&raw_ty) {
@@ -26,15 +47,7 @@ pub(in crate::executor) fn project_eval_rows(
                     } else {
                         raw_ty
                     };
-                    let name = alias
-                        .as_ref()
-                        .map(|a| a.value.clone())
-                        .or_else(|| infer_expr_col_name(expr))
-                        .unwrap_or_else(|| {
-                            let n = format!("f{anon_idx}_");
-                            anon_idx += 1;
-                            n
-                        });
+                    let name = pre_name.clone().unwrap_or_else(|| Arc::from("f0_"));
                     cols.push(RowBinding {
                         qualifier: None,
                         name,
@@ -240,7 +253,7 @@ fn build_struct_eval_row(
         {
             struct_row.cols.push(RowBinding {
                 qualifier: None,
-                name: fname,
+                name: Arc::from(fname),
                 ty: fty,
                 value: sf.value.clone(),
             });
@@ -274,14 +287,14 @@ fn push_expanded_binding(
         let rty = rval.infer_type()?;
         out.push(RowBinding {
             qualifier: None,
-            name: name.to_owned(),
+            name: Arc::from(name),
             ty: rty,
             value: rval,
         });
     } else {
         out.push(RowBinding {
             qualifier: None,
-            name: name.to_owned(),
+            name: Arc::from(name),
             ty: ty.clone(),
             value: val.clone(),
         });

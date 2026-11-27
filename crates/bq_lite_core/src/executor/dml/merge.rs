@@ -219,13 +219,14 @@ fn update_row_with_assignments(
 }
 
 fn make_target_eval_row(meta: &TableMeta, row: &[BqValue], qual: &str) -> EvalRow {
+    let qual_arc: Option<std::sync::Arc<str>> = Some(std::sync::Arc::from(qual));
     EvalRow::new(
         meta.columns
             .iter()
             .zip(row)
             .map(|(col, val)| RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: col.name.clone(),
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from(col.name.as_str()),
                 ty: col.ty.clone(),
                 value: val.clone(),
             })

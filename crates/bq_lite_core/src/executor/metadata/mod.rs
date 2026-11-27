@@ -86,8 +86,8 @@ fn resolve_scope(prefix: &[String], catalog: &Catalog) -> (String, Option<String
 
 pub(super) fn binding(qual: &str, name: &str, ty: BqType, value: BqValue) -> RowBinding {
     RowBinding {
-        qualifier: Some(qual.to_owned()),
-        name: name.to_owned(),
+        qualifier: Some(std::sync::Arc::from(qual)),
+        name: std::sync::Arc::from(name),
         ty,
         value,
     }

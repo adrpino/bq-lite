@@ -295,7 +295,7 @@ fn eval_grouped_fn(
         return eval_grouping_fn(call, keys);
     }
     if is_aggregate_name(&name) {
-        return match eval_aggregate_call(call, bucket, ctx) {
+        return match eval_aggregate_call(call, super::exec_util::RowSlice::Owned(bucket), ctx) {
             Ok(val) => Ok(val),
             Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
             Err(err) => Err(err),

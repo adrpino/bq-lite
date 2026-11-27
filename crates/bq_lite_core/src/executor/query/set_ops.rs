@@ -151,10 +151,25 @@ fn eval_except(
 }
 
 pub(super) fn dedup_rows(rows: Vec<Vec<BqValue>>) -> BqResult<Vec<Vec<BqValue>>> {
-    let mut out = Vec::with_capacity(rows.len());
+    let mut out: Vec<Vec<BqValue>> = Vec::with_capacity(rows.len());
+    let mut index: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        if find_row(&out, &row)?.is_none() {
+        let h = super::exec_util::hash_value_slice(&row);
+        let cands = index.entry(h).or_default();
+        let mut seen = false;
+        for &idx in cands.iter() {
+            if let Some(ex) = out.get(idx) {
+                if rows_equal(ex, &row)? {
+                    seen = true;
+                    break;
+                }
+            }
+        }
+        if !seen {
+            let new_idx = out.len();
             out.push(row);
+            cands.push(new_idx);
         }
     }
     Ok(out)

@@ -43,20 +43,62 @@ pub(super) fn eval_join_with_schema(
     )? {
         return Ok((rows, out_schema));
     }
+    let rows = nested_loop_join(
+        left_rows,
+        left_schema,
+        &right_rows,
+        &right_schema,
+        join,
+        ctx,
+    )?;
+    Ok((rows, out_schema))
+}
+
+fn nested_loop_join(
+    left_rows: &[EvalRow],
+    left_schema: &EvalRow,
+    right_rows: &[EvalRow],
+    right_schema: &EvalRow,
+    join: &Join,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<EvalRow>> {
     let left_null = null_out_eval_row(left_schema);
-    let right_null = null_out_eval_row(&right_schema);
+    let right_null = null_out_eval_row(right_schema);
     let mut right_matched = vec![false; right_rows.len()];
     let mut out = Vec::new();
+    let mut scratch = EvalRow::default();
 
     for lrow in left_rows {
         let mut l_matched = false;
-        for (r_idx, rrow) in right_rows.iter().enumerate() {
-            if let Some(joined) = try_join_pair(lrow, rrow, &join.constraint, ctx)? {
-                l_matched = true;
-                if let Some(slot) = right_matched.get_mut(r_idx) {
-                    *slot = true;
+        if let JoinConstraint::On(ref expr) = join.constraint {
+            scratch.cols.clear();
+            scratch.cols.extend(lrow.cols.iter().cloned());
+            scratch.pseudo_cols.clear();
+            scratch.pseudo_cols.extend(lrow.pseudo_cols.iter().cloned());
+            let l_col_len = scratch.cols.len();
+            let l_pseudo_len = scratch.pseudo_cols.len();
+            for (r_idx, rrow) in right_rows.iter().enumerate() {
+                scratch.cols.truncate(l_col_len);
+                scratch.cols.extend(rrow.cols.iter().cloned());
+                scratch.pseudo_cols.truncate(l_pseudo_len);
+                scratch.pseudo_cols.extend(rrow.pseudo_cols.iter().cloned());
+                if matches!(eval_expr(expr, &scratch, ctx)?, BqValue::Bool(true)) {
+                    l_matched = true;
+                    if let Some(slot) = right_matched.get_mut(r_idx) {
+                        *slot = true;
+                    }
+                    out.push(scratch.clone());
                 }
-                out.push(joined);
+            }
+        } else {
+            for (r_idx, rrow) in right_rows.iter().enumerate() {
+                if let Some(joined) = try_join_pair(lrow, rrow, &join.constraint, ctx)? {
+                    l_matched = true;
+                    if let Some(slot) = right_matched.get_mut(r_idx) {
+                        *slot = true;
+                    }
+                    out.push(joined);
+                }
             }
         }
         if !l_matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
@@ -79,7 +121,7 @@ pub(super) fn eval_join_with_schema(
             }
         }
     }
-    Ok((out, out_schema))
+    Ok(out)
 }
 
 fn merged_join_schema(left: &EvalRow, right: &EvalRow, constraint: &JoinConstraint) -> EvalRow {
@@ -160,7 +202,7 @@ fn record_using_table_cols(
         if is_using(&col.name) {
             if let Some(ref q) = col.qualifier {
                 if !touched_quals.iter().any(|t| t.eq_ignore_ascii_case(q)) {
-                    touched_quals.push(q.clone());
+                    touched_quals.push(q.as_ref().to_owned());
                 }
             }
         }

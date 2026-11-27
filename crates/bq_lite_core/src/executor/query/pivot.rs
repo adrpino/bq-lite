@@ -59,7 +59,7 @@ fn collect_pivot_group_cols(rows: &[EvalRow], spec: &PivotSpec) -> Vec<String> {
                     !c.name.eq_ignore_ascii_case(&spec.for_col.value)
                         && !agg_references_col(&spec.aggregates, &c.name)
                 })
-                .map(|c| c.name.clone())
+                .map(|c| c.name.as_ref().to_owned())
                 .collect()
         })
         .unwrap_or_default()
@@ -95,13 +95,14 @@ fn build_pivot_row(
     bucket: &[EvalRow],
     ctx: &ExecContext<'_>,
 ) -> BqResult<EvalRow> {
+    let qual_arc: Option<std::sync::Arc<str>> = params.alias.map(std::sync::Arc::from);
     let mut bindings: Vec<RowBinding> = params
         .group_cols
         .iter()
         .zip(key)
         .map(|(name, val)| RowBinding {
-            qualifier: params.alias.map(str::to_owned),
-            name: name.clone(),
+            qualifier: qual_arc.clone(),
+            name: std::sync::Arc::from(name.as_str()),
             ty: val.infer_type().unwrap_or(BqType::UntypedNull),
             value: val,
         })
@@ -128,8 +129,8 @@ fn build_pivot_row(
                 .as_ref()
                 .map_or_else(|| plabel.clone(), |a| format!("{}_{plabel}", a.value));
             bindings.push(RowBinding {
-                qualifier: params.alias.map(str::to_owned),
-                name: col_name,
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from(col_name),
                 ty: val.infer_type()?,
                 value: val,
             });
@@ -216,11 +217,12 @@ fn base_unpivot_cols(
     excluded: &BTreeSet<String>,
     alias: Option<&str>,
 ) -> Vec<RowBinding> {
+    let qual_arc: Option<std::sync::Arc<str>> = alias.map(std::sync::Arc::from);
     row.cols
         .iter()
         .filter(|c| !excluded.contains(&c.name.to_ascii_lowercase()))
         .map(|c| RowBinding {
-            qualifier: alias.map(str::to_owned),
+            qualifier: qual_arc.clone(),
             name: c.name.clone(),
             ty: c.ty.clone(),
             value: c.value.clone(),
@@ -249,11 +251,12 @@ fn build_unpivot_row(
     if !spec.include_nulls && vals.iter().all(|b| b.value.is_null()) {
         return Ok(None);
     }
+    let qual_arc: Option<std::sync::Arc<str>> = alias.map(std::sync::Arc::from);
     let mut new_cols = base_cols.to_vec();
     for (dst_ident, src_binding) in spec.value_cols.iter().zip(vals) {
         new_cols.push(RowBinding {
-            qualifier: alias.map(str::to_owned),
-            name: dst_ident.value.clone(),
+            qualifier: qual_arc.clone(),
+            name: std::sync::Arc::from(dst_ident.value.as_str()),
             ty: src_binding.ty,
             value: src_binding.value,
         });
@@ -268,8 +271,8 @@ fn build_unpivot_row(
             .join("_"),
     };
     new_cols.push(RowBinding {
-        qualifier: alias.map(str::to_owned),
-        name: spec.name_col.value.clone(),
+        qualifier: qual_arc,
+        name: std::sync::Arc::from(spec.name_col.value.as_str()),
         ty: BqType::String,
         value: BqValue::String(label),
     });

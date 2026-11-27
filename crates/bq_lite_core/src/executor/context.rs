@@ -13,8 +13,8 @@ use super::result::QueryResult;
 /// A single column binding in the current evaluation row.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RowBinding {
-    pub qualifier: Option<String>,
-    pub name: String,
+    pub qualifier: Option<Arc<str>>,
+    pub name: Arc<str>,
     pub ty: BqType,
     pub value: BqValue,
 }
@@ -42,16 +42,23 @@ impl EvalRow {
 
     #[must_use]
     pub(super) fn from_query_result(alias: Option<&str>, qr: &QueryResult) -> Vec<Self> {
+        let qual: Option<Arc<str>> = alias.map(Arc::from);
+        let col_names: Vec<Arc<str>> = qr
+            .columns
+            .iter()
+            .map(|c| Arc::from(c.name.as_str()))
+            .collect();
         qr.rows
             .iter()
             .map(|row| {
                 let cols = qr
                     .columns
                     .iter()
+                    .zip(col_names.iter())
                     .zip(row.iter())
-                    .map(|(col, val)| RowBinding {
-                        qualifier: alias.map(str::to_owned),
-                        name: col.name.clone(),
+                    .map(|((col, cname), val)| RowBinding {
+                        qualifier: qual.clone(),
+                        name: cname.clone(),
                         ty: col.ty.clone(),
                         value: val.clone(),
                     })
@@ -97,7 +104,7 @@ impl EvalRow {
             self.cols
                 .iter()
                 .map(|c| BqStructFieldValue {
-                    name: Some(c.name.clone()),
+                    name: Some(c.name.as_ref().to_owned()),
                     value: c.value.clone(),
                 })
                 .collect(),
@@ -140,7 +147,7 @@ impl Default for GovernanceConfig {
 pub(super) struct ExecContext<'a> {
     pub catalog: &'a Catalog,
     pub storage: &'a StorageEngine,
-    pub ctes: BTreeMap<String, QueryResult>,
+    pub ctes: BTreeMap<String, Arc<QueryResult>>,
     pub params: BTreeMap<String, BqValue>,
     pub positional_params: Vec<BqValue>,
     pub vars: BTreeMap<String, BqValue>,

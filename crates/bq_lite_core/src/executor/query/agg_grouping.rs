@@ -231,11 +231,12 @@ pub(super) fn attach_grouped_order_by(
             }
         }
         if evaluated_all {
+            let col_arc: std::sync::Arc<str> = std::sync::Arc::from(col_name.as_str());
             for (srow, val) in src_rows.iter_mut().zip(vals) {
                 let ty = val.infer_type().unwrap_or(BqType::UntypedNull);
                 srow.cols.push(RowBinding {
                     qualifier: None,
-                    name: col_name.clone(),
+                    name: col_arc.clone(),
                     ty,
                     value: val,
                 });

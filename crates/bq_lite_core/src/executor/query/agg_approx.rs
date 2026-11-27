@@ -2,17 +2,18 @@ use std::cmp::Ordering;
 
 use crate::ast::{FunctionCall, NullHandling};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::ExecContext;
 use crate::executor::evaluator::{compare_values, eval_expr};
 use crate::types::BqValue;
 
 use super::agg_builtins::{collect_arg_values, dedup_values};
+use super::exec_util::RowSlice;
 
 const MAX_APPROX_QUANTILES: i64 = 1_000_000;
 
 pub(super) fn eval_approx_quantiles(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let [val_arg, count_arg] = call.args.as_slice() else {
@@ -42,7 +43,7 @@ pub(super) fn eval_approx_quantiles(
 
     let respect_nulls = matches!(call.null_handling, Some(NullHandling::RespectNulls));
     let mut vals = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in rows.iter() {
         let v = eval_expr(&val_arg.expr, row, ctx)?;
         if v.is_null() && !respect_nulls {
             continue;
@@ -70,14 +71,14 @@ pub(super) fn eval_approx_quantiles(
 
 pub(super) fn eval_approx_count_distinct(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let [val_arg] = call.args.as_slice() else {
         return Err(BqError::query("APPROX_COUNT_DISTINCT expects 1 argument"));
     };
     let mut vals = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in rows.iter() {
         let v = eval_expr(&val_arg.expr, row, ctx)?;
         if !v.is_null() {
             vals.push(v);
@@ -141,7 +142,7 @@ fn compare_nan_aware(a: &BqValue, b: &BqValue) -> Option<Ordering> {
 )]
 pub(super) fn eval_stat_agg(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
     is_stddev: bool,
     is_pop: bool,

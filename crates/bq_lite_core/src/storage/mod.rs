@@ -143,6 +143,15 @@ impl StorageEngine {
     }
 
     #[must_use]
+    pub fn read_rows_ref(&self, tref: &TableRef) -> (&[Row], &[DateTime<Utc>]) {
+        self.tables
+            .get(&tref.storage_key())
+            .map_or((&[], &[]), |s| {
+                (s.current.as_slice(), s.ingestion_times.as_slice())
+            })
+    }
+
+    #[must_use]
     pub fn read_rows_with_times(
         &self,
         tref: &TableRef,

@@ -28,9 +28,10 @@ pub(super) fn eval_table_function(
             let table_q = require_table_arg(param, arg)?;
             let table_qr = execute_query(table_q, ctx)?;
             let validated = validate_and_coerce_tvf_table(expected_fields, table_qr)?;
-            sub_ctx
-                .ctes
-                .insert(param.name.value.to_ascii_lowercase(), validated);
+            sub_ctx.ctes.insert(
+                param.name.value.to_ascii_lowercase(),
+                std::sync::Arc::new(validated),
+            );
         } else {
             let val = eval_expr(&arg.expr, &EvalRow::default(), ctx)?;
             let target_ty = param.ty.to_bq_type()?;
@@ -61,7 +62,7 @@ pub(super) fn eval_table_function_schema(
             validate_tvf_columns(expected_fields, &mut cols)?;
             sub_ctx.ctes.insert(
                 param.name.value.to_ascii_lowercase(),
-                QueryResult::new(cols, Vec::new()),
+                std::sync::Arc::new(QueryResult::new(cols, Vec::new())),
             );
         } else {
             let val = eval_expr(&arg.expr, &EvalRow::default(), ctx)?;
@@ -73,12 +74,13 @@ pub(super) fn eval_table_function_schema(
         }
     }
     let out_cols = infer_query_columns(q, &sub_ctx)?;
+    let qual_arc: Option<std::sync::Arc<str>> = alias.map(std::sync::Arc::from);
     Ok(EvalRow::new(
         out_cols
             .into_iter()
             .map(|c| RowBinding {
-                qualifier: alias.map(str::to_owned),
-                name: c.name,
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from(c.name),
                 ty: c.ty,
                 value: BqValue::Null,
             })

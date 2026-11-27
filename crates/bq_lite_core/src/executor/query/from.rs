@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 
 use crate::ast::{TableFactor, TableWithJoins};
@@ -253,22 +255,30 @@ fn eval_wildcard_tables(
             continue;
         };
         let concrete_ref = crate::catalog::TableRef::new(&tref.project, &tref.dataset, tbl_name);
-        let qual = alias.unwrap_or(tbl_name);
-        for row in ctx.storage.read_rows(&concrete_ref) {
+        let qual_arc: Option<Arc<str>> = Some(Arc::from(alias.unwrap_or(tbl_name)));
+        let col_names: Vec<Arc<str>> = meta
+            .columns
+            .iter()
+            .map(|c| Arc::from(c.name.as_str()))
+            .collect();
+        let suffix_name: Arc<str> = Arc::from("_TABLE_SUFFIX");
+        let (rows_ref, _) = ctx.storage.read_rows_ref(&concrete_ref);
+        for row in rows_ref {
             let mut cols: Vec<RowBinding> = meta
                 .columns
                 .iter()
+                .zip(&col_names)
                 .zip(row)
-                .map(|(col, val)| RowBinding {
-                    qualifier: Some(qual.to_owned()),
-                    name: col.name.clone(),
+                .map(|((col, cname), val)| RowBinding {
+                    qualifier: qual_arc.clone(),
+                    name: cname.clone(),
                     ty: col.ty.clone(),
-                    value: val,
+                    value: val.clone(),
                 })
                 .collect();
             cols.push(RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_TABLE_SUFFIX".to_owned(),
+                qualifier: qual_arc.clone(),
+                name: suffix_name.clone(),
                 ty: BqType::String,
                 value: BqValue::String(suffix.to_owned()),
             });
@@ -293,87 +303,110 @@ fn eval_concrete_table(
         let qr = execute_query(vq, ctx)?;
         return Ok(EvalRow::from_query_result(Some(qual), &qr));
     }
-    let rows_with_ts: Vec<(Vec<BqValue>, DateTime<Utc>)> = if meta.kind == TableKind::External {
-        let (_, ext_rows) = crate::executor::ddl::load_external_rows(meta)?;
-        ext_rows.into_iter().map(|r| (r, meta.created_at)).collect()
-    } else if let Some(st_expr) = system_time {
-        let ts = eval_system_time(st_expr, ctx)?;
-        ctx.storage
-            .read_rows_as_of(tref, ts)?
-            .into_iter()
-            .map(|r| (r, meta.created_at))
-            .collect()
-    } else {
-        ctx.storage.read_rows_with_times(tref, meta.created_at)
-    };
     let policies = ctx
         .catalog
         .get_dataset(&tref.project, &tref.dataset)
         .ok()
         .and_then(|ds| ds.policies.get(&meta.name))
         .filter(|list| !list.is_empty());
+    let qual_arc: Option<Arc<str>> = Some(Arc::from(qual));
+    let col_names: Vec<Arc<str>> = meta
+        .columns
+        .iter()
+        .map(|c| Arc::from(c.name.as_str()))
+        .collect();
+    let names_pair = (&qual_arc, col_names.as_slice());
 
-    let mut out = Vec::with_capacity(rows_with_ts.len());
-    for (row, ing_ts) in rows_with_ts {
-        let eval_row = build_concrete_eval_row(meta, qual, row, ing_ts, ctx);
-        if let Some(pol_list) = policies {
-            let mut allowed = false;
-            for pol in pol_list {
-                if !policy_matches_session(pol, ctx) {
-                    continue;
-                }
-                if matches!(
-                    eval_expr(&pol.filter_expr, &eval_row, ctx)?,
-                    BqValue::Bool(true)
-                ) {
-                    allowed = true;
-                    break;
-                }
-            }
-            if !allowed {
-                continue;
+    if meta.kind == TableKind::Table && system_time.is_none() {
+        let (rows_ref, times_ref) = ctx.storage.read_rows_ref(tref);
+        let mut out = Vec::with_capacity(rows_ref.len());
+        for (i, row) in rows_ref.iter().enumerate() {
+            let ing_ts = times_ref.get(i).copied().unwrap_or(meta.created_at);
+            let eval_row = build_concrete_eval_row(meta, names_pair, row.clone(), ing_ts, ctx);
+            if check_row_policies(&eval_row, policies, ctx)? {
+                out.push(eval_row);
             }
         }
-        out.push(eval_row);
+        return Ok(out);
+    }
+
+    let owned_rows: Vec<Vec<BqValue>> = if meta.kind == TableKind::External {
+        crate::executor::ddl::load_external_rows(meta)?.1
+    } else if let Some(st_expr) = system_time {
+        let ts = eval_system_time(st_expr, ctx)?;
+        ctx.storage.read_rows_as_of(tref, ts)?
+    } else {
+        ctx.storage.read_rows(tref)
+    };
+    let mut out = Vec::with_capacity(owned_rows.len());
+    for row in owned_rows {
+        let eval_row = build_concrete_eval_row(meta, names_pair, row, meta.created_at, ctx);
+        if check_row_policies(&eval_row, policies, ctx)? {
+            out.push(eval_row);
+        }
     }
     Ok(out)
 }
 
+fn check_row_policies(
+    eval_row: &EvalRow,
+    policies: Option<&Vec<crate::catalog::RowAccessPolicyMeta>>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<bool> {
+    let Some(pol_list) = policies else {
+        return Ok(true);
+    };
+    for pol in pol_list {
+        if !policy_matches_session(pol, ctx) {
+            continue;
+        }
+        if matches!(
+            eval_expr(&pol.filter_expr, eval_row, ctx)?,
+            BqValue::Bool(true)
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn build_concrete_eval_row(
     meta: &crate::catalog::TableMeta,
-    qual: &str,
+    names: (&Option<Arc<str>>, &[Arc<str>]),
     mut row: Vec<BqValue>,
     ing_ts: DateTime<Utc>,
     ctx: &ExecContext<'_>,
 ) -> EvalRow {
+    let (qual_arc, col_names) = names;
     mask_row_columns(&meta.columns, &mut row, ctx);
-    let part_date = ing_ts.date_naive();
-    let part_ts = DateTime::<Utc>::from_naive_utc_and_offset(
-        part_date.and_hms_opt(0, 0, 0).unwrap_or_default(),
-        Utc,
-    );
     let cols = meta
         .columns
         .iter()
+        .zip(col_names)
         .zip(row)
-        .map(|(col, val)| RowBinding {
-            qualifier: Some(qual.to_owned()),
-            name: col.name.clone(),
+        .map(|((col, cname), val)| RowBinding {
+            qualifier: qual_arc.clone(),
+            name: cname.clone(),
             ty: col.ty.clone(),
             value: val,
         })
         .collect();
     let pseudo = if meta.partition_by.is_some() {
+        let part_date = ing_ts.date_naive();
+        let part_ts = DateTime::<Utc>::from_naive_utc_and_offset(
+            part_date.and_hms_opt(0, 0, 0).unwrap_or_default(),
+            Utc,
+        );
         vec![
             RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_PARTITIONTIME".to_owned(),
+                qualifier: qual_arc.clone(),
+                name: Arc::from("_PARTITIONTIME"),
                 ty: BqType::Timestamp,
                 value: BqValue::Timestamp(part_ts),
             },
             RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_PARTITIONDATE".to_owned(),
+                qualifier: qual_arc.clone(),
+                name: Arc::from("_PARTITIONDATE"),
                 ty: BqType::Date,
                 value: BqValue::Date(part_date),
             },
@@ -422,7 +455,10 @@ fn eval_unnest(
             )))
         }
     };
-    let elem_name = alias.map_or_else(|| "f0_".to_owned(), |a| a.value.clone());
+    let elem_name: Arc<str> = Arc::from(alias.map_or("f0_", |a| a.value.as_str()));
+    let qual_arc: Option<Arc<str>> = alias.map(|a| Arc::from(a.value.as_str()));
+    let offset_arc: Option<Arc<str>> = with_offset
+        .map(|opt_alias| Arc::from(opt_alias.as_ref().map_or("offset", |a| a.value.as_str())));
     let static_elem_ty = match infer_expr_type(expr, row_ref, ctx) {
         BqType::Array(inner) => Some(*inner),
         _ => None,
@@ -435,7 +471,7 @@ fn eval_unnest(
             (BqValue::Null, Some(BqType::Struct(sf))) => unpack_null_struct_unnest(sf, alias),
             _ => (
                 vec![RowBinding {
-                    qualifier: alias.map(|a| a.value.clone()),
+                    qualifier: qual_arc.clone(),
                     name: elem_name.clone(),
                     ty,
                     value: item,
@@ -443,14 +479,11 @@ fn eval_unnest(
                 Vec::new(),
             ),
         };
-        if let Some(opt_alias) = with_offset {
-            let offset_name = opt_alias
-                .as_ref()
-                .map_or_else(|| "offset".to_owned(), |a| a.value.clone());
+        if let Some(ref offset_name) = offset_arc {
             let off_val = i64::try_from(idx).unwrap_or(i64::MAX);
             cols.push(RowBinding {
                 qualifier: None,
-                name: offset_name,
+                name: offset_name.clone(),
                 ty: BqType::Int64,
                 value: BqValue::Int64(off_val),
             });

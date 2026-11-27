@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::ast::{FunctionCall, HavingKind, NullHandling};
 use crate::error::{BqError, BqResult};
@@ -8,6 +9,7 @@ use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqType, BqValue};
 
 use super::agg_approx::{eval_approx_count_distinct, eval_approx_quantiles, eval_stat_agg};
+use super::exec_util::{hash_single_value, RowSlice};
 use super::sort::sort_with_order_keys;
 
 const AGGREGATE_FUNCTIONS: &[&str] = &[
@@ -43,13 +45,13 @@ pub(super) fn is_aggregate_name(name: &str) -> bool {
 
 pub(super) fn eval_aggregate_call(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let filtered_storage;
     let rows = if let Some((having_kind, ref having_expr)) = call.having {
         filtered_storage = filter_rows_by_having(rows, having_kind, having_expr, ctx)?;
-        filtered_storage.as_slice()
+        RowSlice::Owned(filtered_storage.as_slice())
     } else {
         rows
     };
@@ -81,7 +83,7 @@ pub(super) fn eval_aggregate_call(
 
 pub(super) fn collect_arg_values(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<BqValue>> {
     let arg = call
@@ -89,7 +91,7 @@ pub(super) fn collect_arg_values(
         .first()
         .ok_or_else(|| BqError::query("Aggregate expects at least 1 argument"))?;
     let mut vals = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in rows.iter() {
         let v = eval_expr(&arg.expr, row, ctx)?;
         if !v.is_null() {
             vals.push(v);
@@ -102,24 +104,31 @@ pub(super) fn collect_arg_values(
 }
 
 pub(super) fn dedup_values(vals: &mut Vec<BqValue>) -> BqResult<()> {
-    let mut out = Vec::with_capacity(vals.len());
+    let mut out: Vec<BqValue> = Vec::with_capacity(vals.len());
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(vals.len());
     for v in vals.drain(..) {
+        let h = hash_single_value(&v);
+        let bucket = index.entry(h).or_default();
         let mut seen = false;
-        for existing in &out {
-            if values_distinct_eq(existing, &v)? {
-                seen = true;
-                break;
+        for &idx in bucket.iter() {
+            if let Some(existing) = out.get(idx) {
+                if values_distinct_eq(existing, &v)? {
+                    seen = true;
+                    break;
+                }
             }
         }
         if !seen {
+            let new_idx = out.len();
             out.push(v);
+            bucket.push(new_idx);
         }
     }
     *vals = out;
     Ok(())
 }
 
-fn eval_count(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+fn eval_count(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     let Some(arg) = call.args.first() else {
         return Err(BqError::query("COUNT requires 1 argument"));
     };
@@ -134,13 +143,17 @@ fn eval_count(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> B
     ))
 }
 
-fn eval_countif(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+fn eval_countif(
+    call: &FunctionCall,
+    rows: RowSlice<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
     let arg = call
         .args
         .first()
         .ok_or_else(|| BqError::query("COUNTIF requires 1 argument"))?;
     let mut count = 0_i64;
-    for row in rows {
+    for row in rows.iter() {
         if matches!(eval_expr(&arg.expr, row, ctx)?, BqValue::Bool(true)) {
             count += 1;
         }
@@ -148,8 +161,7 @@ fn eval_countif(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) ->
     Ok(BqValue::Int64(count))
 }
 
-fn eval_sum(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
-    let vals = collect_arg_values(call, rows, ctx)?;
+fn sum_collected_values(vals: Vec<BqValue>) -> BqResult<BqValue> {
     let Some(first) = vals.first() else {
         return Ok(BqValue::Null);
     };
@@ -165,6 +177,10 @@ fn eval_sum(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqR
     Ok(acc)
 }
 
+fn eval_sum(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+    sum_collected_values(collect_arg_values(call, rows, ctx)?)
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "AVG only supports numeric scalar variants"
@@ -173,13 +189,13 @@ fn eval_sum(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqR
     clippy::cast_precision_loss,
     reason = "GoogleSQL AVG converts integer sums to FLOAT64"
 )]
-fn eval_avg(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqResult<BqValue> {
+fn eval_avg(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
     let vals = collect_arg_values(call, rows, ctx)?;
     if vals.is_empty() {
         return Ok(BqValue::Null);
     }
     let count = vals.len();
-    let sum = eval_sum(call, rows, ctx)?;
+    let sum = sum_collected_values(vals)?;
     match sum {
         BqValue::Int64(n) => Ok(BqValue::Float64((n as f64) / (count as f64))),
         BqValue::Float64(f) => Ok(BqValue::Float64(f / (count as f64))),
@@ -202,7 +218,7 @@ fn eval_avg(call: &FunctionCall, rows: &[EvalRow], ctx: &ExecContext<'_>) -> BqR
 
 fn eval_min_max(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
     is_min: bool,
 ) -> BqResult<BqValue> {
@@ -230,7 +246,7 @@ fn eval_min_max(
 
 fn eval_any_value(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let arg = call
@@ -242,7 +258,7 @@ fn eval_any_value(
             .first()
             .map_or(Ok(BqValue::Null), |row| eval_expr(&arg.expr, row, ctx));
     }
-    for row in rows {
+    for row in rows.iter() {
         let v = eval_expr(&arg.expr, row, ctx)?;
         if !v.is_null() {
             return Ok(v);
@@ -252,14 +268,14 @@ fn eval_any_value(
 }
 
 fn filter_rows_by_having(
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     kind: HavingKind,
     having_expr: &crate::ast::Expr,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<EvalRow>> {
     let mut best_key: Option<BqValue> = None;
     let mut winners: Vec<EvalRow> = Vec::new();
-    for row in rows {
+    for row in rows.iter() {
         let key = eval_expr(having_expr, row, ctx)?;
         if key.is_null() {
             continue;
@@ -294,7 +310,7 @@ fn filter_rows_by_having(
 
 fn eval_array_agg(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let arg = call
@@ -303,7 +319,7 @@ fn eval_array_agg(
         .ok_or_else(|| BqError::query("ARRAY_AGG requires 1 argument"))?;
     let ignore_nulls = call.null_handling == Some(NullHandling::IgnoreNulls);
     let mut items = Vec::new();
-    for row in rows {
+    for row in rows.iter() {
         let val = eval_expr(&arg.expr, row, ctx)?;
         if ignore_nulls && val.is_null() {
             continue;
@@ -383,7 +399,7 @@ fn join_string_or_bytes(vals: Vec<BqValue>, delim: Option<BqValue>) -> BqResult<
 )]
 fn eval_string_agg(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let arg = call
@@ -403,7 +419,7 @@ fn eval_string_agg(
         None => None,
     };
     let mut items = Vec::new();
-    for row in rows {
+    for row in rows.iter() {
         let val = eval_expr(&arg.expr, row, ctx)?;
         if val.is_null() {
             continue;
@@ -430,7 +446,7 @@ fn eval_string_agg(
 
 fn eval_logical(
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
     is_and: bool,
 ) -> BqResult<BqValue> {
@@ -451,7 +467,7 @@ fn eval_logical(
 fn eval_bitwise_agg(
     name: &str,
     call: &FunctionCall,
-    rows: &[EvalRow],
+    rows: RowSlice<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let vals = collect_arg_values(call, rows, ctx)?;

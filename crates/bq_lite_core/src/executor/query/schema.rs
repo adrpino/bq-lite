@@ -31,7 +31,7 @@ pub(in crate::executor) fn infer_query_columns(
             }
             local_ctx.ctes.insert(
                 key,
-                crate::executor::result::QueryResult::new(cols, Vec::new()),
+                std::sync::Arc::new(crate::executor::result::QueryResult::new(cols, Vec::new())),
             );
         }
     }
@@ -385,8 +385,8 @@ fn infer_table_ref_schema(
             let qual = alias.unwrap_or(tbl_name.as_str());
             let mut row = infer_concrete_table_schema(meta, Some(qual), ctx)?;
             row.cols.push(RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_TABLE_SUFFIX".to_owned(),
+                qualifier: Some(std::sync::Arc::from(qual)),
+                name: std::sync::Arc::from("_TABLE_SUFFIX"),
                 ty: BqType::String,
                 value: BqValue::Null,
             });
@@ -410,12 +410,13 @@ fn infer_concrete_table_schema(
             return Ok(null_eval_row_from_cols(Some(qual), &cols));
         }
     }
+    let qual_arc: Option<std::sync::Arc<str>> = Some(std::sync::Arc::from(qual));
     let cols = meta
         .columns
         .iter()
         .map(|c| RowBinding {
-            qualifier: Some(qual.to_owned()),
-            name: c.name.clone(),
+            qualifier: qual_arc.clone(),
+            name: std::sync::Arc::from(c.name.as_str()),
             ty: c.ty.clone(),
             value: BqValue::Null,
         })
@@ -423,14 +424,14 @@ fn infer_concrete_table_schema(
     let pseudo = if meta.partition_by.is_some() {
         vec![
             RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_PARTITIONTIME".to_owned(),
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from("_PARTITIONTIME"),
                 ty: BqType::Timestamp,
                 value: BqValue::Null,
             },
             RowBinding {
-                qualifier: Some(qual.to_owned()),
-                name: "_PARTITIONDATE".to_owned(),
+                qualifier: qual_arc,
+                name: std::sync::Arc::from("_PARTITIONDATE"),
                 ty: BqType::Date,
                 value: BqValue::Null,
             },
@@ -455,11 +456,12 @@ pub(super) fn null_out_eval_row(row: &EvalRow) -> EvalRow {
 }
 
 fn null_eval_row_from_cols(qual: Option<&str>, cols: &[QueryColumn]) -> EvalRow {
+    let qual_arc: Option<std::sync::Arc<str>> = qual.map(std::sync::Arc::from);
     EvalRow::new(
         cols.iter()
             .map(|c| RowBinding {
-                qualifier: qual.map(str::to_owned),
-                name: c.name.clone(),
+                qualifier: qual_arc.clone(),
+                name: std::sync::Arc::from(c.name.as_str()),
                 ty: c.ty.clone(),
                 value: BqValue::Null,
             })
