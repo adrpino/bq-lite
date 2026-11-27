@@ -23,6 +23,7 @@ fn parse_data_type_inner(p: &mut Parser) -> BqResult<DataTypeAst> {
         "STRING" => Ok(DataTypeAst::String {
             max_len: parse_optional_len(p)?,
         }),
+        "ROUNDING_MODE" => Ok(DataTypeAst::String { max_len: None }),
         "BYTES" => Ok(DataTypeAst::Bytes {
             max_len: parse_optional_len(p)?,
         }),
@@ -88,6 +89,9 @@ fn parse_array_type(p: &mut Parser) -> BqResult<DataTypeAst> {
 }
 
 fn parse_struct_type(p: &mut Parser) -> BqResult<DataTypeAst> {
+    if p.eat(&TokenKind::Neq) {
+        return Ok(DataTypeAst::Struct(Vec::new()));
+    }
     p.expect(&TokenKind::Lt, "'<'")?;
     if p.at_gt_angle() {
         p.expect_gt_angle()?;

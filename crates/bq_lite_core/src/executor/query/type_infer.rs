@@ -80,6 +80,8 @@ pub(in crate::executor) fn infer_expr_type(
         | Expr::ArraySubquery(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
+        | Expr::ExprStar(_)
+        | Expr::WithExpr { .. }
         | Expr::Lambda { .. } => infer_complex_expr_type(expr, row, ctx),
     }
 }

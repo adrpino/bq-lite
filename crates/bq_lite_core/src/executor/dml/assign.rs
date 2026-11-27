@@ -271,6 +271,17 @@ pub(super) fn build_returning_result(
     action_label: &str,
     ctx: &ExecContext<'_>,
 ) -> BqResult<QueryResult> {
+    let actions = vec![action_label; eval_rows.len()];
+    build_returning_result_with_actions(schema_row, eval_rows, returning, &actions, ctx)
+}
+
+pub(super) fn build_returning_result_with_actions(
+    schema_row: &EvalRow,
+    eval_rows: &[EvalRow],
+    returning: &DmlReturning,
+    actions: &[&str],
+    ctx: &ExecContext<'_>,
+) -> BqResult<QueryResult> {
     let dummy_sel = Select {
         distinct: false,
         as_kind: None,
@@ -305,8 +316,9 @@ pub(super) fn build_returning_result(
             .as_ref()
             .map_or_else(|| "ACTION".to_owned(), |id| id.value.clone());
         cols.push(QueryColumn::new(col_name, BqType::String));
-        for row in &mut out_rows {
-            row.push(BqValue::String(action_label.to_owned()));
+        for (idx, row) in out_rows.iter_mut().enumerate() {
+            let label = actions.get(idx).copied().unwrap_or("");
+            row.push(BqValue::String(label.to_owned()));
         }
     }
     let mut qr = QueryResult::new(cols, out_rows);

@@ -257,6 +257,14 @@ pub(crate) fn parse_timestamp_str(s: &str) -> BqResult<DateTime<Utc>> {
     if let Ok(dt) = parse_naive_datetime(no_utc) {
         return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
     }
+    if let Some((prefix, tz_part)) = trimmed.rsplit_once(' ') {
+        if let (Ok(ndt), Ok(tz)) = (
+            parse_naive_datetime(prefix.trim()),
+            BqTimezone::parse(tz_part.trim()),
+        ) {
+            return tz.local_to_utc(ndt);
+        }
+    }
     Err(BqError::semantic(format!(
         "Invalid TIMESTAMP string: '{s}'"
     )))

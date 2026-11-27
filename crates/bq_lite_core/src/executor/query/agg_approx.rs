@@ -201,6 +201,9 @@ pub(super) fn eval_approx_quantiles(
     let sample = rows.first().cloned().unwrap_or_default();
     let count_val = eval_expr(&count_arg.expr, &sample, ctx)?;
     if count_val.is_null() {
+        if call.safe_prefix {
+            return Ok(BqValue::Null);
+        }
         return Err(BqError::semantic(
             "APPROX_QUANTILES number of quantiles cannot be NULL",
         ));
@@ -211,6 +214,9 @@ pub(super) fn eval_approx_quantiles(
         ));
     };
     if !(1..=MAX_APPROX_QUANTILES).contains(&k_raw) {
+        if call.safe_prefix {
+            return Ok(BqValue::Null);
+        }
         return Err(BqError::semantic(format!(
             "APPROX_QUANTILES number of quantiles must be between 1 and {MAX_APPROX_QUANTILES}"
         )));

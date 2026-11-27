@@ -327,6 +327,7 @@ mod memory_guard_tests {
             expiration_ms: None,
             external_uris: Vec::new(),
             external_format: None,
+            primary_key: Vec::new(),
         };
         catalog.put_table(&tref, meta, true, false).unwrap();
         let mut storage = StorageEngine::new();

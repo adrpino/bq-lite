@@ -46,6 +46,8 @@ pub struct Catalog {
     default_project: String,
     default_dataset: Option<String>,
     projects: BTreeMap<String, Arc<ProjectMeta>>,
+    #[serde(default)]
+    constants: BTreeMap<String, crate::types::BqValue>,
 }
 
 impl Default for Catalog {
@@ -64,7 +66,17 @@ impl Catalog {
             default_project: proj_id,
             default_dataset: None,
             projects,
+            constants: BTreeMap::new(),
         }
+    }
+
+    pub fn set_constant(&mut self, name: &str, value: crate::types::BqValue) {
+        self.constants.insert(name.to_ascii_lowercase(), value);
+    }
+
+    #[must_use]
+    pub fn get_constant(&self, name: &str) -> Option<&crate::types::BqValue> {
+        self.constants.get(&name.to_ascii_lowercase())
     }
 
     #[must_use]
@@ -378,6 +390,7 @@ mod tests {
                 expiration_ms: None,
                 external_uris: Vec::new(),
                 external_format: None,
+                primary_key: Vec::new(),
             },
             false,
             false,

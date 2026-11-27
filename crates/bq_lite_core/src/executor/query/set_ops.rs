@@ -1,4 +1,4 @@
-use crate::ast::{SetCorrespondence, SetOpKind, SetQuantifier};
+use crate::ast::{SetColumnMatchMode, SetCorrespondence, SetOpKind, SetQuantifier};
 use crate::error::{BqError, BqResult};
 use crate::executor::evaluator::values_distinct_eq;
 use crate::executor::result::{QueryColumn, QueryResult};
@@ -10,14 +10,15 @@ type AlignedSetInputs = (Vec<QueryColumn>, Vec<Vec<BqValue>>, Vec<Vec<BqValue>>)
 pub(super) fn execute_set_op(
     op: SetOpKind,
     quantifier: SetQuantifier,
-    correspondence: SetCorrespondence,
+    correspondence: &SetCorrespondence,
     left: QueryResult,
     right: QueryResult,
 ) -> BqResult<QueryResult> {
     let (l_cols, l_rows, r_rows) = match correspondence {
         SetCorrespondence::Positional => align_positional(left, right)?,
-        SetCorrespondence::ByName => align_by_name(left, right)?,
-        SetCorrespondence::Corresponding => align_corresponding(left, right)?,
+        SetCorrespondence::ByName { mode, on_columns } => {
+            align_by_name_mode(left, right, *mode, on_columns)?
+        }
     };
     let rows = match op {
         SetOpKind::Union => eval_union(l_rows, r_rows, quantifier)?,
@@ -45,88 +46,123 @@ fn align_positional(left: QueryResult, right: QueryResult) -> BqResult<AlignedSe
     Ok((cols, l_rows, r_rows))
 }
 
-fn align_by_name(left: QueryResult, right: QueryResult) -> BqResult<AlignedSetInputs> {
-    if left.columns.len() != right.columns.len() {
-        return Err(BqError::query(
-            "BY NAME set operation column count mismatch",
-        ));
+fn resolve_target_columns(
+    left: &QueryResult,
+    right: &QueryResult,
+    mode: SetColumnMatchMode,
+    on_columns: &[String],
+) -> BqResult<Vec<String>> {
+    if !on_columns.is_empty() {
+        return Ok(on_columns.to_vec());
     }
-    let mut r_indices = Vec::with_capacity(left.columns.len());
-    let mut cols = Vec::with_capacity(left.columns.len());
-    for lc in &left.columns {
-        let r_idx = right.column_index(&lc.name).ok_or_else(|| {
-            BqError::query(format!(
-                "Column '{}' not found in right side of BY NAME",
-                lc.name
-            ))
-        })?;
-        let rc = right
-            .columns
-            .get(r_idx)
-            .ok_or_else(|| BqError::internal("missing right column"))?;
-        let ty = common_supertype(&[lc.ty.clone(), rc.ty.clone()])?;
-        cols.push(QueryColumn::new(lc.name.clone(), ty));
-        r_indices.push(r_idx);
-    }
-    let reordered_r: Vec<Vec<BqValue>> = right
-        .rows
-        .into_iter()
-        .map(|row| {
-            r_indices
+    match mode {
+        SetColumnMatchMode::Strict => {
+            if left.columns.len() != right.columns.len() {
+                return Err(BqError::query(
+                    "BY NAME set operation column count mismatch",
+                ));
+            }
+            Ok(left.columns.iter().map(|c| c.name.clone()).collect())
+        }
+        SetColumnMatchMode::Inner => {
+            let names: Vec<String> = left
+                .columns
                 .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(BqValue::Null))
-                .collect()
-        })
-        .collect();
-    let l_rows = coerce_rows(left.rows, &cols)?;
-    let r_rows = coerce_rows(reordered_r, &cols)?;
-    Ok((cols, l_rows, r_rows))
+                .filter(|lc| right.column_index(&lc.name).is_some())
+                .map(|lc| lc.name.clone())
+                .collect();
+            if names.is_empty() {
+                return Err(BqError::query(
+                    "CORRESPONDING set operation has no matching column names",
+                ));
+            }
+            Ok(names)
+        }
+        SetColumnMatchMode::Left => Ok(left.columns.iter().map(|c| c.name.clone()).collect()),
+        SetColumnMatchMode::Full => {
+            let mut names: Vec<String> = left.columns.iter().map(|c| c.name.clone()).collect();
+            for rc in &right.columns {
+                if left.column_index(&rc.name).is_none() {
+                    names.push(rc.name.clone());
+                }
+            }
+            Ok(names)
+        }
+    }
 }
 
-fn align_corresponding(left: QueryResult, right: QueryResult) -> BqResult<AlignedSetInputs> {
-    let mut l_indices = Vec::new();
-    let mut r_indices = Vec::new();
-    let mut cols = Vec::new();
-    for (li, lc) in left.columns.iter().enumerate() {
-        let Some(ri) = right.column_index(&lc.name) else {
-            continue;
+fn align_by_name_mode(
+    left: QueryResult,
+    right: QueryResult,
+    mode: SetColumnMatchMode,
+    on_columns: &[String],
+) -> BqResult<AlignedSetInputs> {
+    let target_names = resolve_target_columns(&left, &right, mode, on_columns)?;
+    let mut l_indices: Vec<Option<usize>> = Vec::with_capacity(target_names.len());
+    let mut r_indices: Vec<Option<usize>> = Vec::with_capacity(target_names.len());
+    let mut cols: Vec<QueryColumn> = Vec::with_capacity(target_names.len());
+    for name in target_names {
+        let li = left.column_index(&name);
+        let ri = right.column_index(&name);
+        let ty = match (li, ri) {
+            (Some(l), Some(r)) => {
+                let lc = left
+                    .columns
+                    .get(l)
+                    .ok_or_else(|| BqError::internal("missing left column"))?;
+                let rc = right
+                    .columns
+                    .get(r)
+                    .ok_or_else(|| BqError::internal("missing right column"))?;
+                common_supertype(&[lc.ty.clone(), rc.ty.clone()])?
+            }
+            (Some(l), None)
+                if matches!(mode, SetColumnMatchMode::Left | SetColumnMatchMode::Full) =>
+            {
+                left.columns
+                    .get(l)
+                    .ok_or_else(|| BqError::internal("missing left column"))?
+                    .ty
+                    .clone()
+            }
+            (None, Some(r)) if matches!(mode, SetColumnMatchMode::Full) => right
+                .columns
+                .get(r)
+                .ok_or_else(|| BqError::internal("missing right column"))?
+                .ty
+                .clone(),
+            _ => {
+                return Err(BqError::query(format!(
+                    "Column '{name}' is missing in BY NAME / CORRESPONDING set operation"
+                )));
+            }
         };
-        let Some(rc) = right.columns.get(ri) else {
-            continue;
-        };
-        let ty = common_supertype(&[lc.ty.clone(), rc.ty.clone()])?;
-        cols.push(QueryColumn::new(lc.name.clone(), ty));
+        cols.push(QueryColumn::new(name, ty));
         l_indices.push(li);
         r_indices.push(ri);
     }
-    if cols.is_empty() {
-        return Err(BqError::query(
-            "CORRESPONDING set operation has no matching column names",
-        ));
-    }
-    let proj_l: Vec<Vec<BqValue>> = left
-        .rows
-        .into_iter()
-        .map(|row| {
-            l_indices
-                .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(BqValue::Null))
-                .collect()
-        })
-        .collect();
-    let proj_r: Vec<Vec<BqValue>> = right
-        .rows
-        .into_iter()
-        .map(|row| {
-            r_indices
-                .iter()
-                .map(|&idx| row.get(idx).cloned().unwrap_or(BqValue::Null))
-                .collect()
-        })
-        .collect();
+    let proj_l = project_optional_indices(left.rows, &l_indices);
+    let proj_r = project_optional_indices(right.rows, &r_indices);
     let l_rows = coerce_rows(proj_l, &cols)?;
     let r_rows = coerce_rows(proj_r, &cols)?;
     Ok((cols, l_rows, r_rows))
+}
+
+fn project_optional_indices(
+    rows: Vec<Vec<BqValue>>,
+    indices: &[Option<usize>],
+) -> Vec<Vec<BqValue>> {
+    rows.into_iter()
+        .map(|row| {
+            indices
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|idx| row.get(idx).cloned())
+                        .unwrap_or(BqValue::Null)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn coerce_rows(rows: Vec<Vec<BqValue>>, cols: &[QueryColumn]) -> BqResult<Vec<Vec<BqValue>>> {

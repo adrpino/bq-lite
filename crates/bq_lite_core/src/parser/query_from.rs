@@ -312,7 +312,7 @@ pub(super) fn parse_pivot_spec(p: &mut Parser) -> BqResult<PivotSpec> {
         Ok((expr, alias))
     })?;
     p.expect_kw("FOR")?;
-    let for_col = p.parse_ident()?;
+    let for_expr = super::expr_primary::parse_primary(p)?;
     p.expect_kw("IN")?;
     p.expect(&TokenKind::LParen, "'('")?;
     let in_values = p.parse_comma_list(|p| {
@@ -324,7 +324,7 @@ pub(super) fn parse_pivot_spec(p: &mut Parser) -> BqResult<PivotSpec> {
     p.expect(&TokenKind::RParen, "')'")?;
     Ok(PivotSpec {
         aggregates,
-        for_col,
+        for_expr,
         in_values,
     })
 }
@@ -346,7 +346,7 @@ pub(super) fn parse_unpivot_spec(p: &mut Parser) -> BqResult<UnpivotSpec> {
     p.expect_kw("IN")?;
     p.expect(&TokenKind::LParen, "'('")?;
     let in_cols = p.parse_comma_list(|p| {
-        let cols = parse_ident_or_tuple(p)?;
+        let cols = parse_unpivot_col_or_tuple(p)?;
         let alias = if p.eat_kw("AS") {
             Some(parse_expr(p)?)
         } else {
@@ -362,6 +362,32 @@ pub(super) fn parse_unpivot_spec(p: &mut Parser) -> BqResult<UnpivotSpec> {
         name_col,
         in_cols,
     })
+}
+
+fn parse_unpivot_col_ident(p: &mut Parser) -> BqResult<Ident> {
+    let obj = p.parse_object_name()?;
+    obj.parts
+        .into_iter()
+        .last()
+        .ok_or_else(|| BqError::syntax("Expected column name in UNPIVOT", p.current_span()))
+}
+
+fn parse_unpivot_col_or_tuple(p: &mut Parser) -> BqResult<Vec<Ident>> {
+    if p.eat(&TokenKind::LParen) {
+        let cols = p.parse_comma_list(parse_unpivot_col_ident)?;
+        p.expect(&TokenKind::RParen, "')'")?;
+        Ok(cols)
+    } else if matches!(
+        p.peek().kind,
+        TokenKind::Ident(_) | TokenKind::QuotedIdent(_)
+    ) {
+        Ok(vec![parse_unpivot_col_ident(p)?])
+    } else {
+        Err(BqError::syntax(
+            "Expected column name or parenthesized column list",
+            p.current_span(),
+        ))
+    }
 }
 
 fn parse_ident_or_tuple(p: &mut Parser) -> BqResult<Vec<Ident>> {

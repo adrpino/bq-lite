@@ -11,6 +11,8 @@ pub(super) const GEO_SEARCH_FUNCTIONS: &[&str] = &[
     "ST_GEOGFROMTEXT",
     "ST_GEOGPOINT",
     "ST_WITHIN",
+    "ST_X",
+    "ST_Y",
 ];
 
 pub(super) fn eval_geo_search_fn(
@@ -32,8 +34,25 @@ pub(super) fn eval_geo_search_fn(
         "ST_DISTANCE" => eval_st_distance(args).map(Some),
         "ST_CONTAINS" => eval_st_contains(args, false).map(Some),
         "ST_WITHIN" => eval_st_contains(args, true).map(Some),
+        "ST_X" => eval_st_xy(args, true).map(Some),
+        "ST_Y" => eval_st_xy(args, false).map(Some),
         _ => Ok(None),
     }
+}
+
+fn eval_st_xy(args: Vec<BqValue>, is_x: bool) -> BqResult<BqValue> {
+    let fname = if is_x { "ST_X" } else { "ST_Y" };
+    let [arg]: [BqValue; 1] = args
+        .try_into()
+        .map_err(|_| BqError::query(format!("{fname} expects 1 argument")))?;
+    if arg.is_null() {
+        return Ok(BqValue::Null);
+    }
+    let BqValue::Geography(wkt) = arg else {
+        return Err(BqError::query(format!("{fname} expects GEOGRAPHY")));
+    };
+    let (x, y) = parse_wkt_point(&wkt)?;
+    Ok(BqValue::Float64(if is_x { x } else { y }))
 }
 
 fn eval_st_geogpoint(args: Vec<BqValue>) -> BqResult<BqValue> {

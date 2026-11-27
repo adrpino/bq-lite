@@ -1,12 +1,15 @@
-use crate::ast::{Join, PipeGroupByItem, PipeOp, PipeOrderDir, PipeOrderedItem, SetOpKind};
+use crate::ast::{
+    Join, PipeGroupByItem, PipeOp, PipeOrderDir, PipeOrderedItem, SetColumnMatchMode,
+    SetCorrespondence, SetOpKind, SetQuantifier,
+};
 use crate::error::{BqError, BqResult};
 
 use super::cursor::Parser;
 use super::expr::parse_expr;
 use super::expr_postfix::parse_order_by_expr;
 use super::query::{
-    parse_cte, parse_group_by_item, parse_optional_alias, parse_optional_correspondence,
-    parse_optional_window_clause, parse_query, parse_select_item, parse_set_quantifier,
+    parse_cte, parse_group_by_item, parse_optional_alias, parse_optional_window_clause,
+    parse_query, parse_select_item,
 };
 use super::query_from::{
     parse_join_constraint, parse_pivot_spec, parse_table_factor, parse_unpivot_spec,
@@ -191,18 +194,111 @@ fn parse_optional_order_dir(p: &mut Parser) -> BqResult<Option<PipeOrderDir>> {
     }))
 }
 
-fn try_parse_pipe_set_op(p: &mut Parser) -> BqResult<Option<PipeOp>> {
+fn peek_set_op_prefix(p: &Parser, allowed: &[&str]) -> Option<(Option<SetColumnMatchMode>, usize)> {
+    let check_op = |offset: usize| matches!(&p.peek_n(offset).kind, TokenKind::Ident(w) if allowed.iter().any(|k| w.eq_ignore_ascii_case(k)));
+    if check_op(0) {
+        return Some((None, 0));
+    }
+    let mode = if p.is_kw("INNER") {
+        Some(SetColumnMatchMode::Inner)
+    } else if p.is_kw("LEFT") {
+        Some(SetColumnMatchMode::Left)
+    } else if p.is_kw("FULL") {
+        Some(SetColumnMatchMode::Full)
+    } else {
+        None
+    }?;
+    if check_op(1) {
+        return Some((Some(mode), 1));
+    }
+    if matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("OUTER"))
+        && check_op(2)
+    {
+        return Some((Some(mode), 2));
+    }
+    None
+}
+
+pub(super) fn try_parse_set_op_head(
+    p: &mut Parser,
+    allowed: &[&str],
+) -> BqResult<Option<(SetOpKind, SetQuantifier, SetCorrespondence)>> {
+    let Some((prefix_mode, skip)) = peek_set_op_prefix(p, allowed) else {
+        return Ok(None);
+    };
+    for _ in 0..skip {
+        p.advance();
+    }
     let op = if p.eat_kw("UNION") {
         SetOpKind::Union
     } else if p.eat_kw("INTERSECT") {
         SetOpKind::Intersect
-    } else if p.eat_kw("EXCEPT") {
-        SetOpKind::Except
     } else {
-        return Ok(None);
+        p.expect_kw("EXCEPT")?;
+        SetOpKind::Except
     };
     let quantifier = parse_set_quantifier(p)?;
-    let correspondence = parse_optional_correspondence(p)?;
+    let correspondence = parse_optional_correspondence_with_mode(p, prefix_mode)?;
+    Ok(Some((op, quantifier, correspondence)))
+}
+
+fn parse_set_quantifier(p: &mut Parser) -> BqResult<SetQuantifier> {
+    if p.eat_kw("ALL") {
+        Ok(SetQuantifier::All)
+    } else if p.eat_kw("DISTINCT") {
+        Ok(SetQuantifier::Distinct)
+    } else {
+        Err(BqError::syntax(
+            "Expected ALL or DISTINCT after set operator in GoogleSQL",
+            p.current_span(),
+        ))
+    }
+}
+
+fn parse_optional_correspondence_with_mode(
+    p: &mut Parser,
+    prefix_mode: Option<SetColumnMatchMode>,
+) -> BqResult<SetCorrespondence> {
+    let mode = if p.eat_kw("BY") {
+        p.expect_kw("NAME")?;
+        prefix_mode.unwrap_or(SetColumnMatchMode::Strict)
+    } else if p.eat_kw("CORRESPONDING") {
+        prefix_mode.unwrap_or(SetColumnMatchMode::Inner)
+    } else if p.is_kw("STRICT")
+        && matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("CORRESPONDING"))
+    {
+        p.advance();
+        p.advance();
+        SetColumnMatchMode::Strict
+    } else {
+        if prefix_mode.is_some() {
+            return Err(BqError::syntax(
+                "Expected BY NAME or CORRESPONDING after INNER/LEFT/FULL set operator",
+                p.current_span(),
+            ));
+        }
+        return Ok(SetCorrespondence::Positional);
+    };
+    let mut on_columns = Vec::new();
+    if p.eat_kw("ON") || p.eat_kw("BY") {
+        p.expect(&TokenKind::LParen, "'('")?;
+        loop {
+            on_columns.push(p.parse_ident()?.value);
+            if !p.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        p.expect(&TokenKind::RParen, "')'")?;
+    }
+    Ok(SetCorrespondence::ByName { mode, on_columns })
+}
+
+fn try_parse_pipe_set_op(p: &mut Parser) -> BqResult<Option<PipeOp>> {
+    let Some((op, quantifier, correspondence)) =
+        try_parse_set_op_head(p, &["UNION", "INTERSECT", "EXCEPT"])?
+    else {
+        return Ok(None);
+    };
     let mut queries = Vec::new();
     loop {
         p.expect(&TokenKind::LParen, "'('")?;

@@ -10,20 +10,24 @@ use super::agg::eval_aggregate_expr;
 
 struct PivotRowParams<'a> {
     group_cols: &'a [String],
-    pivot_vals: &'a [(BqValue, String)],
+    pivot_vals: &'a [(BqValue, String, bool)],
     spec: &'a PivotSpec,
     alias: Option<&'a str>,
 }
 
 pub(super) fn apply_pivot(
     rows: Vec<EvalRow>,
+    schema_row: Option<&EvalRow>,
     spec: &PivotSpec,
     alias: Option<&str>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<Vec<EvalRow>> {
     let pivot_vals = eval_pivot_values(spec, ctx)?;
-    let group_cols = collect_pivot_group_cols(&rows, spec);
-    let buckets = bucket_pivot_rows(rows, &group_cols);
+    let group_cols = collect_pivot_group_cols(rows.first().or(schema_row), spec);
+    let mut buckets = bucket_pivot_rows(rows, &group_cols);
+    if buckets.is_empty() && group_cols.is_empty() && schema_row.is_some() {
+        buckets.push((Vec::new(), Vec::new()));
+    }
     let params = PivotRowParams {
         group_cols: &group_cols,
         pivot_vals: &pivot_vals,
@@ -38,25 +42,29 @@ pub(super) fn apply_pivot(
     Ok(out)
 }
 
-fn eval_pivot_values(spec: &PivotSpec, ctx: &ExecContext<'_>) -> BqResult<Vec<(BqValue, String)>> {
+fn eval_pivot_values(
+    spec: &PivotSpec,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Vec<(BqValue, String, bool)>> {
     let mut out = Vec::with_capacity(spec.in_values.len());
     for (expr, col_alias) in &spec.in_values {
         let val = eval_expr(expr, &EvalRow::default(), ctx)?;
+        let has_alias = col_alias.is_some();
         let label = col_alias
             .as_ref()
             .map_or_else(|| val.to_string(), |a| a.value.clone());
-        out.push((val, label));
+        out.push((val, label, has_alias));
     }
     Ok(out)
 }
 
-fn collect_pivot_group_cols(rows: &[EvalRow], spec: &PivotSpec) -> Vec<String> {
-    rows.first()
+fn collect_pivot_group_cols(sample: Option<&EvalRow>, spec: &PivotSpec) -> Vec<String> {
+    sample
         .map(|r| {
             r.cols
                 .iter()
                 .filter(|c| {
-                    !c.name.eq_ignore_ascii_case(&spec.for_col.value)
+                    !expr_mentions(&spec.for_expr, &c.name)
                         && !agg_references_col(&spec.aggregates, &c.name)
                 })
                 .map(|c| c.name.as_ref().to_owned())
@@ -108,16 +116,18 @@ fn build_pivot_row(
         })
         .collect();
 
-    for (pval, plabel) in params.pivot_vals {
+    // Evaluate the FOR expression once per row so non-deterministic expressions assign each row cleanly.
+    let row_for_vals: Vec<BqValue> = bucket
+        .iter()
+        .map(|r| eval_expr(&params.spec.for_expr, r, ctx))
+        .collect::<BqResult<Vec<_>>>()?;
+
+    for (pval, plabel, has_val_alias) in params.pivot_vals {
         let matching: Vec<EvalRow> = bucket
             .iter()
-            .filter(|r| {
-                r.resolve_ident(&params.spec.for_col.value)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|b| values_distinct_eq(&b.value, pval).unwrap_or(false))
-            })
-            .cloned()
+            .zip(row_for_vals.iter())
+            .filter(|(_, fv)| values_distinct_eq(fv, pval).unwrap_or(false))
+            .map(|(r, _)| r.clone())
             .collect();
         for (agg_expr, agg_alias) in &params.spec.aggregates {
             let val = if matching.is_empty() {
@@ -125,9 +135,21 @@ fn build_pivot_row(
             } else {
                 eval_aggregate_expr(agg_expr, &matching, ctx)?
             };
-            let col_name = agg_alias
-                .as_ref()
-                .map_or_else(|| plabel.clone(), |a| format!("{}_{plabel}", a.value));
+            let col_name = agg_alias.as_ref().map_or_else(
+                || {
+                    if !has_val_alias
+                        && plabel
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|b| b.is_ascii_digit() || *b == b'-')
+                    {
+                        format!("_{plabel}")
+                    } else {
+                        plabel.clone()
+                    }
+                },
+                |a| format!("{}_{plabel}", a.value),
+            );
             bindings.push(RowBinding {
                 qualifier: qual_arc.clone(),
                 name: std::sync::Arc::from(col_name),
@@ -156,28 +178,63 @@ fn agg_references_col(aggs: &[(Expr, Option<crate::ast::Ident>)], col: &str) -> 
 fn expr_mentions(expr: &Expr, col: &str) -> bool {
     match expr {
         Expr::Ident(id) => id.value.eq_ignore_ascii_case(col),
-        Expr::Function(call) => call.args.iter().any(|a| expr_mentions(&a.expr, col)),
+        Expr::CompoundIdent(parts) => {
+            parts
+                .first()
+                .is_some_and(|p| p.value.eq_ignore_ascii_case(col))
+                || parts
+                    .last()
+                    .is_some_and(|p| p.value.eq_ignore_ascii_case(col))
+        }
+        Expr::Function(call) => {
+            call.args.iter().any(|a| expr_mentions(&a.expr, col))
+                || call.order_by.iter().any(|o| expr_mentions(&o.expr, col))
+                || call
+                    .having
+                    .as_ref()
+                    .is_some_and(|(_, e)| expr_mentions(e, col))
+        }
         Expr::Binary { left, right, .. } => expr_mentions(left, col) || expr_mentions(right, col),
-        Expr::Grouped(inner) | Expr::Unary { expr: inner, .. } => expr_mentions(inner, col),
+        Expr::Grouped(inner)
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Is { expr: inner, .. }
+        | Expr::FieldAccess { expr: inner, .. }
+        | Expr::Extract { expr: inner, .. }
+        | Expr::ExprStar(inner) => expr_mentions(inner, col),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => expr_mentions(e, col) || expr_mentions(low, col) || expr_mentions(high, col),
+        Expr::Like {
+            expr: e, pattern, ..
+        } => expr_mentions(e, col) || expr_mentions(pattern, col),
+        Expr::In { expr: e, .. } => expr_mentions(e, col),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(|o| expr_mentions(o, col))
+                || whens
+                    .iter()
+                    .any(|w| expr_mentions(&w.condition, col) || expr_mentions(&w.result, col))
+                || else_result
+                    .as_deref()
+                    .is_some_and(|e| expr_mentions(e, col))
+        }
+        Expr::ArrayLiteral { elements, .. } => elements.iter().any(|e| expr_mentions(e, col)),
+        Expr::StructLiteral { fields, .. } => fields.iter().any(|f| expr_mentions(&f.expr, col)),
+        Expr::Subscript { expr: e, index, .. } => {
+            expr_mentions(e, col) || expr_mentions(index, col)
+        }
         Expr::Literal(_)
-        | Expr::CompoundIdent(_)
         | Expr::Parameter(_)
         | Expr::PositionalParam(_)
         | Expr::SystemVar(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
-        | Expr::Is { .. }
-        | Expr::Between { .. }
-        | Expr::Like { .. }
-        | Expr::In { .. }
-        | Expr::Cast { .. }
-        | Expr::Case { .. }
-        | Expr::ArrayLiteral { .. }
+        | Expr::WithExpr { .. }
         | Expr::ArraySubquery(_)
-        | Expr::StructLiteral { .. }
-        | Expr::Subscript { .. }
-        | Expr::FieldAccess { .. }
-        | Expr::Extract { .. }
         | Expr::Interval { .. }
         | Expr::RangeLiteral { .. }
         | Expr::Lambda { .. }

@@ -93,6 +93,7 @@ pub(super) fn exec_create_external_table(
         expiration_ms: None,
         external_uris: uris,
         external_format: Some(format),
+        primary_key: Vec::new(),
     };
     catalog.put_table(tref, meta, stmt.or_replace, stmt.if_not_exists)?;
     Ok(QueryResult::empty())
@@ -160,6 +161,7 @@ pub(super) fn exec_load_data(
             expiration_ms: None,
             external_uris: Vec::new(),
             external_format: None,
+            primary_key: Vec::new(),
         };
         catalog.put_table(&tref, meta, false, false)?;
     }

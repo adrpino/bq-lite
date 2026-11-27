@@ -1,15 +1,15 @@
 use std::collections::BTreeSet;
 
-use crate::ast::{
-    Cte, Expr, Query, Select, SelectItem, SetExpr, SetOpKind, SetQuantifier, TableFactor,
-    TableWithJoins, WithClause,
-};
+use crate::ast::{Cte, Expr, Query, SetExpr, SetOpKind, SetQuantifier, WithClause};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
 use crate::executor::result::QueryResult;
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::BqValue;
 
+use super::cte_refs::{
+    collect_query_table_refs, query_references_table, set_expr_references_table,
+};
 use super::set_ops::{dedup_rows, rows_equal};
 use super::{execute_query, execute_set_expr};
 
@@ -87,52 +87,186 @@ fn topo_order_ctes(ctes: &[Cte]) -> Vec<usize> {
     out
 }
 
+struct RecursiveParts<'a> {
+    quantifier: SetQuantifier,
+    by_name: bool,
+    base_qr: QueryResult,
+    rec_term: RecTerm<'a>,
+}
+
+struct DepthBounds {
+    alias: Option<String>,
+    min_depth: Option<i64>,
+    max_depth: Option<i64>,
+}
+
 fn eval_recursive_cte(cte: &Cte, ctx: &ExecContext<'_>) -> BqResult<QueryResult> {
     let key = cte.name.value.to_ascii_lowercase();
-    let Some((quantifier, by_name, base_expr, rec_expr)) =
-        split_recursive_union(&cte.query.body, &key)
-    else {
+    let empty_outer = EvalRow::default();
+    let mut inner_ctx = ctx.with_outer(&empty_outer);
+    if let Some(ref inner_with) = cte.query.with {
+        eval_with_clause(inner_with, &mut inner_ctx)?;
+    }
+    let Some(parts) = split_recursive_query(&cte.query, &key, &inner_ctx)? else {
         return execute_query(&cte.query, ctx);
     };
-    let mut accumulated = execute_set_expr(base_expr, ctx)?;
+    let bounds = resolve_depth_bounds(cte, &inner_ctx)?;
+    let mut accumulated = parts.base_qr;
     if !cte.columns.is_empty() && cte.columns.len() == accumulated.columns.len() {
         for (col, alias) in accumulated.columns.iter_mut().zip(&cte.columns) {
             col.name.clone_from(&alias.value);
         }
     }
-    if quantifier == SetQuantifier::Distinct {
+    if parts.quantifier == SetQuantifier::Distinct {
         accumulated.rows = dedup_rows(accumulated.rows)?;
     }
+    let mut row_depths = vec![0_i64; accumulated.rows.len()];
     let mut delta = accumulated.clone();
-    let empty_outer = EvalRow::default();
-    for iter in 0..MAX_CTE_RECURSION {
+    let iter_limit = bounds
+        .max_depth
+        .and_then(|m| usize::try_from(m).ok())
+        .unwrap_or(MAX_CTE_RECURSION);
+    for iter in 0..iter_limit {
         if iter > 0 && delta.rows.is_empty() {
-            return Ok(accumulated);
+            return Ok(apply_depth_filter(accumulated, &row_depths, &bounds));
         }
-        let mut step_ctx = ctx.with_outer(&empty_outer);
+        let mut step_ctx = inner_ctx.with_outer(&empty_outer);
         step_ctx
             .ctes
             .insert(key.clone(), std::sync::Arc::new(delta));
-        let raw_next = execute_set_expr(rec_expr, &step_ctx)?;
+        let raw_next = match parts.rec_term {
+            RecTerm::SetExpr(se) => execute_set_expr(se, &step_ctx)?,
+            RecTerm::Query(q) => execute_query(q, &step_ctx)?,
+        };
         if raw_next.rows.is_empty() {
-            return Ok(accumulated);
+            return Ok(apply_depth_filter(accumulated, &row_depths, &bounds));
         }
         let mut next_delta =
-            align_recursive_step(&cte.name.value, by_name, &accumulated, raw_next)?;
+            align_recursive_step(&cte.name.value, parts.by_name, &accumulated, raw_next)?;
         coerce_recursive_types(&mut accumulated, &mut next_delta)?;
-        if quantifier == SetQuantifier::Distinct {
+        if parts.quantifier == SetQuantifier::Distinct {
             next_delta.rows = filter_new_rows(&accumulated.rows, next_delta.rows)?;
             if next_delta.rows.is_empty() {
-                return Ok(accumulated);
+                return Ok(apply_depth_filter(accumulated, &row_depths, &bounds));
             }
         }
+        let next_depth = i64::try_from(iter + 1).unwrap_or(i64::MAX);
+        row_depths.extend(std::iter::repeat_n(next_depth, next_delta.rows.len()));
         accumulated.rows.extend(next_delta.rows.clone());
         delta = next_delta;
+    }
+    if bounds.max_depth.is_some() {
+        return Ok(apply_depth_filter(accumulated, &row_depths, &bounds));
     }
     Err(BqError::semantic(format!(
         "Recursive CTE '{}' exceeded maximum iteration limit ({MAX_CTE_RECURSION})",
         cte.name.value
     )))
+}
+
+enum RecTerm<'a> {
+    SetExpr(&'a SetExpr),
+    Query(&'a Query),
+}
+
+fn split_recursive_query<'a>(
+    query: &'a Query,
+    cte_key: &str,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<RecursiveParts<'a>>> {
+    if let Some((quantifier, by_name, base_expr, rec_expr)) =
+        split_recursive_union(&query.body, cte_key)
+    {
+        let base_qr = execute_set_expr(base_expr, ctx)?;
+        return Ok(Some(RecursiveParts {
+            quantifier,
+            by_name,
+            base_qr,
+            rec_term: RecTerm::SetExpr(rec_expr),
+        }));
+    }
+    if let Some(crate::ast::PipeOp::SetOp {
+        op: SetOpKind::Union,
+        quantifier,
+        correspondence,
+        queries,
+    }) = query.pipe_ops.last()
+    {
+        if let [rec_q] = queries.as_slice() {
+            if query_references_table(rec_q, cte_key) {
+                let base_q = Query {
+                    with: None,
+                    body: query.body.clone(),
+                    order_by: query.order_by.clone(),
+                    limit: query.limit.clone(),
+                    offset: query.offset.clone(),
+                    pipe_ops: query
+                        .pipe_ops
+                        .get(..query.pipe_ops.len().saturating_sub(1))
+                        .unwrap_or(&[])
+                        .to_vec(),
+                };
+                let base_qr = execute_query(&base_q, ctx)?;
+                let by_name = !matches!(correspondence, crate::ast::SetCorrespondence::Positional);
+                return Ok(Some(RecursiveParts {
+                    quantifier: *quantifier,
+                    by_name,
+                    base_qr,
+                    rec_term: RecTerm::Query(rec_q),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_depth_bounds(cte: &Cte, ctx: &ExecContext<'_>) -> BqResult<DepthBounds> {
+    let Some(ref ds) = cte.depth_spec else {
+        return Ok(DepthBounds {
+            alias: None,
+            min_depth: None,
+            max_depth: None,
+        });
+    };
+    let empty = EvalRow::default();
+    let eval_i64 = |e: &Expr| -> BqResult<i64> {
+        let BqValue::Int64(n) = crate::executor::evaluator::eval_expr(e, &empty, ctx)? else {
+            return Err(BqError::query("WITH DEPTH bounds must be INT64"));
+        };
+        Ok(n)
+    };
+    let min_depth = ds.min_depth.as_deref().map(eval_i64).transpose()?;
+    let max_depth = ds.max_depth.as_deref().map(eval_i64).transpose()?;
+    let alias = ds.alias.as_ref().map(|a| a.value.clone());
+    Ok(DepthBounds {
+        alias,
+        min_depth,
+        max_depth,
+    })
+}
+
+fn apply_depth_filter(mut qr: QueryResult, depths: &[i64], bounds: &DepthBounds) -> QueryResult {
+    if bounds.alias.is_none() && bounds.min_depth.is_none() && bounds.max_depth.is_none() {
+        return qr;
+    }
+    if let Some(ref col_name) = bounds.alias {
+        qr.columns.push(crate::executor::result::QueryColumn::new(
+            col_name.clone(),
+            crate::types::BqType::Int64,
+        ));
+    }
+    let mut filtered = Vec::with_capacity(qr.rows.len());
+    for (mut row, &d) in qr.rows.into_iter().zip(depths.iter()) {
+        if bounds.min_depth.is_some_and(|lo| d < lo) || bounds.max_depth.is_some_and(|hi| d > hi) {
+            continue;
+        }
+        if bounds.alias.is_some() {
+            row.push(BqValue::Int64(d));
+        }
+        filtered.push(row);
+    }
+    qr.rows = filtered;
+    qr
 }
 
 fn split_recursive_union<'a>(
@@ -274,122 +408,4 @@ fn filter_new_rows(
         }
     }
     Ok(fresh)
-}
-
-fn query_references_table(query: &Query, target_lower: &str) -> bool {
-    let mut refs = BTreeSet::new();
-    collect_query_table_refs(query, &mut refs);
-    refs.contains(target_lower)
-}
-
-fn set_expr_references_table(expr: &SetExpr, target_lower: &str) -> bool {
-    let mut refs = BTreeSet::new();
-    collect_set_expr_table_refs(expr, &mut refs);
-    refs.contains(target_lower)
-}
-
-fn collect_query_table_refs(query: &Query, out: &mut BTreeSet<String>) {
-    if let Some(ref w) = query.with {
-        for c in &w.ctes {
-            collect_query_table_refs(&c.query, out);
-        }
-    }
-    collect_set_expr_table_refs(&query.body, out);
-}
-
-fn collect_set_expr_table_refs(expr: &SetExpr, out: &mut BTreeSet<String>) {
-    match expr {
-        SetExpr::Select(sel) => collect_select_table_refs(sel, out),
-        SetExpr::Query(q) => collect_query_table_refs(q, out),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_set_expr_table_refs(left, out);
-            collect_set_expr_table_refs(right, out);
-        }
-        SetExpr::Values(_) => {}
-    }
-}
-
-fn collect_select_table_refs(sel: &Select, out: &mut BTreeSet<String>) {
-    for twj in &sel.from {
-        collect_twj_table_refs(twj, out);
-    }
-    for item in &sel.projection {
-        if let SelectItem::Expr { expr, .. } = item {
-            collect_expr_table_refs(expr, out);
-        }
-    }
-    if let Some(ref w) = sel.where_clause {
-        collect_expr_table_refs(w, out);
-    }
-    if let Some(ref h) = sel.having {
-        collect_expr_table_refs(h, out);
-    }
-}
-
-fn collect_twj_table_refs(twj: &TableWithJoins, out: &mut BTreeSet<String>) {
-    collect_factor_table_refs(&twj.relation, out);
-    for j in &twj.joins {
-        collect_factor_table_refs(&j.relation, out);
-    }
-}
-
-fn collect_factor_table_refs(factor: &TableFactor, out: &mut BTreeSet<String>) {
-    match factor {
-        TableFactor::Table { name, .. } => {
-            let parts = name.normalized_parts();
-            if let [single] = parts.as_slice() {
-                out.insert(single.to_ascii_lowercase());
-            }
-        }
-        TableFactor::Derived { query, .. } => collect_query_table_refs(query, out),
-        TableFactor::NestedJoin(twj) => collect_twj_table_refs(twj, out),
-        TableFactor::Pivot { source, .. }
-        | TableFactor::Unpivot { source, .. }
-        | TableFactor::TableSample { source, .. } => {
-            collect_factor_table_refs(source, out);
-        }
-        TableFactor::Unnest { expr, .. } => collect_expr_table_refs(expr, out),
-        TableFactor::TableFunction { args, .. } => {
-            for a in args {
-                collect_expr_table_refs(&a.expr, out);
-            }
-        }
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only subquery-bearing expression variants can contain CTE table references"
-)]
-fn collect_expr_table_refs(expr: &Expr, out: &mut BTreeSet<String>) {
-    match expr {
-        Expr::Subquery(q) | Expr::ArraySubquery(q) | Expr::Exists(q) => {
-            collect_query_table_refs(q, out);
-        }
-        Expr::In {
-            expr: inner,
-            target,
-            ..
-        } => {
-            collect_expr_table_refs(inner, out);
-            if let crate::ast::InTarget::Subquery(q) = target {
-                collect_query_table_refs(q, out);
-            }
-        }
-        Expr::Binary { left, right, .. } => {
-            collect_expr_table_refs(left, out);
-            collect_expr_table_refs(right, out);
-        }
-        Expr::Unary { expr: inner, .. }
-        | Expr::Grouped(inner)
-        | Expr::Cast { expr: inner, .. }
-        | Expr::Is { expr: inner, .. }
-        | Expr::FieldAccess { expr: inner, .. } => collect_expr_table_refs(inner, out),
-        Expr::Function(call) => {
-            for a in &call.args {
-                collect_expr_table_refs(&a.expr, out);
-            }
-        }
-        _ => {}
-    }
 }

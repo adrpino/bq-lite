@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::ast::{Expr, GroupByClause, Ident, OrderByExpr, Select, SelectItem};
+use crate::ast::{Expr, Ident, OrderByExpr, Select, SelectItem};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::{eval_expr, infer_expr_col_name, values_distinct_eq};
@@ -35,6 +35,7 @@ impl BucketRows<'_> {
 pub(super) struct GroupedBucket<'a> {
     pub active_keys: Vec<(Expr, BqValue)>,
     pub rolled_up_keys: Vec<Expr>,
+    pub direct_select_keys: Vec<Expr>,
     pub rows: BucketRows<'a>,
 }
 
@@ -42,6 +43,7 @@ pub(super) struct GroupedBucket<'a> {
 pub(super) struct GroupedKeys<'a> {
     pub active: &'a [(Expr, BqValue)],
     pub rolled_up: &'a [Expr],
+    pub direct_select: &'a [Expr],
     pub select_aliases: Option<&'a BTreeMap<String, Expr>>,
 }
 
@@ -50,6 +52,7 @@ impl GroupedBucket<'_> {
         GroupedKeys {
             active: &self.active_keys,
             rolled_up: &self.rolled_up_keys,
+            direct_select: &self.direct_select_keys,
             select_aliases: None,
         }
     }
@@ -57,11 +60,10 @@ impl GroupedBucket<'_> {
 
 use super::agg_builtins::is_aggregate_name;
 use super::agg_eval::eval_grouped_expr;
-use super::agg_grouping::{attach_grouped_order_by, expand_single_gb_item, expr_eq_gb};
+use super::agg_grouping::{attach_grouped_order_by, expand_group_by, expr_eq_gb};
 use super::project::{has_untyped_null, merge_inferred_type};
 use super::project_eval_rows;
 use super::type_infer::infer_expr_type;
-use super::window::expr_has_window;
 
 #[must_use]
 pub(super) fn select_uses_grouping(select: &Select) -> bool {
@@ -92,7 +94,11 @@ pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
         | Expr::Cast { expr: inner, .. }
         | Expr::Is { expr: inner, .. }
         | Expr::FieldAccess { expr: inner, .. }
-        | Expr::Extract { expr: inner, .. } => expr_has_aggregate(inner),
+        | Expr::Extract { expr: inner, .. }
+        | Expr::ExprStar(inner) => expr_has_aggregate(inner),
+        Expr::WithExpr { bindings, body } => {
+            bindings.iter().any(|(_, e)| expr_has_aggregate(e)) || expr_has_aggregate(body)
+        }
         Expr::Case {
             operand,
             whens,
@@ -188,9 +194,9 @@ pub(super) fn execute_grouped_buckets<'a>(
 ) -> BqResult<Vec<GroupedBucket<'a>>> {
     let alias_map = build_select_alias_map(select);
     let effective_schema = rows.first().unwrap_or(schema_row);
-    let grouping_sets = match &select.group_by {
+    let (grouping_sets, direct_select_keys) = match &select.group_by {
         Some(gb) => expand_group_by(gb, select, &alias_map, effective_schema)?,
-        None => vec![Vec::new()],
+        None => (vec![Vec::new()], Vec::new()),
     };
     let mut all_keys: Vec<Expr> = Vec::new();
     for set in &grouping_sets {
@@ -228,6 +234,7 @@ pub(super) fn execute_grouped_buckets<'a>(
                 let keys = GroupedKeys {
                     active: &active_pairs,
                     rolled_up: &rolled_full,
+                    direct_select: &direct_select_keys,
                     select_aliases: Some(&alias_map),
                 };
                 let hval = eval_grouped_expr(having, bucket.as_slice(), &keys, ctx)?;
@@ -238,6 +245,7 @@ pub(super) fn execute_grouped_buckets<'a>(
             out.push(GroupedBucket {
                 active_keys: active_pairs,
                 rolled_up_keys: rolled_full,
+                direct_select_keys: direct_select_keys.clone(),
                 rows: bucket,
             });
         }
@@ -284,82 +292,6 @@ fn append_alias_keys(alias_map: &BTreeMap<String, Expr>, active_pairs: &mut Vec<
         }
     }
     active_pairs.extend(extra);
-}
-
-fn expand_group_by(
-    gb: &GroupByClause,
-    select: &Select,
-    alias_map: &BTreeMap<String, Expr>,
-    schema_row: &EvalRow,
-) -> BqResult<Vec<Vec<Expr>>> {
-    let proj_exprs: Vec<Option<Expr>> = select
-        .projection
-        .iter()
-        .map(|item| match item {
-            SelectItem::Expr { expr, .. } => Some((**expr).clone()),
-            SelectItem::Wildcard { .. } => None,
-        })
-        .collect();
-    match gb {
-        GroupByClause::All => {
-            let mut keys = Vec::new();
-            for item in &select.projection {
-                match item {
-                    SelectItem::Expr { expr, .. } => {
-                        if !expr_has_aggregate(expr) && !expr_has_window(expr) {
-                            keys.push((**expr).clone());
-                        }
-                    }
-                    SelectItem::Wildcard {
-                        qualifier, except, ..
-                    } => {
-                        let qual_str = qualifier
-                            .as_ref()
-                            .and_then(|q| q.parts.last())
-                            .map(|i| &i.value);
-                        for col in &schema_row.cols {
-                            if col.name.starts_with("__win_") {
-                                continue;
-                            }
-                            if let Some(qs) = qual_str {
-                                if !col
-                                    .qualifier
-                                    .as_deref()
-                                    .is_some_and(|cq| cq.eq_ignore_ascii_case(qs))
-                                {
-                                    continue;
-                                }
-                            }
-                            if except
-                                .iter()
-                                .any(|e| e.value.eq_ignore_ascii_case(&col.name))
-                            {
-                                continue;
-                            }
-                            keys.push(Expr::Ident(Ident::unquoted(col.name.as_ref())));
-                        }
-                    }
-                }
-            }
-            Ok(vec![keys])
-        }
-        GroupByClause::Items(items) => {
-            let mut acc: Vec<Vec<Expr>> = vec![Vec::new()];
-            for item in items {
-                let sets = expand_single_gb_item(item, &proj_exprs, alias_map, schema_row)?;
-                let mut next = Vec::with_capacity(acc.len() * sets.len());
-                for base in &acc {
-                    for add in &sets {
-                        let mut combined = base.clone();
-                        combined.extend(add.iter().cloned());
-                        next.push(combined);
-                    }
-                }
-                acc = next;
-            }
-            Ok(acc)
-        }
-    }
 }
 
 fn bucket_rows<'a>(
@@ -440,6 +372,11 @@ pub(super) fn project_grouped_row(
     for item in &select.projection {
         match item {
             SelectItem::Expr { expr, alias } => {
+                if let Expr::ExprStar(inner) = expr.as_ref() {
+                    let val = eval_grouped_expr(inner, bucket, keys, ctx)?;
+                    super::project::expand_struct_star_value(val, &mut cols, &mut anon_idx)?;
+                    continue;
+                }
                 let val = eval_grouped_expr(expr, bucket, keys, ctx)?;
                 let raw_ty = val.infer_type()?;
                 let ty = if has_untyped_null(&raw_ty) {
@@ -463,11 +400,30 @@ pub(super) fn project_grouped_row(
                     value: val,
                 });
             }
-            SelectItem::Wildcard { .. } => {
+            SelectItem::Wildcard {
+                qualifier,
+                except,
+                replace,
+            } => {
                 let sample = bucket.first().cloned().unwrap_or_default();
-                let expanded = project_eval_rows(select, &[sample], ctx)?;
+                let single_wc = Select {
+                    distinct: false,
+                    as_kind: None,
+                    projection: vec![SelectItem::Wildcard {
+                        qualifier: qualifier.clone(),
+                        except: except.clone(),
+                        replace: replace.clone(),
+                    }],
+                    from: Vec::new(),
+                    where_clause: None,
+                    group_by: None,
+                    having: None,
+                    qualify: None,
+                    window: Vec::new(),
+                };
+                let expanded = project_eval_rows(&single_wc, &[sample], ctx)?;
                 if let Some(first) = expanded.into_iter().next() {
-                    return Ok(first);
+                    cols.extend(first.cols);
                 }
             }
         }

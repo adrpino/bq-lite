@@ -59,6 +59,8 @@ pub(super) fn expr_has_window(expr: &Expr) -> bool {
         | Expr::SystemVar(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
+        | Expr::ExprStar(_)
+        | Expr::WithExpr { .. }
         | Expr::Like { .. }
         | Expr::In { .. }
         | Expr::ArrayLiteral { .. }
@@ -210,13 +212,19 @@ fn filter_grouped_qualify(
         let mut active = bucket.active_keys.clone();
         for col in &proj_row.cols {
             let ident = Expr::Ident(crate::ast::Ident::unquoted(col.name.as_ref()));
-            if !active.iter().any(|(k, _)| k == &ident) {
+            if !active.iter().any(|(k, _)| k == &ident)
+                && !bucket
+                    .rolled_up_keys
+                    .iter()
+                    .any(|r| super::agg_grouping::expr_eq_gb(r, &ident))
+            {
                 active.push((ident, col.value.clone()));
             }
         }
         let keys = super::agg::GroupedKeys {
             active: &active,
             rolled_up: &bucket.rolled_up_keys,
+            direct_select: &bucket.direct_select_keys,
             select_aliases: Some(alias_map),
         };
         if matches!(
@@ -356,6 +364,8 @@ fn rewrite_expr_windows(expr: &mut Expr, calls: &mut Vec<FunctionCall>) {
         | Expr::SystemVar(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
+        | Expr::ExprStar(_)
+        | Expr::WithExpr { .. }
         | Expr::Like { .. }
         | Expr::In { .. }
         | Expr::ArrayLiteral { .. }

@@ -342,7 +342,12 @@ fn eval_window_agg(
         }
         return Ok(());
     }
-    if upper == "SUM" && !call.distinct && call.having.is_none() && spec.frame.is_none() {
+    if upper == "SUM"
+        && !call.distinct
+        && call.having.is_none()
+        && spec.frame.is_none()
+        && !call.safe_prefix
+    {
         if let Some(arg) = call.args.first() {
             return eval_cumulative_sum(arg, spec, part, ctx, out);
         }

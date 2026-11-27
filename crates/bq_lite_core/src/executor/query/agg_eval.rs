@@ -11,7 +11,7 @@ use crate::types::{BqStructFieldValue, BqValue};
 
 use super::agg::GroupedKeys;
 use super::agg_builtins::{eval_aggregate_call, is_aggregate_name};
-use super::agg_grouping::expr_eq_gb;
+use super::agg_grouping::{expr_eq_gb, expr_subcols_covered_by_keys};
 use super::exec_util::RowSlice;
 
 #[expect(
@@ -24,11 +24,13 @@ pub(super) fn eval_grouped_expr(
     keys: &GroupedKeys<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    if let Some((_, key_val)) = keys.active.iter().find(|(k, _)| expr_eq_gb(k, expr)) {
-        return Ok(key_val.clone());
-    }
-    if keys.rolled_up.iter().any(|k| expr_eq_gb(k, expr)) {
-        return Ok(BqValue::Null);
+    if !expr_subcols_covered_by_keys(expr, keys) {
+        if let Some((_, key_val)) = keys.active.iter().find(|(k, _)| expr_eq_gb(k, expr)) {
+            return Ok(key_val.clone());
+        }
+        if keys.rolled_up.iter().any(|k| expr_eq_gb(k, expr)) {
+            return Ok(BqValue::Null);
+        }
     }
     match expr {
         Expr::Function(call) if call.over.is_none() => eval_grouped_fn(call, bucket, keys, ctx),
@@ -89,6 +91,9 @@ pub(super) fn eval_grouped_expr(
         | Expr::Extract { .. }
         | Expr::ArrayLiteral { .. }
         | Expr::StructLiteral { .. } => eval_grouped_compound(expr, bucket, keys, ctx),
+        Expr::WithExpr { bindings, body } => {
+            eval_grouped_with_expr(bindings, body, bucket, keys, ctx)
+        }
         Expr::Ident(id) => eval_grouped_ident(expr, &id.value, bucket, keys, ctx),
         _ => {
             let empty_row = EvalRow::default();
@@ -96,6 +101,35 @@ pub(super) fn eval_grouped_expr(
             eval_expr(expr, sample, ctx)
         }
     }
+}
+
+fn eval_grouped_with_expr(
+    bindings: &[(crate::ast::Ident, Expr)],
+    body: &Expr,
+    bucket: RowSlice<'_>,
+    keys: &GroupedKeys<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let mut active = keys.active.to_vec();
+    for (name, b_expr) in bindings {
+        let cur_keys = GroupedKeys {
+            active: &active,
+            rolled_up: keys.rolled_up,
+            direct_select: keys.direct_select,
+            select_aliases: keys.select_aliases,
+        };
+        let val = eval_grouped_expr(b_expr, bucket, &cur_keys, ctx)?;
+        let ident_expr = Expr::Ident(name.clone());
+        active.retain(|(k, _)| !expr_eq_gb(k, &ident_expr));
+        active.push((ident_expr, val));
+    }
+    let final_keys = GroupedKeys {
+        active: &active,
+        rolled_up: keys.rolled_up,
+        direct_select: keys.direct_select,
+        select_aliases: keys.select_aliases,
+    };
+    eval_grouped_expr(body, bucket, &final_keys, ctx)
 }
 
 fn eval_grouped_ident(
@@ -110,6 +144,7 @@ fn eval_grouped_ident(
             let next_keys = GroupedKeys {
                 active: keys.active,
                 rolled_up: keys.rolled_up,
+                direct_select: keys.direct_select,
                 select_aliases: None,
             };
             return eval_grouped_expr(aliased, bucket, &next_keys, ctx);
@@ -299,11 +334,7 @@ fn eval_grouped_fn(
         return eval_grouping_fn(call, keys);
     }
     if is_aggregate_name(&name) {
-        return match eval_aggregate_call(call, bucket, ctx) {
-            Ok(val) => Ok(val),
-            Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
-            Err(err) => Err(err),
-        };
+        return eval_aggregate_call(call, bucket, ctx);
     }
     let upper = name.to_ascii_uppercase();
     let mut args = Vec::with_capacity(call.args.len());

@@ -43,6 +43,18 @@ pub(in crate::executor) fn execute_ddl_with_bindings(
 ) -> BqResult<Option<QueryResult>> {
     match stmt {
         Statement::CreateSchema(cs) => exec_create_schema(cs, catalog, storage, bindings).map(Some),
+        Statement::CreateConstant(cc) => {
+            let ctx = ExecContext::with_bindings(catalog, storage, bindings);
+            let val = crate::executor::evaluator::eval_expr(
+                &cc.expr,
+                &crate::executor::context::EvalRow::default(),
+                &ctx,
+            )?;
+            if !cc.if_not_exists || catalog.get_constant(&cc.name.value).is_none() {
+                catalog.set_constant(&cc.name.value, val);
+            }
+            Ok(Some(QueryResult::empty()))
+        }
         Statement::AlterSchema(als) => exec_alter_schema(als, catalog, storage, bindings).map(Some),
         Statement::CreateTable(ct) => exec_create_table(ct, catalog, storage, bindings).map(Some),
         Statement::AlterTable(at) => exec_alter_table(at, catalog, storage).map(Some),
@@ -133,6 +145,7 @@ fn exec_create_view(
         expiration_ms: None,
         external_uris: Vec::new(),
         external_format: None,
+        primary_key: Vec::new(),
     };
     catalog.put_table(&tref, meta, stmt.or_replace, stmt.if_not_exists)?;
     Ok(QueryResult::empty())

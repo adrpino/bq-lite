@@ -40,6 +40,7 @@ const OUT_OF_SCOPE_FEATURES: &[&str] = &[
     "TIMESTAMP_NANOS",
     "TIMESTAMP_PICOS",
     "DISALLOW_NULL_PRIMARY_KEYS",
+    "DISALLOW_PRIMARY_KEY_UPDATES",
     "REPLACE_FIELDS",
     "PROTO",
     "ENUM",
@@ -178,6 +179,7 @@ fn prepare_db_section(engine: &mut Engine, sec: &TestSection) {
                 expiration_ms: None,
                 external_uris: Vec::new(),
                 external_format: None,
+                primary_key: Vec::new(),
             };
             let tref = TableRef::new("local", "compliance", &tbl_name);
             let _ = engine.catalog_mut().put_table(&tref, meta, true, false);
@@ -218,13 +220,34 @@ fn extract_create_table_name(sql: &str) -> Option<String> {
     None
 }
 
+fn fork_for_section(base_engine: &Engine, sec: &TestSection) -> Engine {
+    let mut fork = base_engine.fork_isolated();
+    if sec.primary_key_mode.as_deref() == Some("first_column_is_primary_key") {
+        let tbl_names: Vec<String> = fork
+            .catalog()
+            .get_dataset("local", "compliance")
+            .map(|ds| ds.tables.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in tbl_names {
+            let tref = TableRef::new("local", "compliance", &name);
+            if let Ok(mut meta) = fork.catalog().get_table(&tref).cloned() {
+                if let Some(first_col) = meta.columns.first() {
+                    meta.primary_key = vec![first_col.name.clone()];
+                    let _ = fork.catalog_mut().put_table(&tref, meta, true, false);
+                }
+            }
+        }
+    }
+    fork
+}
+
 fn run_single_case(base_engine: &Engine, sec: &TestSection, report: &mut FileReport) {
     match &sec.expected {
         Expected::Empty => {
             report.skipped += 1;
         }
         Expected::Error => {
-            let mut fork = base_engine.fork_isolated();
+            let mut fork = fork_for_section(base_engine, sec);
             match fork.exec_script(&sec.sql) {
                 Err(err) if err.kind != BqErrorKind::Unimplemented => {
                     report.passed += 1;
@@ -291,7 +314,7 @@ fn run_dml_case(
     all_rows: Option<&str>,
     report: &mut FileReport,
 ) {
-    let mut fork = base_engine.fork_isolated();
+    let mut fork = fork_for_section(base_engine, sec);
     match fork.exec(&sec.sql) {
         Ok(qr) => {
             let count_ok = num_rows_modified
@@ -337,12 +360,16 @@ fn extract_dml_target_table(sql: &str) -> Option<String> {
     let mut tokens = sql.split_whitespace();
     let first = tokens.next()?;
     let raw = if first.eq_ignore_ascii_case("INSERT") {
-        let second = tokens.next()?;
-        if second.eq_ignore_ascii_case("INTO") {
-            tokens.next()?
-        } else {
-            second
+        let mut cur = tokens.next()?;
+        while cur.eq_ignore_ascii_case("OR")
+            || cur.eq_ignore_ascii_case("IGNORE")
+            || cur.eq_ignore_ascii_case("REPLACE")
+            || cur.eq_ignore_ascii_case("UPDATE")
+            || cur.eq_ignore_ascii_case("INTO")
+        {
+            cur = tokens.next()?;
         }
+        cur
     } else if first.eq_ignore_ascii_case("UPDATE") {
         tokens.next()?
     } else if first.eq_ignore_ascii_case("DELETE") {

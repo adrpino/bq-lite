@@ -1,7 +1,7 @@
 use crate::ast::{
-    ArrayAccessKind, DeleteStmt, DmlReturning, Expr, Ident, InsertSource, InsertStmt, MergeAction,
-    MergeClause, MergeConditionKind, MergeStmt, TruncateStmt, UpdateAssignment, UpdatePathStep,
-    UpdateStmt,
+    ArrayAccessKind, DeleteStmt, DmlReturning, Expr, Ident, InsertMode, InsertSource, InsertStmt,
+    MergeAction, MergeClause, MergeConditionKind, MergeStmt, TruncateStmt, UpdateAssignment,
+    UpdatePathStep, UpdateStmt,
 };
 use crate::error::{BqError, BqResult};
 
@@ -13,6 +13,21 @@ use super::token::TokenKind;
 
 pub(super) fn parse_insert(p: &mut Parser) -> BqResult<InsertStmt> {
     p.expect_kw("INSERT")?;
+    let had_or = p.eat_kw("OR");
+    let mode = if p.eat_kw("IGNORE") {
+        InsertMode::Ignore
+    } else if p.eat_kw("REPLACE") {
+        InsertMode::Replace
+    } else if p.eat_kw("UPDATE") {
+        InsertMode::Update
+    } else if had_or {
+        return Err(BqError::syntax(
+            "Expected IGNORE, REPLACE, or UPDATE after INSERT OR",
+            p.current_span(),
+        ));
+    } else {
+        InsertMode::Default
+    };
     p.eat_kw("INTO");
     let table = p.parse_object_name()?;
     let columns = if p.eat(&TokenKind::LParen) {
@@ -35,6 +50,7 @@ pub(super) fn parse_insert(p: &mut Parser) -> BqResult<InsertStmt> {
     };
     let (assert_rows_modified, returning) = parse_dml_tail_clauses(p)?;
     Ok(InsertStmt {
+        mode,
         table,
         columns,
         source,

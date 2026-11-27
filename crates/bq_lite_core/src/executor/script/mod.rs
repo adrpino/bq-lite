@@ -186,6 +186,7 @@ pub(super) fn exec_single_stmt(
         | Statement::AlterView(_)
         | Statement::Drop(_)
         | Statement::CreateSchema(_)
+        | Statement::CreateConstant(_)
         | Statement::CreateView(_)
         | Statement::CreateFunction(_)
         | Statement::CreateProcedure(_)

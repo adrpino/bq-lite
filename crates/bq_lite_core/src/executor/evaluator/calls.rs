@@ -363,11 +363,19 @@ pub(super) fn eval_array_literal(
         .into_iter()
         .zip(elements.iter())
         .map(|(v, el)| {
-            if matches!(el, Expr::Literal(crate::ast::Literal::String(_)))
+            let is_str_lit = matches!(el, Expr::Literal(crate::ast::Literal::String(_)));
+            let is_float_lit = matches!(el, Expr::Literal(crate::ast::Literal::Float(_)))
+                || matches!(
+                    el,
+                    Expr::Unary { expr: inner, .. }
+                        if matches!(inner.as_ref(), Expr::Literal(crate::ast::Literal::Float(_)))
+                );
+            if (is_str_lit
                 && matches!(
                     target_elem,
                     BqType::Date | BqType::Datetime | BqType::Time | BqType::Timestamp
-                )
+                ))
+                || (is_float_lit && matches!(target_elem, BqType::Numeric | BqType::BigNumeric))
             {
                 crate::types::coercion::cast_value(v, &target_elem)
             } else {
@@ -444,6 +452,8 @@ pub(in crate::executor) fn infer_expr_col_name(expr: &Expr) -> Option<String> {
         | Expr::SystemVar(_)
         | Expr::Star
         | Expr::QualifiedStar(_)
+        | Expr::ExprStar(_)
+        | Expr::WithExpr { .. }
         | Expr::Binary { .. }
         | Expr::Unary { .. }
         | Expr::Is { .. }

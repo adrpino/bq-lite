@@ -186,6 +186,8 @@ Every function listed as `implemented` in a table below must exist in the corres
 | `ST_GEOGFROMTEXT` | `implemented` | Parses WKT into `GEOGRAPHY` |
 | `ST_GEOGPOINT` | `implemented` | Constructs `GEOGRAPHY` point |
 | `ST_WITHIN` | `implemented` | Geography within check |
+| `ST_X` | `implemented` | Longitude coordinate of a `GEOGRAPHY` point |
+| `ST_Y` | `implemented` | Latitude coordinate of a `GEOGRAPHY` point |
 | `STARTS_WITH` | `implemented` | Prefix check |
 | `STRING` | `implemented` | Extracts `STRING` from `JSON` |
 | `STRPOS` | `implemented` | 1-based substring position |

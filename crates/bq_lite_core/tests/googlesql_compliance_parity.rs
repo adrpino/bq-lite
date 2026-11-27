@@ -166,3 +166,217 @@ fn aggregates_bytes_and_tablesample_parity() {
         .unwrap();
     assert_eq!(ts.rows[0][0], BqValue::Int64(5));
 }
+
+#[test]
+fn set_ops_by_name_struct_accessors_with_expr_and_temporal_coercion_parity() {
+    let e = Engine::new();
+
+    // INNER / LEFT / FULL UNION ALL BY NAME [ON (...)]
+    let full = e
+        .query(
+            "SELECT 1 AS b, 2 AS a, 5 AS z
+             FULL UNION ALL BY NAME ON (B, z, y)
+             SELECT 6 AS y, 3 AS b, 4 AS a
+             ORDER BY B",
+        )
+        .unwrap();
+    assert_eq!(
+        full.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["B", "z", "y"]
+    );
+    assert_eq!(
+        full.rows,
+        vec![
+            vec![BqValue::Int64(1), BqValue::Int64(5), BqValue::Null],
+            vec![BqValue::Int64(3), BqValue::Null, BqValue::Int64(6)],
+        ]
+    );
+
+    // STRUCT positional accessors, empty STRUCT<>(), WITH(...) expressions + expr.*
+    let s = e
+        .query(
+            "SELECT
+                STRUCT(10, 'hi')[OFFSET(0)],
+                STRUCT(10, 'hi')[ORDINAL(2)],
+                STRUCT(10, 'hi')[SAFE_OFFSET(9)],
+                STRUCT<>() IS DISTINCT FROM CAST(NULL AS STRUCT<>),
+                WITH(x AS ARRAY_AGG(v ORDER BY v), STRUCT(ARRAY_LENGTH(x) AS n, x[OFFSET(0)] AS first)).*
+             FROM UNNEST([3, 1, 2]) AS v",
+        )
+        .unwrap();
+    assert_eq!(s.rows[0][0], BqValue::Int64(10));
+    assert_eq!(s.rows[0][1], BqValue::String("hi".to_owned()));
+    assert!(s.rows[0][2].is_null());
+    assert_eq!(s.rows[0][3], BqValue::Bool(true));
+    assert_eq!(s.rows[0][4], BqValue::Int64(3));
+    assert_eq!(s.rows[0][5], BqValue::Int64(1));
+    assert!(e.query("SELECT STRUCT(1)[OFFSET(5)]").is_err());
+
+    // IANA tz TIMESTAMP literals, temporal BETWEEN/IN with string literals, ARRAY<NUMERIC> float coercion
+    let t = e
+        .query(
+            "SELECT
+                TIMESTAMP '2013-07-22 16:24:00 Europe/London' > TIMESTAMP '2011-04-29 10:48:00 Europe/London',
+                DATE '2020-05-01' BETWEEN '2020-01-01' AND '2020-12-31',
+                DATE '2020-05-01' IN ('2020-05-01', '2020-06-01'),
+                CAST(1.25 AS NUMERIC) IN UNNEST(ARRAY<NUMERIC>[1, 1.25, 2]),
+                ROUND(NUMERIC '2.45', 1, CAST('ROUND_HALF_AWAY_FROM_ZERO' AS ROUNDING_MODE)),
+                ST_X(ST_GEOGPOINT(-122.4, 37.8)),
+                ST_Y(ST_GEOGPOINT(-122.4, 37.8))",
+        )
+        .unwrap();
+    assert_eq!(t.rows[0][0], BqValue::Bool(true));
+    assert_eq!(t.rows[0][1], BqValue::Bool(true));
+    assert_eq!(t.rows[0][2], BqValue::Bool(true));
+    assert_eq!(t.rows[0][3], BqValue::Bool(true));
+    assert_eq!(t.rows[0][4].to_string(), "2.5");
+    assert_eq!(t.rows[0][5], BqValue::Float64(-122.4));
+    assert_eq!(t.rows[0][6], BqValue::Float64(37.8));
+}
+
+#[test]
+fn grouping_sets_recursive_depth_pivot_constants_and_pk_dml_parity() {
+    let mut e = Engine::new();
+
+    // GROUPING SETS expression match + QUALIFY GROUPING(a) = 0
+    let gs = e
+        .query(
+            "WITH t AS (SELECT 10 AS a, 'x' AS b UNION ALL SELECT 20, 'y')
+             SELECT a, a + 1, COUNT(*) OVER ()
+             FROM t
+             GROUP BY GROUPING SETS(a, a + 1)
+             QUALIFY GROUPING(a) = 0
+             ORDER BY a",
+        )
+        .unwrap();
+    assert_eq!(
+        gs.rows,
+        vec![
+            vec![BqValue::Int64(10), BqValue::Int64(11), BqValue::Int64(4)],
+            vec![BqValue::Int64(20), BqValue::Int64(21), BqValue::Int64(4)],
+        ]
+    );
+
+    // WITH RECURSIVE WITH DEPTH AS depth BETWEEN 1 AND 3 + pipe set op recursion
+    let rec = e
+        .query(
+            "WITH RECURSIVE t AS (
+                SELECT 0 AS n
+                UNION ALL
+                SELECT MOD(n + 1, 3) AS n FROM t
+             ) WITH DEPTH AS depth BETWEEN 1 AND 3
+             SELECT n, depth FROM t ORDER BY depth",
+        )
+        .unwrap();
+    assert_eq!(
+        rec.rows,
+        vec![
+            vec![BqValue::Int64(1), BqValue::Int64(1)],
+            vec![BqValue::Int64(2), BqValue::Int64(2)],
+            vec![BqValue::Int64(0), BqValue::Int64(3)],
+        ]
+    );
+    let pipe_rec = e
+        .query(
+            "WITH RECURSIVE t AS (
+                (SELECT 1 AS a, 2 AS b)
+                |> UNION DISTINCT BY NAME
+                (SELECT b, a FROM t)
+             )
+             SELECT a, b FROM t",
+        )
+        .unwrap();
+    assert_eq!(
+        pipe_rec.rows,
+        vec![vec![BqValue::Int64(1), BqValue::Int64(2)]]
+    );
+
+    // CREATE TEMP CONSTANT + PIVOT FOR (expr) + empty input + UNPIVOT qualified names
+    e.exec("CREATE TEMP CONSTANT C10 = 10").unwrap();
+    let piv = e
+        .query(
+            "SELECT _10 FROM (SELECT 10 AS k, 5 AS v WHERE FALSE)
+             PIVOT(ANY_VALUE(v) FOR (k) IN (C10))",
+        )
+        .unwrap();
+    assert_eq!(piv.rows, vec![vec![BqValue::Null]]);
+    let unpiv = e
+        .query(
+            "SELECT lbl, val FROM (SELECT 1 AS a, 2 AS b) AS t
+             UNPIVOT(val FOR lbl IN (t.a, t.b))
+             ORDER BY lbl",
+        )
+        .unwrap();
+    assert_eq!(
+        unpiv.rows,
+        vec![
+            vec![BqValue::String("a".to_owned()), BqValue::Int64(1)],
+            vec![BqValue::String("b".to_owned()), BqValue::Int64(2)],
+        ]
+    );
+}
+
+#[test]
+fn primary_key_dml_modes_and_safe_analytic_parity() {
+    let mut e = Engine::new();
+
+    // PRIMARY KEY + INSERT OR IGNORE / REPLACE / UPDATE + THEN RETURN WITH ACTION + UPDATE PK error
+    e.exec("CREATE SCHEMA pkds").unwrap();
+    e.exec("CREATE TABLE pkds.kv (id INT64, v INT64, extra INT64, PRIMARY KEY (id))")
+        .unwrap();
+    e.exec("INSERT INTO pkds.kv VALUES (1, 10, 100), (2, 20, 200)")
+        .unwrap();
+    assert!(e.exec("INSERT INTO pkds.kv VALUES (1, 99, 999)").is_err());
+
+    let ign = e
+        .exec("INSERT OR IGNORE INTO pkds.kv VALUES (1, 99, 999), (3, 30, 300) THEN RETURN WITH ACTION *")
+        .unwrap();
+    assert_eq!(ign.rows_affected, 1);
+    assert_eq!(ign.rows[0][3], BqValue::String("INSERT".to_owned()));
+
+    let upd = e
+        .exec("INSERT OR UPDATE INTO pkds.kv (id, v) VALUES (1, 55) THEN RETURN WITH ACTION *")
+        .unwrap();
+    assert_eq!(
+        upd.rows[0],
+        vec![
+            BqValue::Int64(1),
+            BqValue::Int64(55),
+            BqValue::Int64(100),
+            BqValue::String("UPDATE".to_owned()),
+        ]
+    );
+
+    let rep = e
+        .exec("INSERT OR REPLACE INTO pkds.kv (id, v) VALUES (2, 77) THEN RETURN WITH ACTION *")
+        .unwrap();
+    assert_eq!(
+        rep.rows[0],
+        vec![
+            BqValue::Int64(2),
+            BqValue::Int64(77),
+            BqValue::Null,
+            BqValue::String("REPLACE".to_owned()),
+        ]
+    );
+
+    // UPDATE causing duplicate PK must fail
+    assert!(e.exec("UPDATE pkds.kv SET id = 2 WHERE id = 1").is_err());
+
+    // SAFE.SUM analytic suppresses INT64 overflow, but propagates arg division-by-zero
+    let safe_win = e
+        .query(
+            "SELECT SAFE.SUM(v) OVER (ORDER BY k)
+             FROM (SELECT 1 AS k, 9223372036854775807 AS v UNION ALL SELECT 2, 1)
+             ORDER BY k",
+        )
+        .unwrap();
+    assert_eq!(safe_win.rows[0][0], BqValue::Int64(i64::MAX));
+    assert!(safe_win.rows[1][0].is_null());
+    assert!(e
+        .query("SELECT SAFE.SUM(1 / 0) OVER () FROM (SELECT 1 AS x)")
+        .is_err());
+}

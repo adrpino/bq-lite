@@ -19,10 +19,19 @@ pub struct WithClause {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CteDepthSpec {
+    pub alias: Option<Ident>,
+    pub min_depth: Option<Box<Expr>>,
+    pub max_depth: Option<Box<Expr>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cte {
     pub name: Ident,
     pub columns: Vec<Ident>,
     pub query: Box<Query>,
+    #[serde(default)]
+    pub depth_spec: Option<CteDepthSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +48,20 @@ pub enum SetQuantifier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetColumnMatchMode {
+    Strict,
+    Inner,
+    Left,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetCorrespondence {
     Positional,
-    ByName,
-    Corresponding,
+    ByName {
+        mode: SetColumnMatchMode,
+        on_columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,7 +181,7 @@ pub enum TableFactor {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PivotSpec {
     pub aggregates: Vec<(Expr, Option<Ident>)>,
-    pub for_col: Ident,
+    pub for_expr: Expr,
     pub in_values: Vec<(Expr, Option<Ident>)>,
 }
 

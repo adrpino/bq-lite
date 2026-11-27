@@ -30,6 +30,7 @@ fn seed_bench_table(eng: &mut Engine, name: &str, num_rows: i64, num_groups: i64
         expiration_ms: None,
         external_uris: Vec::new(),
         external_format: None,
+        primary_key: Vec::new(),
     };
     let tref = TableRef::new("local", "perf", name);
     assert!(eng.create_table(&tref, meta).is_ok());

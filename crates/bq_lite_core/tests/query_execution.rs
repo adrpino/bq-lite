@@ -33,6 +33,7 @@ fn setup_orders_engine() -> BqResult<Engine> {
             expiration_ms: None,
             external_uris: Vec::new(),
             external_format: None,
+            primary_key: Vec::new(),
         },
     )?;
     engine.insert_rows(

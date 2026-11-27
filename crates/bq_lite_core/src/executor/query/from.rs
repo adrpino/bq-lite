@@ -185,7 +185,17 @@ pub(super) fn eval_table_factor(
             alias,
         } => {
             let src = eval_table_factor(source, corr_row, ctx)?;
-            apply_pivot(src, spec, alias.as_ref().map(|a| a.value.as_str()), ctx)
+            let schema = src
+                .is_empty()
+                .then(|| infer_table_factor_schema(source, corr_row, ctx).ok())
+                .flatten();
+            apply_pivot(
+                src,
+                schema.as_ref(),
+                spec,
+                alias.as_ref().map(|a| a.value.as_str()),
+                ctx,
+            )
         }
         TableFactor::Unpivot {
             source,
@@ -239,6 +249,9 @@ fn eval_table_ref(
         if ctx.catalog.get_table(&temp_ref).is_ok() {
             return eval_concrete_table(&temp_ref, alias, system_time, ctx);
         }
+    }
+    if let Some(rows) = super::joins::try_eval_correlated_array_ref(name, alias, ctx)? {
+        return Ok(rows);
     }
     let tref = ctx.catalog.resolve_table_name(name)?;
     if let Some(prefix) = tref.table.strip_suffix('*') {
@@ -337,7 +350,7 @@ fn eval_concrete_table(
     let owned_rows: Vec<Vec<BqValue>> = if meta.kind == TableKind::External {
         crate::executor::ddl::load_external_rows(meta)?.1
     } else if let Some(st_expr) = system_time {
-        let ts = eval_system_time(st_expr, ctx)?;
+        let ts = super::joins::eval_system_time(st_expr, ctx)?;
         ctx.storage.read_rows_as_of(tref, ts)?
     } else {
         ctx.storage.read_rows(tref)
@@ -423,23 +436,9 @@ fn build_concrete_eval_row(
 
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "FOR SYSTEM_TIME AS OF expects TIMESTAMP"
-)]
-fn eval_system_time(expr: &crate::ast::Expr, ctx: &ExecContext<'_>) -> BqResult<DateTime<Utc>> {
-    let val = eval_expr(expr, &EvalRow::default(), ctx)?;
-    match val {
-        BqValue::Timestamp(ts) => Ok(ts),
-        _ => Err(BqError::query(
-            "FOR SYSTEM_TIME AS OF requires a TIMESTAMP expression",
-        )),
-    }
-}
-
-#[expect(
-    clippy::wildcard_enum_match_arm,
     reason = "UNNEST accepts Null or Array"
 )]
-fn eval_unnest(
+pub(super) fn eval_unnest(
     expr: &crate::ast::Expr,
     alias: Option<&crate::ast::Ident>,
     with_offset: Option<&Option<crate::ast::Ident>>,

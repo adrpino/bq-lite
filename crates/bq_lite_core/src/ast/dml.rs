@@ -15,8 +15,19 @@ pub enum InsertSource {
     Query(Box<Query>),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsertMode {
+    #[default]
+    Default,
+    Ignore,
+    Replace,
+    Update,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InsertStmt {
+    #[serde(default)]
+    pub mode: InsertMode,
     pub table: ObjectName,
     pub columns: Vec<Ident>,
     pub source: InsertSource,

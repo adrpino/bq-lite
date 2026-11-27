@@ -170,8 +170,8 @@
     "skipped": 14
   },
   "array_aggregation.test": {
-    "passed": 21,
-    "failed": 7,
+    "passed": 28,
+    "failed": 0,
     "skipped": 126
   },
   "array_constructors.test": {
@@ -240,8 +240,8 @@
     "skipped": 16
   },
   "comparison_functions.test": {
-    "passed": 75,
-    "failed": 8,
+    "passed": 81,
+    "failed": 2,
     "skipped": 33
   },
   "concat_function.test": {
@@ -270,19 +270,19 @@
     "skipped": 4
   },
   "dml_insert.test": {
-    "passed": 33,
-    "failed": 33,
+    "passed": 65,
+    "failed": 1,
     "skipped": 15
   },
   "dml_returning.test": {
-    "passed": 25,
-    "failed": 10,
+    "passed": 35,
+    "failed": 0,
     "skipped": 0
   },
   "dml_update.test": {
-    "passed": 58,
-    "failed": 22,
-    "skipped": 12
+    "passed": 65,
+    "failed": 2,
+    "skipped": 25
   },
   "dml_update_struct.test": {
     "passed": 49,
@@ -315,8 +315,8 @@
     "skipped": 32
   },
   "grouping_sets_queries.test": {
-    "passed": 73,
-    "failed": 16,
+    "passed": 89,
+    "failed": 0,
     "skipped": 18
   },
   "hash.test": {
@@ -330,13 +330,13 @@
     "skipped": 0
   },
   "in_queries.test": {
-    "passed": 102,
-    "failed": 10,
+    "passed": 105,
+    "failed": 7,
     "skipped": 5
   },
   "interval.test": {
-    "passed": 48,
-    "failed": 7,
+    "passed": 51,
+    "failed": 4,
     "skipped": 17
   },
   "is_unknown.test": {
@@ -400,8 +400,8 @@
     "skipped": 0
   },
   "pivot.test": {
-    "passed": 18,
-    "failed": 11,
+    "passed": 28,
+    "failed": 1,
     "skipped": 10
   },
   "qualify.test": {
@@ -435,13 +435,13 @@
     "skipped": 0
   },
   "round.test": {
-    "passed": 11,
-    "failed": 2,
+    "passed": 13,
+    "failed": 0,
     "skipped": 0
   },
   "safe_function.test": {
-    "passed": 35,
-    "failed": 2,
+    "passed": 37,
+    "failed": 0,
     "skipped": 21
   },
   "select_distinct.test": {
@@ -450,8 +450,8 @@
     "skipped": 22
   },
   "set_operation_by_name.test": {
-    "passed": 1,
-    "failed": 7,
+    "passed": 8,
+    "failed": 0,
     "skipped": 0
   },
   "strings.test": {
@@ -460,13 +460,13 @@
     "skipped": 24
   },
   "struct_positional_accessor.test": {
-    "passed": 0,
-    "failed": 2,
+    "passed": 2,
+    "failed": 0,
     "skipped": 12
   },
   "struct_queries.test": {
-    "passed": 22,
-    "failed": 1,
+    "passed": 23,
+    "failed": 0,
     "skipped": 11
   },
   "subquery_expression_queries.test": {
@@ -500,8 +500,8 @@
     "skipped": 1
   },
   "unpivot.test": {
-    "passed": 10,
-    "failed": 1,
+    "passed": 11,
+    "failed": 0,
     "skipped": 3
   },
   "with_queries.test": {
@@ -510,8 +510,8 @@
     "skipped": 0
   },
   "with_recursive.test": {
-    "passed": 26,
-    "failed": 9,
+    "passed": 34,
+    "failed": 1,
     "skipped": 8
   }
 }

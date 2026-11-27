@@ -19,15 +19,8 @@ pub(super) fn parse_postfix(p: &mut Parser) -> BqResult<Expr> {
     loop {
         if p.eat(&TokenKind::Dot) {
             if p.eat(&TokenKind::Star) {
-                expr = match expr_to_object_name(expr) {
-                    Some(name) => Expr::QualifiedStar(name),
-                    None => {
-                        return Err(BqError::syntax(
-                            "Expected qualified identifier before '.*'",
-                            p.current_span(),
-                        ))
-                    }
-                };
+                expr = expr_to_object_name(expr.clone())
+                    .map_or_else(|| Expr::ExprStar(Box::new(expr)), Expr::QualifiedStar);
                 continue;
             }
             let field = p.parse_ident()?;

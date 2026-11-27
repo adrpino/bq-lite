@@ -1,5 +1,6 @@
 mod assign;
 mod merge;
+mod pk;
 
 use crate::ast::{
     DeleteStmt, Ident, InsertSource, InsertStmt, Statement, TruncateStmt, UpdateStmt,
@@ -15,10 +16,11 @@ use crate::types::coercion::coerce_value;
 use crate::types::BqValue;
 
 use assign::{
-    apply_assignment, build_returning_result, check_assert_rows_modified, eval_update_val,
-    is_default_sentinel, schema_eval_row, AssignCtx,
+    apply_assignment, build_returning_result, build_returning_result_with_actions,
+    check_assert_rows_modified, eval_update_val, is_default_sentinel, schema_eval_row, AssignCtx,
 };
 use merge::exec_merge;
+use pk::{apply_pk_insert, verify_pk_uniqueness};
 
 pub(in crate::executor) fn execute_dml(
     stmt: &Statement,
@@ -56,7 +58,7 @@ fn exec_insert(
 ) -> BqResult<QueryResult> {
     let tref = catalog.resolve_table_name(&stmt.table)?;
     let meta = catalog.get_table(&tref)?.clone();
-    let (prepared, count) = {
+    let outcome = {
         let ctx = ExecContext::with_bindings(catalog, storage, bindings);
         let raw_rows: Vec<Vec<BqValue>> = match &stmt.source {
             InsertSource::Values(rows_expr) => {
@@ -80,23 +82,34 @@ fn exec_insert(
         for raw in raw_rows {
             out.push(finalize_new_row(&meta, &stmt.columns, raw, &ctx)?);
         }
-        let count = u64::try_from(out.len()).unwrap_or(u64::MAX);
-        check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), count, &ctx)?;
-        (out, count)
+        let existing = if meta.primary_key.is_empty() {
+            Vec::new()
+        } else {
+            storage.read_rows(&tref)
+        };
+        let outcome = apply_pk_insert(&meta, stmt.mode, &stmt.columns, existing, out)?;
+        check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), outcome.affected, &ctx)?;
+        outcome
     };
 
-    storage.insert_rows(&tref, prepared.clone())?;
+    if let Some(replaced) = outcome.replaced_table {
+        storage.replace_rows(&tref, replaced);
+    } else if !outcome.append_rows.is_empty() {
+        storage.insert_rows(&tref, outcome.append_rows)?;
+    }
 
     stmt.returning.as_ref().map_or_else(
-        || Ok(QueryResult::affected(count)),
+        || Ok(QueryResult::affected(outcome.affected)),
         |returning| {
             let ctx = ExecContext::with_bindings(catalog, storage, bindings);
             let schema = schema_eval_row(&meta, &meta.name);
-            let eval_rows: Vec<EvalRow> = prepared
+            let eval_rows: Vec<EvalRow> = outcome
+                .modified
                 .iter()
-                .map(|r| row_to_eval(&meta, r, &meta.name))
+                .map(|(r, _)| row_to_eval(&meta, r, &meta.name))
                 .collect();
-            build_returning_result(&schema, &eval_rows, returning, "INSERT", &ctx)
+            let actions: Vec<&str> = outcome.modified.iter().map(|(_, a)| *a).collect();
+            build_returning_result_with_actions(&schema, &eval_rows, returning, &actions, &ctx)
         },
     )
 }
@@ -248,6 +261,7 @@ fn exec_update(
                 out_rows.push(row);
             }
         }
+        verify_pk_uniqueness(&meta, &out_rows)?;
         check_assert_rows_modified(stmt.assert_rows_modified.as_ref(), affected, &ctx)?;
         (out_rows, returned_evals, affected)
     };

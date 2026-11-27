@@ -66,6 +66,8 @@ pub struct TableMeta {
     pub external_uris: Vec<String>,
     #[serde(default)]
     pub external_format: Option<String>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

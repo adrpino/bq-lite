@@ -169,7 +169,12 @@ fn eval_countif(
 }
 
 fn eval_sum(call: &FunctionCall, rows: RowSlice<'_>, ctx: &ExecContext<'_>) -> BqResult<BqValue> {
-    sum_collected_values(collect_arg_values(call, rows, ctx)?)
+    let vals = collect_arg_values(call, rows, ctx)?;
+    match sum_collected_values(vals) {
+        Ok(v) => Ok(v),
+        Err(e) if call.safe_prefix && e.is_safe_suppressible() => Ok(BqValue::Null),
+        Err(e) => Err(e),
+    }
 }
 
 fn eval_min_max(

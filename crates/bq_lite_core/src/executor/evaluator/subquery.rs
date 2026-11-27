@@ -20,10 +20,25 @@ pub(super) fn eval_in_expr(
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let lhs = eval_expr(expr, row, ctx)?;
+    let lhs_temporal = match &lhs {
+        BqValue::Date(_) => Some(crate::types::BqType::Date),
+        BqValue::Datetime(_) => Some(crate::types::BqType::Datetime),
+        BqValue::Time(_) => Some(crate::types::BqType::Time),
+        BqValue::Timestamp(_) => Some(crate::types::BqType::Timestamp),
+        _ => None,
+    };
     let candidates = match target {
         InTarget::List(exprs) => exprs
             .iter()
-            .map(|e| eval_expr(e, row, ctx))
+            .map(|e| {
+                let v = eval_expr(e, row, ctx)?;
+                if let Some(ref tty) = lhs_temporal {
+                    if matches!(e, Expr::Literal(crate::ast::Literal::String(_))) && !v.is_null() {
+                        return crate::types::coercion::cast_value(v, tty);
+                    }
+                }
+                Ok(v)
+            })
             .collect::<BqResult<Vec<_>>>()?,
         InTarget::Unnest(arr_expr) => match eval_expr(arr_expr, row, ctx)? {
             BqValue::Null => Vec::new(),
@@ -140,11 +155,8 @@ pub(super) fn eval_subscript_values(
             _ => Err(BqError::query("Invalid JSON subscript")),
         };
     }
-    let BqValue::Array(items) = base else {
-        return Err(BqError::query("Subscript requires ARRAY value"));
-    };
     let BqValue::Int64(raw_idx) = idx_val else {
-        return Err(BqError::query("Array subscript index must be INT64"));
+        return Err(BqError::query("Subscript index must be INT64"));
     };
     let zero_based = match kind {
         ArrayAccessKind::Raw | ArrayAccessKind::Offset | ArrayAccessKind::SafeOffset => raw_idx,
@@ -154,23 +166,52 @@ pub(super) fn eval_subscript_values(
         kind,
         ArrayAccessKind::SafeOffset | ArrayAccessKind::SafeOrdinal
     );
-    if zero_based < 0 {
-        return if safe {
-            Ok(BqValue::Null)
-        } else {
-            Err(BqError::semantic(format!(
-                "Array index {raw_idx} is out of bounds"
-            )))
-        };
-    }
-    let idx = usize::try_from(zero_based).ok();
-    match idx.and_then(|i| items.get(i).cloned()) {
-        Some(v) => Ok(v),
-        None if safe => Ok(BqValue::Null),
-        None => Err(BqError::semantic(format!(
-            "Array index {raw_idx} is out of bounds for array of length {}",
-            items.len()
-        ))),
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "Only ARRAY and STRUCT support integer offset/ordinal subscripts"
+    )]
+    match base {
+        BqValue::Array(items) => {
+            if zero_based < 0 {
+                return if safe {
+                    Ok(BqValue::Null)
+                } else {
+                    Err(BqError::semantic(format!(
+                        "Array index {raw_idx} is out of bounds"
+                    )))
+                };
+            }
+            let idx = usize::try_from(zero_based).ok();
+            match idx.and_then(|i| items.get(i).cloned()) {
+                Some(v) => Ok(v),
+                None if safe => Ok(BqValue::Null),
+                None => Err(BqError::semantic(format!(
+                    "Array index {raw_idx} is out of bounds for array of length {}",
+                    items.len()
+                ))),
+            }
+        }
+        BqValue::Struct(fields) => {
+            if zero_based < 0 {
+                return if safe {
+                    Ok(BqValue::Null)
+                } else {
+                    Err(BqError::semantic(format!(
+                        "Struct field index {raw_idx} is out of bounds"
+                    )))
+                };
+            }
+            let idx = usize::try_from(zero_based).ok();
+            match idx.and_then(|i| fields.get(i).map(|f| f.value.clone())) {
+                Some(v) => Ok(v),
+                None if safe => Ok(BqValue::Null),
+                None => Err(BqError::semantic(format!(
+                    "Struct field index {raw_idx} is out of bounds for struct of length {}",
+                    fields.len()
+                ))),
+            }
+        }
+        _ => Err(BqError::query("Subscript requires ARRAY or STRUCT value")),
     }
 }
 
@@ -331,4 +372,27 @@ pub(super) fn eval_array_subquery(
         .map(|r| r.into_iter().next().unwrap_or(BqValue::Null))
         .collect();
     Ok(BqValue::Array(items))
+}
+
+pub(super) fn eval_with_expr(
+    bindings: &[(crate::ast::Ident, Expr)],
+    body: &Expr,
+    row: &EvalRow,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let mut scoped = row.clone();
+    for (name, expr) in bindings {
+        let val = eval_expr(expr, &scoped, ctx)?;
+        let ty = val.infer_type()?;
+        scoped
+            .cols
+            .retain(|c| !c.name.eq_ignore_ascii_case(&name.value));
+        scoped.cols.push(crate::executor::context::RowBinding {
+            qualifier: None,
+            name: std::sync::Arc::from(name.value.as_str()),
+            ty,
+            value: val,
+        });
+    }
+    eval_expr(body, &scoped, ctx)
 }

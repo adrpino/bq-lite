@@ -150,6 +150,7 @@ fn build_new_table_meta(table_id: String, body: &JsonValue) -> BqResult<TableMet
         expiration_ms: parse_i64_or_str(body.get("expirationTime")),
         external_uris: Vec::new(),
         external_format: None,
+        primary_key: Vec::new(),
     })
 }
 

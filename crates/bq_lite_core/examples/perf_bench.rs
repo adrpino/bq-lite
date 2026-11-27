@@ -37,6 +37,7 @@ fn build_wide_table(eng: &mut Engine, name: &str, num_rows: i64, num_cols: usize
         expiration_ms: None,
         external_uris: Vec::new(),
         external_format: None,
+        primary_key: Vec::new(),
     };
     let tref = TableRef::new("local", "bench", name);
     eng.create_table(&tref, meta).unwrap();

@@ -13,12 +13,13 @@ pub use common::{
 };
 pub use ddl::{
     AlterSchemaStmt, AlterTableAction, AlterTableStmt, AlterViewStmt, ColumnDef,
-    CreateFunctionStmt, CreateProcedureStmt, CreateRowAccessPolicyStmt, CreateSchemaStmt,
-    CreateTableKind, CreateTableStmt, CreateViewStmt, DropObjectKind, DropStmt, ExportDataStmt,
-    FunctionBody, FunctionKind, LoadDataStmt, ParamMode, RoutineParam, TableConstraint,
+    CreateConstantStmt, CreateFunctionStmt, CreateProcedureStmt, CreateRowAccessPolicyStmt,
+    CreateSchemaStmt, CreateTableKind, CreateTableStmt, CreateViewStmt, DropObjectKind, DropStmt,
+    ExportDataStmt, FunctionBody, FunctionKind, LoadDataStmt, ParamMode, RoutineParam,
+    TableConstraint,
 };
 pub use dml::{
-    DeleteStmt, DmlReturning, InsertSource, InsertStmt, MergeAction, MergeClause,
+    DeleteStmt, DmlReturning, InsertMode, InsertSource, InsertStmt, MergeAction, MergeClause,
     MergeConditionKind, MergeStmt, TruncateStmt, UpdateAssignment, UpdatePathStep, UpdateStmt,
 };
 pub use expr::{
@@ -26,10 +27,10 @@ pub use expr::{
     Literal, NullHandling, StructFieldExpr, UnaryOp, WhenBranch,
 };
 pub use query::{
-    Cte, GroupByClause, GroupByItem, Join, JoinConstraint, JoinKind, PipeGroupByItem, PipeOp,
-    PipeOrderDir, PipeOrderedItem, PivotSpec, Query, ReplaceItem, Select, SelectAsKind, SelectItem,
-    SetCorrespondence, SetExpr, SetOpKind, SetQuantifier, TableFactor, TableWithJoins, UnpivotSpec,
-    WithClause,
+    Cte, CteDepthSpec, GroupByClause, GroupByItem, Join, JoinConstraint, JoinKind, PipeGroupByItem,
+    PipeOp, PipeOrderDir, PipeOrderedItem, PivotSpec, Query, ReplaceItem, Select, SelectAsKind,
+    SelectItem, SetColumnMatchMode, SetCorrespondence, SetExpr, SetOpKind, SetQuantifier,
+    TableFactor, TableWithJoins, UnpivotSpec, WithClause,
 };
 pub use script::{
     AssertStmt, BeginEndBlock, CallStmt, CaseStmt, CaseStmtBranch, DeclareStmt,
@@ -51,6 +52,7 @@ pub enum Statement {
     AlterView(Box<AlterViewStmt>),
     Drop(DropStmt),
     CreateSchema(CreateSchemaStmt),
+    CreateConstant(Box<CreateConstantStmt>),
     CreateView(Box<CreateViewStmt>),
     CreateFunction(Box<CreateFunctionStmt>),
     CreateProcedure(Box<CreateProcedureStmt>),

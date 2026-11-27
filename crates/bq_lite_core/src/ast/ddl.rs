@@ -119,6 +119,15 @@ pub struct DropStmt {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateConstantStmt {
+    pub or_replace: bool,
+    pub temp: bool,
+    pub if_not_exists: bool,
+    pub name: Ident,
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateSchemaStmt {
     pub if_not_exists: bool,
     pub name: ObjectName,

@@ -196,6 +196,7 @@ pub(super) fn write_rows_with_dispositions(
                 expiration_ms: None,
                 external_uris: Vec::new(),
                 external_format: None,
+                primary_key: Vec::new(),
             },
         )?;
     }

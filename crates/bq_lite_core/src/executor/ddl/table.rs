@@ -84,6 +84,20 @@ fn exec_standard_create_table(
     }
     let options = eval_options(&stmt.options, catalog, storage, bindings)?;
     let now = Utc::now();
+    let primary_key = stmt
+        .constraints
+        .iter()
+        .find_map(|c| match c {
+            crate::ast::TableConstraint::PrimaryKey {
+                columns,
+                enforced: true,
+            } => Some(columns.iter().map(|id| id.value.clone()).collect()),
+            crate::ast::TableConstraint::PrimaryKey {
+                enforced: false, ..
+            }
+            | crate::ast::TableConstraint::ForeignKey { .. } => None,
+        })
+        .unwrap_or_default();
     let meta = TableMeta {
         name: tref.table.clone(),
         kind: TableKind::Table,
@@ -101,6 +115,7 @@ fn exec_standard_create_table(
         expiration_ms: None,
         external_uris: Vec::new(),
         external_format: None,
+        primary_key,
     };
     let created = catalog.put_table(tref, meta, stmt.or_replace, stmt.if_not_exists)?;
     if created {

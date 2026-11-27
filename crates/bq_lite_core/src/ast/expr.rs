@@ -132,6 +132,11 @@ pub enum Expr {
     SystemVar(String),
     Star,
     QualifiedStar(ObjectName),
+    ExprStar(Box<Self>),
+    WithExpr {
+        bindings: Vec<(Ident, Self)>,
+        body: Box<Self>,
+    },
     Binary {
         left: Box<Self>,
         op: BinaryOp,

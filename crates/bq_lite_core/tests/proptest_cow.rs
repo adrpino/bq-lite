@@ -32,6 +32,7 @@ proptest! {
             expiration_ms: None,
             external_uris: Vec::new(),
             external_format: None,
+            primary_key: Vec::new(),
         }).unwrap();
         parent.insert_rows(&tref, vec![vec![BqValue::Int64(0)]]).unwrap();
 

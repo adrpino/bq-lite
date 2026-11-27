@@ -20,6 +20,7 @@ pub(super) use ops::{
 };
 use subquery::{
     eval_array_subquery, eval_extract, eval_in_expr, eval_scalar_subquery, eval_subscript,
+    eval_with_expr,
 };
 
 pub(super) fn eval_subscript_values(
@@ -138,7 +139,10 @@ pub(super) fn eval_expr(expr: &Expr, row: &EvalRow, ctx: &ExecContext<'_>) -> Bq
             start,
             end,
         } => literals::eval_range_literal(elem_type, start, end, row, ctx),
-        Expr::Star | Expr::QualifiedStar(_) => Err(BqError::query("Unexpected '*' in expression")),
+        Expr::WithExpr { bindings, body } => eval_with_expr(bindings, body, row, ctx),
+        Expr::Star | Expr::QualifiedStar(_) | Expr::ExprStar(_) => {
+            Err(BqError::query("Unexpected '*' in expression"))
+        }
         Expr::Lambda { .. } => Err(BqError::query(
             "Lambda expression is only valid inside ARRAY_TRANSFORM / ARRAY_FILTER",
         )),
@@ -257,6 +261,9 @@ fn resolve_single_ident(name: &str, row: &EvalRow, ctx: &ExecContext<'_>) -> BqR
     if let Some(var_val) = ctx.vars.get(&name.to_ascii_lowercase()) {
         return Ok(var_val.clone());
     }
+    if let Some(const_val) = ctx.catalog.get_constant(name) {
+        return Ok(const_val.clone());
+    }
     for outer in ctx.outer_rows.iter().rev() {
         if let Some(binding) = outer.resolve_ident(name)? {
             return Ok(binding.value.clone());
@@ -351,9 +358,34 @@ fn eval_between(
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let v = eval_expr(expr, row, ctx)?;
-    let l = eval_expr(low, row, ctx)?;
-    let h = eval_expr(high, row, ctx)?;
+    let mut v = eval_expr(expr, row, ctx)?;
+    let mut l = eval_expr(low, row, ctx)?;
+    let mut h = eval_expr(high, row, ctx)?;
+    let is_lit_str = |e: &Expr| matches!(e, Expr::Literal(crate::ast::Literal::String(_)));
+    let temporal_ty = [&v, &l, &h].iter().find_map(|val| {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "Only temporal scalar variants trigger string-literal coercion in BETWEEN"
+        )]
+        match val {
+            BqValue::Date(_) => Some(crate::types::BqType::Date),
+            BqValue::Datetime(_) => Some(crate::types::BqType::Datetime),
+            BqValue::Time(_) => Some(crate::types::BqType::Time),
+            BqValue::Timestamp(_) => Some(crate::types::BqType::Timestamp),
+            _ => None,
+        }
+    });
+    if let Some(ref tty) = temporal_ty {
+        if is_lit_str(expr) && !v.is_null() {
+            v = cast_value(v, tty)?;
+        }
+        if is_lit_str(low) && !l.is_null() {
+            l = cast_value(l, tty)?;
+        }
+        if is_lit_str(high) && !h.is_null() {
+            h = cast_value(h, tty)?;
+        }
+    }
     let ge_low = eval_binary(crate::ast::BinaryOp::Gte, v.clone(), l)?;
     let le_high = eval_binary(crate::ast::BinaryOp::Lte, v, h)?;
     let in_range = eval_binary(crate::ast::BinaryOp::And, ge_low, le_high)?;

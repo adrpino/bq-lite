@@ -60,6 +60,22 @@ pub(super) fn parse_create_stmt(p: &mut Parser) -> BqResult<Statement> {
             parse_create_procedure(p, or_replace)?,
         )));
     }
+    if p.is_kw("CONSTANT") {
+        p.advance();
+        let if_not_exists = parse_if_not_exists(p)?;
+        let name = p.parse_ident()?;
+        p.expect(&TokenKind::Eq, "'='")?;
+        let expr = parse_expr(p)?;
+        return Ok(Statement::CreateConstant(Box::new(
+            crate::ast::CreateConstantStmt {
+                or_replace,
+                temp,
+                if_not_exists,
+                name,
+                expr,
+            },
+        )));
+    }
     if p.is_kw("ROW") {
         return Ok(Statement::CreateRowAccessPolicy(Box::new(
             parse_create_row_access_policy(p, or_replace)?,

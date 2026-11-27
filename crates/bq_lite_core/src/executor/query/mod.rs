@@ -4,6 +4,7 @@ mod agg_builtins;
 mod agg_eval;
 mod agg_grouping;
 mod cte;
+mod cte_refs;
 mod exec_util;
 mod from;
 mod governance;
@@ -111,7 +112,7 @@ pub(super) fn execute_set_expr(expr: &SetExpr, ctx: &ExecContext<'_>) -> BqResul
         } => {
             let l = execute_set_expr(left, ctx)?;
             let r = execute_set_expr(right, ctx)?;
-            execute_set_op(*op, *quantifier, *correspondence, l, r)
+            execute_set_op(*op, *quantifier, correspondence, l, r)
         }
         SetExpr::Values(rows_expr) => eval_values_expr(rows_expr, ctx),
     }

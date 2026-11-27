@@ -300,3 +300,42 @@ pub(super) fn combine_rows(l: &EvalRow, r: &EvalRow) -> EvalRow {
     pseudo.extend(r.pseudo_cols.iter().cloned());
     EvalRow::with_pseudo(cols, pseudo)
 }
+
+/// Resolves a correlated `FROM t.arr` / `FROM t.s.arr` table factor against `ctx.outer_rows`
+/// as an implicit `UNNEST(...)`.
+pub(super) fn try_eval_correlated_array_ref(
+    name: &crate::ast::ObjectName,
+    alias: Option<&str>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<Vec<EvalRow>>> {
+    if ctx.outer_rows.is_empty() || name.parts.len() < 2 {
+        return Ok(None);
+    }
+    let expr = crate::ast::Expr::CompoundIdent(name.parts.clone());
+    let empty = EvalRow::default();
+    match eval_expr(&expr, &empty, ctx) {
+        Ok(BqValue::Array(_) | BqValue::Null) => {
+            let alias_id = alias.map(crate::ast::Ident::unquoted);
+            let rows = super::from::eval_unnest(&expr, alias_id.as_ref(), None, None, ctx)?;
+            Ok(Some(rows))
+        }
+        Ok(_) | Err(_) => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "FOR SYSTEM_TIME AS OF expects TIMESTAMP"
+)]
+pub(super) fn eval_system_time(
+    expr: &crate::ast::Expr,
+    ctx: &ExecContext<'_>,
+) -> BqResult<chrono::DateTime<chrono::Utc>> {
+    let val = eval_expr(expr, &EvalRow::default(), ctx)?;
+    match val {
+        BqValue::Timestamp(ts) => Ok(ts),
+        _ => Err(BqError::query(
+            "FOR SYSTEM_TIME AS OF requires a TIMESTAMP expression",
+        )),
+    }
+}

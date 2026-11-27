@@ -202,6 +202,7 @@ fn bq_reserved_names_drop_memory_alter_qualify_and_joins() {
             expiration_ms: None,
             external_uris: Vec::new(),
             external_format: None,
+            primary_key: Vec::new(),
         },
     )
     .unwrap();

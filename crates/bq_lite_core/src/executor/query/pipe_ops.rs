@@ -238,7 +238,7 @@ pub(super) fn pipe_set_op(
     state: PipeState,
     op: SetOpKind,
     quantifier: SetQuantifier,
-    correspondence: SetCorrespondence,
+    correspondence: &SetCorrespondence,
     queries: &[Query],
     ctx: &ExecContext<'_>,
 ) -> BqResult<PipeState> {
@@ -256,7 +256,13 @@ pub(super) fn pipe_pivot(
     alias: Option<&Ident>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<PipeState> {
-    let rows = apply_pivot(state.rows, spec, alias.map(|a| a.value.as_str()), ctx)?;
+    let rows = apply_pivot(
+        state.rows,
+        Some(&state.schema),
+        spec,
+        alias.map(|a| a.value.as_str()),
+        ctx,
+    )?;
     let schema = rows.first().map(null_out_eval_row).unwrap_or_default();
     Ok(PipeState { rows, schema })
 }

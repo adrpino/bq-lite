@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::ast::{Expr, ObjectName, Select, SelectItem};
-use crate::error::BqResult;
+use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowBinding};
 use crate::executor::evaluator::{eval_expr, infer_expr_col_name};
 use crate::types::{BqType, BqValue};
@@ -40,6 +40,12 @@ pub(in crate::executor) fn project_eval_rows(
         for (item, pre_name) in select.projection.iter().zip(&proj_names) {
             match item {
                 SelectItem::Expr { expr, .. } => {
+                    if let Expr::ExprStar(inner) = expr.as_ref() {
+                        let val = eval_expr(inner, row, ctx)?;
+                        let mut anon_idx = cols.len();
+                        expand_struct_star_value(val, &mut cols, &mut anon_idx)?;
+                        continue;
+                    }
                     let val = eval_expr(expr, row, ctx)?;
                     let raw_ty = val.infer_type()?;
                     let ty = if has_untyped_null(&raw_ty) {
@@ -67,6 +73,31 @@ pub(in crate::executor) fn project_eval_rows(
         out.push(EvalRow::new(cols));
     }
     Ok(out)
+}
+
+pub(super) fn expand_struct_star_value(
+    val: BqValue,
+    cols: &mut Vec<RowBinding>,
+    anon_idx: &mut usize,
+) -> BqResult<()> {
+    let BqValue::Struct(fields) = val else {
+        return Err(BqError::query("Expression.* requires a STRUCT value"));
+    };
+    for field in fields {
+        let ty = field.value.infer_type()?;
+        let name = field.name.unwrap_or_else(|| {
+            let n = format!("f{}_", *anon_idx);
+            *anon_idx += 1;
+            n
+        });
+        cols.push(RowBinding {
+            qualifier: None,
+            name: Arc::from(name),
+            ty,
+            value: field.value,
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn has_untyped_null(ty: &BqType) -> bool {

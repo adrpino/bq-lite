@@ -190,7 +190,7 @@ fn apply_single_pipe_op(
             quantifier,
             correspondence,
             queries,
-        } => pipe_set_op(state, *set_op, *quantifier, *correspondence, queries, ctx),
+        } => pipe_set_op(state, *set_op, *quantifier, correspondence, queries, ctx),
         PipeOp::Pivot { spec, alias } => pipe_pivot(state, spec, alias.as_ref(), ctx),
         PipeOp::Unpivot { spec, alias } => pipe_unpivot(state, spec, alias.as_ref()),
         PipeOp::TableSample { amount, is_rows } => pipe_tablesample(state, amount, *is_rows, ctx),

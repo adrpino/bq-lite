@@ -186,6 +186,7 @@ fn try_parse_special_keyword_expr(p: &mut Parser, upper: &str) -> BqResult<Optio
         "STRUCT" => try_parse_struct_expr(p),
         "RANGE" if matches!(p.peek_n(1).kind, TokenKind::Lt) => Ok(Some(parse_range_literal(p)?)),
         "SAFE" if matches!(p.peek_n(1).kind, TokenKind::Dot) => Ok(Some(parse_safe_call(p)?)),
+        "WITH" if matches!(p.peek_n(1).kind, TokenKind::LParen) => Ok(Some(parse_with_expr(p)?)),
         _ => Ok(None),
     }
 }
@@ -337,7 +338,7 @@ pub(super) fn parse_array_literal(
 }
 
 fn try_parse_struct_expr(p: &mut Parser) -> BqResult<Option<Expr>> {
-    let explicit_type = if matches!(p.peek_n(1).kind, TokenKind::Lt) {
+    let explicit_type = if matches!(p.peek_n(1).kind, TokenKind::Lt | TokenKind::Neq) {
         let ty = parse_data_type(p)?;
         Some(ty)
     } else if matches!(p.peek_n(1).kind, TokenKind::LParen) {
@@ -425,4 +426,26 @@ fn parse_safe_call(p: &mut Parser) -> BqResult<Expr> {
         parts.push(p.parse_ident()?);
     }
     parse_function_call(p, ObjectName::new(parts), true)
+}
+
+fn parse_with_expr(p: &mut Parser) -> BqResult<Expr> {
+    p.advance();
+    p.expect(&TokenKind::LParen, "'('")?;
+    let mut bindings = Vec::new();
+    loop {
+        if matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("AS")) {
+            let name = p.parse_ident()?;
+            p.expect_kw("AS")?;
+            let val = parse_expr(p)?;
+            bindings.push((name, val));
+            p.expect(&TokenKind::Comma, "','")?;
+        } else {
+            let body = parse_expr(p)?;
+            p.expect(&TokenKind::RParen, "')'")?;
+            return Ok(Expr::WithExpr {
+                bindings,
+                body: Box::new(body),
+            });
+        }
+    }
 }

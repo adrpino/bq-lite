@@ -1,13 +1,13 @@
 use crate::ast::{
-    Cte, Expr, GroupByClause, GroupByItem, Ident, NamedWindowDef, Query, ReplaceItem, Select,
-    SelectAsKind, SelectItem, SetCorrespondence, SetExpr, SetOpKind, SetQuantifier, WithClause,
+    Cte, CteDepthSpec, Expr, GroupByClause, GroupByItem, Ident, NamedWindowDef, Query, ReplaceItem,
+    Select, SelectAsKind, SelectItem, SetExpr, WithClause,
 };
 use crate::error::{BqError, BqResult};
 
 use super::cursor::Parser;
 use super::expr::parse_expr;
 use super::expr_postfix::{parse_order_by_expr, parse_window_spec};
-use super::pipe::parse_pipe_op;
+use super::pipe::{parse_pipe_op, try_parse_set_op_head};
 use super::query_from::parse_from_list;
 use super::token::TokenKind;
 
@@ -63,24 +63,45 @@ pub(super) fn parse_cte(p: &mut Parser) -> BqResult<Cte> {
     p.expect(&TokenKind::LParen, "'('")?;
     let query = Box::new(parse_query(p)?);
     p.expect(&TokenKind::RParen, "')'")?;
+    let depth_spec = if p.is_kw("WITH")
+        && matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("DEPTH"))
+    {
+        p.advance();
+        p.advance();
+        let alias = if p.eat_kw("AS") {
+            Some(p.parse_ident()?)
+        } else {
+            None
+        };
+        let (min_depth, max_depth) = if p.eat_kw("BETWEEN") {
+            let lo = super::expr_primary::parse_primary(p)?;
+            p.expect_kw("AND")?;
+            let hi = super::expr_primary::parse_primary(p)?;
+            (Some(Box::new(lo)), Some(Box::new(hi)))
+        } else {
+            (None, None)
+        };
+        Some(CteDepthSpec {
+            alias,
+            min_depth,
+            max_depth,
+        })
+    } else {
+        None
+    };
     Ok(Cte {
         name,
         columns,
         query,
+        depth_spec,
     })
 }
 
 fn parse_set_expr(p: &mut Parser) -> BqResult<SetExpr> {
     let mut left = parse_set_term(p)?;
-    while p.is_kw("UNION") || p.is_kw("EXCEPT") {
-        let op = if p.eat_kw("UNION") {
-            SetOpKind::Union
-        } else {
-            p.expect_kw("EXCEPT")?;
-            SetOpKind::Except
-        };
-        let quantifier = parse_set_quantifier(p)?;
-        let correspondence = parse_optional_correspondence(p)?;
+    while let Some((op, quantifier, correspondence)) =
+        try_parse_set_op_head(p, &["UNION", "EXCEPT"])?
+    {
         let right = parse_set_term(p)?;
         left = SetExpr::SetOperation {
             op,
@@ -95,12 +116,10 @@ fn parse_set_expr(p: &mut Parser) -> BqResult<SetExpr> {
 
 fn parse_set_term(p: &mut Parser) -> BqResult<SetExpr> {
     let mut left = parse_set_factor(p)?;
-    while p.eat_kw("INTERSECT") {
-        let quantifier = parse_set_quantifier(p)?;
-        let correspondence = parse_optional_correspondence(p)?;
+    while let Some((op, quantifier, correspondence)) = try_parse_set_op_head(p, &["INTERSECT"])? {
         let right = parse_set_factor(p)?;
         left = SetExpr::SetOperation {
-            op: SetOpKind::Intersect,
+            op,
             quantifier,
             correspondence,
             left: Box::new(left),
@@ -108,36 +127,6 @@ fn parse_set_term(p: &mut Parser) -> BqResult<SetExpr> {
         };
     }
     Ok(left)
-}
-
-pub(super) fn parse_set_quantifier(p: &mut Parser) -> BqResult<SetQuantifier> {
-    if p.eat_kw("ALL") {
-        Ok(SetQuantifier::All)
-    } else if p.eat_kw("DISTINCT") {
-        Ok(SetQuantifier::Distinct)
-    } else {
-        Err(BqError::syntax(
-            "Expected ALL or DISTINCT after set operator in GoogleSQL",
-            p.current_span(),
-        ))
-    }
-}
-
-pub(super) fn parse_optional_correspondence(p: &mut Parser) -> BqResult<SetCorrespondence> {
-    if p.eat_kw("BY") {
-        p.expect_kw("NAME")?;
-        Ok(SetCorrespondence::ByName)
-    } else if p.eat_kw("CORRESPONDING") {
-        Ok(SetCorrespondence::Corresponding)
-    } else if p.is_kw("STRICT")
-        && matches!(&p.peek_n(1).kind, TokenKind::Ident(w) if w.eq_ignore_ascii_case("CORRESPONDING"))
-    {
-        p.advance();
-        p.advance();
-        Ok(SetCorrespondence::ByName)
-    } else {
-        Ok(SetCorrespondence::Positional)
-    }
 }
 
 fn parse_set_factor(p: &mut Parser) -> BqResult<SetExpr> {

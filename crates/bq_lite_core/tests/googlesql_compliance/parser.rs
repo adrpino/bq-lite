@@ -4,6 +4,7 @@ pub(super) struct TestSection {
     pub is_prepare_db: bool,
     pub required_features: Vec<String>,
     pub default_time_zone: Option<String>,
+    pub primary_key_mode: Option<String>,
     pub has_parameters: bool,
     pub sql: String,
     pub expected: Expected,
@@ -99,7 +100,9 @@ fn process_section(
             exp_lines.push(line);
         } else {
             seen_sql = true;
-            sql_lines.push(line);
+            // GoogleSQL .test files escape leading `--` SQL comments as `\--`.
+            let unescaped = line.strip_prefix("\\--").map_or(line, |_| &line[1..]);
+            sql_lines.push(unescaped);
         }
     }
 
@@ -115,6 +118,7 @@ fn process_section(
         is_prepare_db: meta.is_prepare_db,
         required_features: meta.required_features,
         default_time_zone: meta.default_time_zone,
+        primary_key_mode: meta.primary_key_mode,
         has_parameters: meta.has_parameters,
         sql,
         expected,
@@ -126,6 +130,7 @@ struct SectionMeta {
     is_prepare_db: bool,
     required_features: Vec<String>,
     default_time_zone: Option<String>,
+    primary_key_mode: Option<String>,
     has_parameters: bool,
 }
 
@@ -136,6 +141,7 @@ impl SectionMeta {
             is_prepare_db: false,
             required_features: default_feats.to_vec(),
             default_time_zone: default_tz.map(str::to_owned),
+            primary_key_mode: None,
             has_parameters: false,
         }
     }
@@ -176,6 +182,10 @@ fn handle_directive(
     }
     if let Some(rest) = inner.strip_prefix("default_time_zone=") {
         meta.default_time_zone = Some(rest.trim().to_owned());
+        return true;
+    }
+    if let Some(rest) = inner.strip_prefix("primary_key_mode=") {
+        meta.primary_key_mode = Some(rest.trim().to_owned());
         return true;
     }
     if inner.starts_with("parameters=") || inner.starts_with("default parameters=") {
