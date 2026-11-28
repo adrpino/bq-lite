@@ -11,6 +11,7 @@ mod from_unnest;
 mod governance;
 mod joins;
 mod joins_hash;
+mod joins_using;
 mod pipe;
 mod pipe_ops;
 mod pivot;
@@ -64,6 +65,8 @@ pub(super) fn execute_query(query: &Query, ctx: &ExecContext<'_>) -> BqResult<Qu
         outer_rows: ctx.outer_rows.clone(),
         now: ctx.now,
         governance: ctx.governance.clone(),
+        impure: ctx.impure,
+        subquery_cache: std::cell::RefCell::default(),
     };
     if let Some(ref with) = query.with {
         eval_with_clause(with, Some(query), &mut local_ctx)?;

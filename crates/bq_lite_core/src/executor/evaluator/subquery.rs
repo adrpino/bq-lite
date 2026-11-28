@@ -1,11 +1,11 @@
 use chrono::{Datelike, Timelike};
 
-use crate::ast::{ArrayAccessKind, Expr, InTarget, Query};
+use crate::ast::{ArrayAccessKind, Expr, InTarget};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext};
-use crate::executor::query::execute_query;
 use crate::types::BqValue;
 
+use super::subquery_cache::eval_in_subquery;
 use super::{eval_expr, ops};
 
 #[expect(
@@ -20,6 +20,9 @@ pub(super) fn eval_in_expr(
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let lhs = eval_expr(expr, row, ctx)?;
+    if let InTarget::Subquery(q) = target {
+        return eval_in_subquery(&lhs, negated, q, row, ctx);
+    }
     let lhs_temporal = match &lhs {
         BqValue::Date(_) => Some(crate::types::BqType::Date),
         BqValue::Datetime(_) => Some(crate::types::BqType::Datetime),
@@ -50,47 +53,7 @@ pub(super) fn eval_in_expr(
                 )))
             }
         },
-        InTarget::Subquery(q) => {
-            let sub_ctx = ctx.with_outer(row);
-            let res = execute_query(q, &sub_ctx)?;
-            if let BqValue::Struct(ref fields) = lhs {
-                if res.columns.len() == fields.len() && res.columns.len() > 1 {
-                    res.rows
-                        .into_iter()
-                        .map(|r| {
-                            BqValue::Struct(
-                                r.into_iter()
-                                    .zip(res.columns.iter())
-                                    .map(|(v, c)| crate::types::BqStructFieldValue {
-                                        name: Some(c.name.clone()),
-                                        value: v,
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect()
-                } else if res.columns.len() == 1 {
-                    res.rows
-                        .into_iter()
-                        .filter_map(|r| r.into_iter().next())
-                        .collect()
-                } else {
-                    return Err(BqError::query(format!(
-                        "IN subquery column count mismatch: expected {}, got {}",
-                        fields.len(),
-                        res.columns.len()
-                    )));
-                }
-            } else {
-                if res.columns.len() != 1 {
-                    return Err(BqError::query("IN subquery must return exactly 1 column"));
-                }
-                res.rows
-                    .into_iter()
-                    .filter_map(|r| r.into_iter().next())
-                    .collect()
-            }
-        }
+        InTarget::Subquery(_) => Vec::new(),
     };
     eval_in_values(&lhs, negated, &candidates)
 }
@@ -327,51 +290,6 @@ fn extract_datetime_part(
             }
         ))),
     }
-}
-
-pub(super) fn eval_scalar_subquery(
-    q: &Query,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let sub_ctx = ctx.with_outer(row);
-    let res = execute_query(q, &sub_ctx)?;
-    if res.columns.len() != 1 {
-        return Err(BqError::query(
-            "Scalar subquery must produce exactly 1 column",
-        ));
-    }
-    if res.rows.len() > 1 {
-        return Err(BqError::semantic(
-            "Scalar subquery produced more than one element",
-        ));
-    }
-    Ok(res
-        .rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.into_iter().next())
-        .unwrap_or(BqValue::Null))
-}
-
-pub(super) fn eval_array_subquery(
-    q: &Query,
-    row: &EvalRow,
-    ctx: &ExecContext<'_>,
-) -> BqResult<BqValue> {
-    let sub_ctx = ctx.with_outer(row);
-    let res = execute_query(q, &sub_ctx)?;
-    if res.columns.len() != 1 {
-        return Err(BqError::query(
-            "ARRAY(SELECT ...) subquery must produce exactly 1 column",
-        ));
-    }
-    let items = res
-        .rows
-        .into_iter()
-        .map(|r| r.into_iter().next().unwrap_or(BqValue::Null))
-        .collect();
-    Ok(BqValue::Array(items))
 }
 
 pub(super) fn eval_with_expr(

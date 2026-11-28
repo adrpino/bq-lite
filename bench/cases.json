@@ -1,0 +1,247 @@
+[
+  {
+    "name": "select_literal",
+    "category": "overhead",
+    "heavy": false,
+    "setup": [],
+    "query": "SELECT 1 AS a, 'hello' AS b, 3.14 AS c",
+    "warmup": 3,
+    "iterations": 20
+  },
+  {
+    "name": "create_view_100k",
+    "category": "ddl",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k, CAST(id AS FLOAT64) / 7 AS v FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "pre_iter_drop": "DROP VIEW IF EXISTS {{ds}}.v",
+    "query": "CREATE OR REPLACE VIEW {{ds}}.v AS SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.t GROUP BY k",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "view_agg_100k",
+    "category": "ddl",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k, CAST(id AS FLOAT64) / 7 AS v FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id",
+      "CREATE VIEW {{ds}}.v AS SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.t GROUP BY k"
+    ],
+    "query": "SELECT k, cnt, total FROM {{ds}}.v ORDER BY k",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "ctas_agg_100k",
+    "category": "ddl",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k, CAST(id AS FLOAT64) / 7 AS v FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "pre_iter_drop": "DROP TABLE IF EXISTS {{ds}}.out_t",
+    "query": "CREATE OR REPLACE TABLE {{ds}}.out_t AS SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.t GROUP BY k",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "scan_100k",
+    "category": "scan",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT COUNT(*) AS cnt, SUM(id) AS total FROM {{ds}}.t",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "filter_100k",
+    "category": "scan",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 1000) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT id, k FROM {{ds}}.t WHERE k = 42 AND id > 50000 ORDER BY id LIMIT 10",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "case_when_100k",
+    "category": "expr",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT CASE WHEN k < 10 THEN 'a' WHEN k < 25 THEN 'b' WHEN k < 50 THEN 'c' WHEN k < 75 THEN 'd' ELSE 'e' END AS bucket, COUNT(*) AS cnt FROM {{ds}}.t GROUP BY bucket ORDER BY bucket",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "string_funcs_50k",
+    "category": "expr",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, CONCAT('user_', CAST(id AS STRING), '@example.com') AS email FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id"
+    ],
+    "query": "SELECT COUNT(*) AS cnt FROM {{ds}}.t WHERE LENGTH(UPPER(SUBSTR(email, 1, 10))) = 10",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "regex_50k",
+    "category": "expr",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, CONCAT('user_', CAST(id AS STRING), '@corp-', CAST(MOD(id, 50) AS STRING), '.example.com') AS email FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id"
+    ],
+    "query": "SELECT COUNT(*) AS cnt FROM {{ds}}.t WHERE REGEXP_CONTAINS(email, r'corp-[12][0-9]\\.example\\.com$')",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "json_extract_25k",
+    "category": "expr",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, CONCAT('{\"user\":{\"id\":', CAST(id AS STRING), ',\"tier\":', CAST(MOD(id, 4) AS STRING), '},\"amt\":', CAST(MOD(id * 17, 500) AS STRING), '}') AS payload FROM UNNEST(GENERATE_ARRAY(1, 25000)) AS id"
+    ],
+    "query": "SELECT COUNT(*) AS cnt, SUM(CAST(JSON_VALUE(payload, '$.amt') AS INT64)) AS total FROM {{ds}}.t WHERE JSON_VALUE(payload, '$.user.tier') = '1'",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "date_funcs_50k",
+    "category": "expr",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, DATE_ADD(DATE '2020-01-01', INTERVAL MOD(id, 365) DAY) AS d FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id"
+    ],
+    "query": "SELECT EXTRACT(MONTH FROM d) AS m, COUNT(*) AS cnt FROM {{ds}}.t GROUP BY m ORDER BY m",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "unnest_array_50k",
+    "category": "array",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, [MOD(id, 10), MOD(id + 1, 10), MOD(id + 2, 10)] AS arr FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id"
+    ],
+    "query": "SELECT COUNT(*) AS cnt, SUM(x) AS total FROM {{ds}}.t, UNNEST(arr) AS x WHERE x >= 5",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "agg_group_by_100k",
+    "category": "agg",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k, CAST(id AS FLOAT64) / 7 AS v FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.t GROUP BY k ORDER BY k",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "multi_agg_100k",
+    "category": "agg",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 50) AS k, MOD(id * 17, 1000) AS a, CAST(id AS FLOAT64) / 3 AS b FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT k, COUNT(*) AS cnt, SUM(a) AS sa, AVG(b) AS ab, MIN(a) AS mna, MAX(a) AS mxa FROM {{ds}}.t GROUP BY k ORDER BY k",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "distinct_count_100k",
+    "category": "agg",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 5000) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT COUNT(DISTINCT k) AS uniq FROM {{ds}}.t",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "join_hash_100k",
+    "category": "join",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.a AS SELECT id, MOD(id, 1000) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id",
+      "CREATE TABLE {{ds}}.b AS SELECT k, k * 2 AS v FROM UNNEST(GENERATE_ARRAY(0, 999)) AS k"
+    ],
+    "query": "SELECT COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.a JOIN {{ds}}.b USING (k)",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "subquery_in_50k",
+    "category": "subquery",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.a AS SELECT id, MOD(id, 1000) AS k FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id",
+      "CREATE TABLE {{ds}}.b AS SELECT k FROM UNNEST(GENERATE_ARRAY(0, 199)) AS k"
+    ],
+    "query": "SELECT COUNT(*) AS cnt FROM {{ds}}.a WHERE k IN (SELECT k FROM {{ds}}.b)",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "order_by_100k",
+    "category": "sort",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 10000) AS k FROM UNNEST(GENERATE_ARRAY(1, 100000)) AS id"
+    ],
+    "query": "SELECT id, k FROM {{ds}}.t ORDER BY k, id LIMIT 1000",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "window_row_number_50k",
+    "category": "window",
+    "heavy": false,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k FROM UNNEST(GENERATE_ARRAY(1, 50000)) AS id"
+    ],
+    "query": "SELECT k, rn FROM (SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM {{ds}}.t) WHERE rn <= 3 ORDER BY k, rn LIMIT 500",
+    "warmup": 2,
+    "iterations": 10
+  },
+  {
+    "name": "agg_group_by_1m",
+    "category": "heavy",
+    "heavy": true,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k, CAST(id AS FLOAT64) / 7 AS v FROM UNNEST(GENERATE_ARRAY(1, 1000000)) AS id"
+    ],
+    "query": "SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM {{ds}}.t GROUP BY k ORDER BY k",
+    "warmup": 1,
+    "iterations": 3
+  },
+  {
+    "name": "order_by_1m",
+    "category": "heavy",
+    "heavy": true,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 10000) AS k FROM UNNEST(GENERATE_ARRAY(1, 1000000)) AS id"
+    ],
+    "query": "SELECT id, k FROM {{ds}}.t ORDER BY k, id LIMIT 1000",
+    "warmup": 1,
+    "iterations": 3
+  },
+  {
+    "name": "window_partition_1m",
+    "category": "heavy",
+    "heavy": true,
+    "setup": [
+      "CREATE TABLE {{ds}}.t AS SELECT id, MOD(id, 100) AS k FROM UNNEST(GENERATE_ARRAY(1, 1000000)) AS id"
+    ],
+    "query": "SELECT k, rn FROM (SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) AS rn FROM {{ds}}.t) WHERE rn <= 5 ORDER BY k, rn LIMIT 500",
+    "warmup": 1,
+    "iterations": 3
+  }
+]

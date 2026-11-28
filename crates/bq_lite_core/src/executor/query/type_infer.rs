@@ -27,12 +27,17 @@ pub(in crate::executor) fn infer_expr_type(
             })
             .or_else(|| {
                 ctx.outer_rows.iter().rev().find_map(|outer| {
-                    outer
+                    let found = outer
+                        .row
                         .resolve_ident(&id.value)
                         .ok()
                         .flatten()
                         .map(|b| b.ty.clone())
-                        .or_else(|| outer.resolve_range_var_type(&id.value))
+                        .or_else(|| outer.row.resolve_range_var_type(&id.value));
+                    if found.is_some() {
+                        outer.mark_touched();
+                    }
+                    found
                 })
             })
             .unwrap_or(BqType::UntypedNull),

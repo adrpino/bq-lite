@@ -57,6 +57,8 @@ impl ScriptState {
             outer_rows: Vec::new(),
             now: Utc::now(),
             governance: self.governance.clone(),
+            impure: None,
+            subquery_cache: std::cell::RefCell::default(),
         }
     }
 }

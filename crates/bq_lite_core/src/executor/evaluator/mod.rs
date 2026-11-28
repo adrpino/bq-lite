@@ -4,11 +4,11 @@ mod lambda;
 mod literals;
 mod ops;
 mod subquery;
+mod subquery_cache;
 
 use crate::ast::{Expr, Ident, UnaryOp};
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{EvalRow, ExecContext, RowRef};
-use crate::executor::query::execute_query;
 use crate::types::coercion::cast_value;
 use crate::types::BqValue;
 
@@ -20,9 +20,10 @@ pub(super) use ops::{
     values_distinct_eq, values_equal,
 };
 pub(in crate::executor) use subquery::coerce_to_expr_supertype;
-use subquery::{
-    eval_array_subquery, eval_case_expr, eval_extract, eval_in_expr, eval_scalar_subquery,
-    eval_subscript, eval_with_expr,
+use subquery::{eval_case_expr, eval_extract, eval_in_expr, eval_subscript, eval_with_expr};
+pub(in crate::executor) use subquery_cache::SubqueryCache;
+use subquery_cache::{
+    eval_array_subquery_cached, eval_exists_subquery, eval_scalar_subquery_cached,
 };
 
 pub(super) fn eval_subscript_values(
@@ -151,13 +152,9 @@ pub(super) fn eval_expr_ref(
             row.as_eval_row().as_ref(),
             ctx,
         ),
-        Expr::Exists(q) => {
-            let owned = row.as_eval_row();
-            let res = execute_query(q, &ctx.with_outer(owned.as_ref()))?;
-            Ok(BqValue::Bool(!res.rows.is_empty()))
-        }
-        Expr::Subquery(q) => eval_scalar_subquery(q, row.as_eval_row().as_ref(), ctx),
-        Expr::ArraySubquery(q) => eval_array_subquery(q, row.as_eval_row().as_ref(), ctx),
+        Expr::Exists(q) => eval_exists_subquery(q, row.as_eval_row().as_ref(), ctx),
+        Expr::Subquery(q) => eval_scalar_subquery_cached(q, row.as_eval_row().as_ref(), ctx),
+        Expr::ArraySubquery(q) => eval_array_subquery_cached(q, row.as_eval_row().as_ref(), ctx),
         Expr::Interval {
             value,
             unit,
@@ -302,10 +299,19 @@ fn resolve_single_ident(name: &str, row: RowRef<'_>, ctx: &ExecContext<'_>) -> B
         return Ok(const_val.clone());
     }
     for outer in ctx.outer_rows.iter().rev() {
-        if let Some(binding) = outer.resolve_ident(name)? {
-            return Ok(binding.value.clone());
+        match outer.row.resolve_ident(name) {
+            Ok(Some(binding)) => {
+                outer.mark_touched();
+                return Ok(binding.value.clone());
+            }
+            Err(err) => {
+                outer.mark_touched();
+                return Err(err);
+            }
+            Ok(None) => {}
         }
-        if let Some(struct_val) = outer.resolve_range_var_struct(name) {
+        if let Some(struct_val) = outer.row.resolve_range_var_struct(name) {
+            outer.mark_touched();
             return Ok(struct_val);
         }
     }
@@ -333,10 +339,16 @@ fn resolve_compound_ident(
             return Ok(val);
         }
         for outer in ctx.outer_rows.iter().rev() {
-            if let Some(val) =
-                resolve_qualified_from_row(first, second, tail, RowRef::Single(outer))?
-            {
-                return Ok(val);
+            match resolve_qualified_from_row(first, second, tail, RowRef::Single(outer.row)) {
+                Ok(Some(val)) => {
+                    outer.mark_touched();
+                    return Ok(val);
+                }
+                Err(err) => {
+                    outer.mark_touched();
+                    return Err(err);
+                }
+                Ok(None) => {}
             }
         }
     }

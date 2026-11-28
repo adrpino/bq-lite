@@ -333,6 +333,7 @@ fn eval_user_scalar_udf(
             }
         }
         crate::ast::FunctionBody::Code(js_code) => {
+            ctx.mark_impure();
             eval_js_udf_dispatch(&fn_name, &cf.params, args, js_code, cf.returns.as_ref())
         }
         crate::ast::FunctionBody::Query(_) => Err(BqError::query(format!(

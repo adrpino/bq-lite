@@ -133,3 +133,41 @@ fn non_quadratic_window_groupby_distinct_and_cte_correlated_guard() {
         .unwrap();
     assert!(rqr.rows.len() > 1_000);
 }
+
+#[test]
+fn uncorrelated_in_subquery_and_using_hash_join_guard() {
+    let mut eng = Engine::new();
+    seed_bench_table(&mut eng, "t_gb", 4_000, 1_000);
+    seed_bench_table(&mut eng, "t_cte", 2_000, 10);
+
+    // Uncorrelated IN (SELECT ...) must hoist & hash-index once (O(N + M), not O(N * M))
+    let t0 = Instant::now();
+    let in_qr = eng
+        .query(
+            "SELECT COUNT(*) FROM perf.t_gb
+             WHERE grp IN (SELECT grp FROM perf.t_cte WHERE grp < 5)",
+        )
+        .unwrap();
+    assert_eq!(in_qr.rows[0][0], BqValue::Int64(20));
+    assert!(
+        t0.elapsed().as_secs() < 5,
+        "uncorrelated IN subquery regression: took {:?}",
+        t0.elapsed()
+    );
+
+    // JOIN ... USING must share RowSchema across matched rows
+    let t1 = Instant::now();
+    let jqr = eng
+        .query(
+            "SELECT COUNT(*), SUM(b.val)
+             FROM perf.t_gb a
+             JOIN (SELECT DISTINCT grp, grp * 2 AS val FROM perf.t_gb) b USING (grp)",
+        )
+        .unwrap();
+    assert_eq!(jqr.rows[0][0], BqValue::Int64(4_000));
+    assert!(
+        t1.elapsed().as_secs() < 5,
+        "USING hash join regression: took {:?}",
+        t1.elapsed()
+    );
+}

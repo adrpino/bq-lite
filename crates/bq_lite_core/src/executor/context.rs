@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -7,9 +8,26 @@ use crate::catalog::{Catalog, JobInfoProvider};
 use crate::storage::StorageEngine;
 use crate::types::BqValue;
 
+use super::evaluator::SubqueryCache;
 use super::result::QueryResult;
 
-pub(super) use super::row::{ColMeta, EvalRow, RowBinding, RowRef, RowSchema};
+pub(super) use super::row::{ColMeta, ColSlot, EvalRow, RowBinding, RowRef, RowSchema};
+
+/// Borrowed outer row entry with optional access tracking for uncorrelated subquery caching.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OuterRow<'a> {
+    pub row: &'a EvalRow,
+    pub touched: Option<&'a Cell<bool>>,
+}
+
+impl OuterRow<'_> {
+    #[inline]
+    pub(super) fn mark_touched(&self) {
+        if let Some(flag) = self.touched {
+            flag.set(true);
+        }
+    }
+}
 
 /// Borrowed script variables and query parameters passed into DDL/DML execution.
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,9 +69,11 @@ pub(super) struct ExecContext<'a> {
     pub positional_params: Vec<BqValue>,
     pub vars: BTreeMap<String, BqValue>,
     pub sys_vars: BTreeMap<String, BqValue>,
-    pub outer_rows: Vec<&'a EvalRow>,
+    pub outer_rows: Vec<OuterRow<'a>>,
     pub now: DateTime<Utc>,
     pub governance: GovernanceConfig,
+    pub impure: Option<&'a Cell<bool>>,
+    pub subquery_cache: RefCell<SubqueryCache>,
 }
 
 impl<'a> ExecContext<'a> {
@@ -70,6 +90,15 @@ impl<'a> ExecContext<'a> {
             outer_rows: Vec::new(),
             now: Utc::now(),
             governance: GovernanceConfig::default(),
+            impure: None,
+            subquery_cache: RefCell::new(SubqueryCache::default()),
+        }
+    }
+
+    #[inline]
+    pub(super) fn mark_impure(&self) {
+        if let Some(flag) = self.impure {
+            flag.set(true);
         }
     }
 
@@ -103,7 +132,10 @@ impl<'a> ExecContext<'a> {
     #[must_use]
     pub(super) fn with_outer<'b>(&'b self, outer: &'b EvalRow) -> ExecContext<'b> {
         let mut outer_rows = self.outer_rows.clone();
-        outer_rows.push(outer);
+        outer_rows.push(OuterRow {
+            row: outer,
+            touched: None,
+        });
         ExecContext {
             catalog: self.catalog,
             storage: self.storage,
@@ -115,6 +147,36 @@ impl<'a> ExecContext<'a> {
             outer_rows,
             now: self.now,
             governance: self.governance.clone(),
+            impure: self.impure,
+            subquery_cache: RefCell::new(SubqueryCache::default()),
+        }
+    }
+
+    #[must_use]
+    pub(super) fn with_outer_tracked<'b>(
+        &'b self,
+        outer: &'b EvalRow,
+        touched: &'b Cell<bool>,
+        impure: &'b Cell<bool>,
+    ) -> ExecContext<'b> {
+        let mut outer_rows = self.outer_rows.clone();
+        outer_rows.push(OuterRow {
+            row: outer,
+            touched: Some(touched),
+        });
+        ExecContext {
+            catalog: self.catalog,
+            storage: self.storage,
+            ctes: self.ctes.clone(),
+            params: self.params.clone(),
+            positional_params: self.positional_params.clone(),
+            vars: self.vars.clone(),
+            sys_vars: self.sys_vars.clone(),
+            outer_rows,
+            now: self.now,
+            governance: self.governance.clone(),
+            impure: Some(impure),
+            subquery_cache: RefCell::new(SubqueryCache::default()),
         }
     }
 }

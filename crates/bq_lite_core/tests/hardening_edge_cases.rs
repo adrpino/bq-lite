@@ -139,3 +139,187 @@ fn hash_join_handles_outer_null_cross_type_and_residual_predicates() {
         .unwrap();
     assert_eq!(date_join.rows[0][0], BqValue::Int64(200));
 }
+
+#[test]
+fn using_hash_join_coalesce_precision_and_error_parity() {
+    let mut eng = Engine::new();
+    eng.exec_script(
+        "CREATE SCHEMA ujh;
+         CREATE TABLE ujh.l AS
+           SELECT x AS id, x * 10 AS score FROM UNNEST(GENERATE_ARRAY(1, 50)) AS x;
+         CREATE TABLE ujh.r AS
+           SELECT x AS id, x * 5 AS min_score FROM UNNEST(GENERATE_ARRAY(25, 75)) AS x;",
+    )
+    .unwrap();
+
+    // USING hash join preserves pre-coalesce qualified cols and coalesces outer USING key
+    let using_star = eng
+        .query(
+            "SELECT id, a.id AS lid, b.id AS rid, a.score, b.min_score
+             FROM ujh.l a FULL JOIN ujh.r b USING (id)
+             WHERE id IN (2, 30, 70)
+             ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        using_star.rows,
+        vec![
+            vec![
+                BqValue::Int64(2),
+                BqValue::Int64(2),
+                BqValue::Null,
+                BqValue::Int64(20),
+                BqValue::Null,
+            ],
+            vec![
+                BqValue::Int64(30),
+                BqValue::Int64(30),
+                BqValue::Int64(30),
+                BqValue::Int64(300),
+                BqValue::Int64(150),
+            ],
+            vec![
+                BqValue::Int64(70),
+                BqValue::Null,
+                BqValue::Int64(70),
+                BqValue::Null,
+                BqValue::Int64(350),
+            ],
+        ]
+    );
+
+    // Large INT64 keys (> 2^53) that collide in IEEE-754 f64 hash buckets must stay distinct
+    let big_int_join = eng
+        .query(
+            "WITH a AS (SELECT 9007199254740992 + MOD(x, 3) AS k FROM UNNEST(GENERATE_ARRAY(1, 30)) AS x),
+                  b AS (SELECT 9007199254740993 AS k FROM UNNEST(GENERATE_ARRAY(1, 5)) AS y)
+             SELECT COUNT(*) FROM a JOIN b USING (k)",
+        )
+        .unwrap();
+    assert_eq!(big_int_join.rows[0][0], BqValue::Int64(50));
+
+    let err = eng
+        .query("SELECT * FROM ujh.l JOIN ujh.r USING (no_such_col)")
+        .unwrap_err();
+    assert!(err.message.contains("USING column"), "got: {}", err.message);
+}
+
+fn seed_subquery_schema(eng: &mut Engine) {
+    assert!(eng
+        .exec_script(
+            "CREATE SCHEMA sq;
+             CREATE TABLE sq.a AS
+               SELECT id, MOD(id, 20) AS k, CONCAT('s', CAST(MOD(id, 10) AS STRING)) AS s
+               FROM UNNEST(GENERATE_ARRAY(1, 100)) AS id
+               UNION ALL SELECT 101, NULL, NULL;
+             CREATE TABLE sq.b AS
+               SELECT k, CONCAT('s', CAST(k AS STRING)) AS s FROM UNNEST(GENERATE_ARRAY(0, 4)) AS k;",
+        )
+        .is_ok());
+}
+
+#[test]
+fn subquery_in_cache_preserves_null_cross_type_and_error_semantics() {
+    let mut eng = Engine::new();
+    seed_subquery_schema(&mut eng);
+
+    let cases = [
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE k IN (SELECT k FROM sq.b)",
+            25_i64,
+        ),
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE s IN (SELECT s FROM sq.b)",
+            50,
+        ),
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE k NOT IN (SELECT k FROM sq.b)",
+            75,
+        ),
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE k NOT IN (SELECT k FROM sq.b UNION ALL SELECT NULL)",
+            0,
+        ),
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE k IN (SELECT k FROM sq.b UNION ALL SELECT NULL)",
+            25,
+        ),
+        (
+            "SELECT COUNT(*) FROM sq.a WHERE k NOT IN (SELECT k FROM sq.b WHERE k < 0)",
+            101,
+        ),
+    ];
+    for (sql, expected) in cases {
+        let qr = eng.query(sql).unwrap();
+        assert_eq!(qr.rows[0][0], BqValue::Int64(expected), "failed for: {sql}");
+    }
+
+    let nan_in = eng
+        .query(
+            "SELECT
+               CAST('NaN' AS FLOAT64) IN (SELECT CAST('NaN' AS FLOAT64)) AS nan_eq,
+               1.0 IN (SELECT k FROM sq.b) AS cross_num",
+        )
+        .unwrap();
+    assert_eq!(
+        nan_in.rows[0],
+        vec![BqValue::Bool(false), BqValue::Bool(true)]
+    );
+
+    assert!(eng
+        .query("SELECT COUNT(*) FROM sq.a WHERE s IN (SELECT k FROM sq.b)")
+        .is_err());
+    assert!(eng
+        .query("SELECT COUNT(*) FROM sq.a WHERE k IN (SELECT k, s FROM sq.b)")
+        .is_err());
+}
+
+#[test]
+fn subquery_cache_skips_correlated_and_impure_subqueries() {
+    let mut eng = Engine::new();
+    seed_subquery_schema(&mut eng);
+
+    let corr = eng
+        .query(
+            "SELECT a.id FROM sq.a a
+             WHERE a.id <= 10 AND a.k IN (SELECT b.k FROM sq.b b WHERE b.k = a.id)
+             ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(
+        corr.rows,
+        vec![
+            vec![BqValue::Int64(1)],
+            vec![BqValue::Int64(2)],
+            vec![BqValue::Int64(3)],
+            vec![BqValue::Int64(4)],
+        ]
+    );
+
+    let nested_corr = eng
+        .query(
+            "SELECT a.id FROM sq.a a
+             WHERE a.id <= 6 AND EXISTS (SELECT 1 FROM sq.b b WHERE b.k IN (SELECT a.id))
+             ORDER BY a.id",
+        )
+        .unwrap();
+    assert_eq!(nested_corr.rows, corr.rows);
+
+    let uuids = eng
+        .query(
+            "SELECT COUNT(DISTINCT u) FROM (
+               SELECT (SELECT GENERATE_UUID()) AS u FROM UNNEST(GENERATE_ARRAY(1, 10)) AS x
+             )",
+        )
+        .unwrap();
+    assert_eq!(uuids.rows[0][0], BqValue::Int64(10));
+
+    let rands = eng
+        .query(
+            "SELECT COUNT(DISTINCT r) FROM (
+               SELECT (SELECT RAND()) AS r FROM UNNEST(GENERATE_ARRAY(1, 10)) AS x
+             )",
+        )
+        .unwrap();
+    assert!(matches!(rands.rows[0][0], BqValue::Int64(n) if n > 1));
+}

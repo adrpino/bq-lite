@@ -119,6 +119,9 @@ pub(super) fn eval_scalar_builtin(
     let Some((canon, group)) = lookup_scalar(name) else {
         return Ok(None);
     };
+    if matches!(canon, "RAND" | "GENERATE_UUID") {
+        ctx.mark_impure();
+    }
     match group {
         ScalarGroup::String => string::eval_string_fn(canon, args),
         ScalarGroup::BytesExtra => bytes_fn::eval_bytes_extra_fn(canon, &args),

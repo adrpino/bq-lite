@@ -5,9 +5,9 @@ use crate::error::{BqError, BqResult};
 use crate::types::{BqStructFieldValue, BqType, BqValue, StructField};
 
 use super::result::QueryResult;
-use super::row_schema::{empty_row_schema, ColSlot};
+use super::row_schema::empty_row_schema;
 
-pub(super) use super::row_schema::{BindingRef, ColMeta, RowBinding, RowSchema};
+pub(super) use super::row_schema::{BindingRef, ColMeta, ColSlot, RowBinding, RowSchema};
 
 /// Evaluation row pairing a shared [`RowSchema`] with flat value vectors.
 #[derive(Debug, Clone)]
