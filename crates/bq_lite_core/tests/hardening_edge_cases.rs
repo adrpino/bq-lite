@@ -377,3 +377,69 @@ fn create_view_static_schema_and_case_supertype_parity() {
         vec![BqValue::String("c".to_owned()), BqValue::Float64(2.5)]
     );
 }
+
+#[test]
+fn fused_scan_early_limit_and_order_by_projection_drop_parity() {
+    let mut eng = Engine::new();
+    eng.exec_script(
+        "CREATE SCHEMA flt;
+         CREATE TABLE flt.t AS
+           SELECT id, MOD(id, 10) AS k, CONCAT('item_', CAST(id AS STRING)) AS label
+           FROM UNNEST(GENERATE_ARRAY(1, 500)) AS id;",
+    )
+    .unwrap();
+
+    // Early-stop LIMIT + OFFSET with WHERE on borrowed storage rows
+    let lim = eng
+        .query("SELECT id, label FROM flt.t WHERE k = 3 LIMIT 3 OFFSET 2")
+        .unwrap();
+    assert_eq!(
+        lim.rows,
+        vec![
+            vec![BqValue::Int64(23), BqValue::String("item_23".to_owned())],
+            vec![BqValue::Int64(33), BqValue::String("item_33".to_owned())],
+            vec![BqValue::Int64(43), BqValue::String("item_43".to_owned())],
+        ]
+    );
+
+    // LIMIT 0 returns 0 rows with full schema
+    let lim0 = eng
+        .query("SELECT id, k FROM flt.t WHERE k = 3 LIMIT 0")
+        .unwrap();
+    assert_eq!(lim0.rows.len(), 0);
+    assert_eq!(lim0.columns.len(), 2);
+
+    // ORDER BY projected columns (drops source rows) vs unprojected column (keeps source rows)
+    let ob_proj = eng
+        .query("SELECT id, k FROM flt.t WHERE k = 7 ORDER BY id DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        ob_proj.rows,
+        vec![
+            vec![BqValue::Int64(497), BqValue::Int64(7)],
+            vec![BqValue::Int64(487), BqValue::Int64(7)],
+        ]
+    );
+
+    let ob_unproj = eng
+        .query("SELECT label FROM flt.t WHERE k = 7 ORDER BY id DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        ob_unproj.rows,
+        vec![
+            vec![BqValue::String("item_497".to_owned())],
+            vec![BqValue::String("item_487".to_owned())],
+        ]
+    );
+
+    // Grouped ORDER BY aggregate (must still resolve via grouped bucket, not projected schema)
+    let grp_agg_ob = eng
+        .query(
+            "SELECT k FROM flt.t WHERE id <= 25 GROUP BY k ORDER BY COUNT(k) DESC, k ASC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        grp_agg_ob.rows,
+        vec![vec![BqValue::Int64(1)], vec![BqValue::Int64(2)]]
+    );
+}

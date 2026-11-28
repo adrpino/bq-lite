@@ -7,7 +7,7 @@ use chrono::{DateTime, NaiveDateTime, NaiveTime, Utc};
 
 use crate::ast::Query;
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext, RowSchema};
+use crate::executor::context::{EvalRow, ExecContext, RowRef, RowSchema};
 use crate::executor::query::execute_query;
 use crate::executor::result::QueryResult;
 use crate::types::{BqStructFieldValue, BqValue};
@@ -97,7 +97,7 @@ pub(super) fn eval_in_subquery(
     lhs: &BqValue,
     negated: bool,
     q: &Query,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let key = query_key(q);
@@ -108,7 +108,10 @@ pub(super) fn eval_in_subquery(
                 outer_schema,
                 col_count,
                 index,
-            }) if Arc::ptr_eq(outer_schema, &row.schema) => {
+            }) if row
+                .schema_arc()
+                .is_some_and(|s| Arc::ptr_eq(outer_schema, s)) =>
+            {
                 validate_in_col_count(lhs, *col_count)?;
                 return probe_in_index(lhs, negated, index);
             }
@@ -119,8 +122,10 @@ pub(super) fn eval_in_subquery(
         }
     }
 
+    let owned_row = row.as_eval_row();
+    let row_ref = owned_row.as_ref();
     if is_uncacheable {
-        let sub_ctx = ctx.with_outer(row);
+        let sub_ctx = ctx.with_outer(row_ref);
         let res = execute_query(q, &sub_ctx)?;
         let col_count = res.columns.len();
         validate_in_col_count(lhs, col_count)?;
@@ -128,7 +133,7 @@ pub(super) fn eval_in_subquery(
         return eval_in_values(lhs, negated, &candidates);
     }
 
-    let (res, cacheable) = execute_tracked(q, row, ctx)?;
+    let (res, cacheable) = execute_tracked(q, row_ref, ctx)?;
     let col_count = res.columns.len();
     if cacheable {
         let index = build_in_index(res);
@@ -138,7 +143,7 @@ pub(super) fn eval_in_subquery(
             cache.entries.insert(
                 key,
                 CachedSubquery::In {
-                    outer_schema: Arc::clone(&row.schema),
+                    outer_schema: Arc::clone(&row_ref.schema),
                     col_count,
                     index,
                 },

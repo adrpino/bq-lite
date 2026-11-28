@@ -52,7 +52,7 @@ use schema::infer_select_columns;
 use set_ops::execute_set_op;
 use sort::{
     apply_limit_offset, apply_order_by, apply_order_by_with_source, eval_limit_offset_bounds,
-    merge_proj_and_source,
+    merge_proj_and_source, order_by_resolved_by_projection,
 };
 use window::{apply_windows, execute_grouped_with_windows, select_has_windows};
 
@@ -156,6 +156,26 @@ fn execute_select(select: &Select, ctx: &ExecContext<'_>) -> BqResult<QueryResul
     execute_select_full(select, &[], None, None, ctx)
 }
 
+fn compute_early_scan_limit(
+    select: &Select,
+    order_by: &[OrderByExpr],
+    limit: Option<&Expr>,
+    offset: Option<&Expr>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<usize>> {
+    let eligible = order_by.is_empty()
+        && !select.distinct
+        && select.qualify.is_none()
+        && (limit.is_some() || offset.is_some())
+        && !select_uses_grouping(select)
+        && !select_has_windows(select);
+    if !eligible {
+        return Ok(None);
+    }
+    let (skip, take) = eval_limit_offset_bounds(limit, offset, ctx)?;
+    Ok(take.map(|t| skip.saturating_add(t)))
+}
+
 fn execute_select_full(
     select: &Select,
     order_by: &[OrderByExpr],
@@ -163,10 +183,13 @@ fn execute_select_full(
     offset: Option<&Expr>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<QueryResult> {
+    let has_grouping = select_uses_grouping(select);
+    let has_windows = select_has_windows(select);
+    let scan_limit = compute_early_scan_limit(select, order_by, limit, offset, ctx)?;
     let (mut rows, schema_row, remaining_where) =
-        eval_from_clause_with_filter(&select.from, select.where_clause.as_ref(), ctx)?;
+        eval_from_clause_with_filter(&select.from, select.where_clause.as_ref(), scan_limit, ctx)?;
     if !remaining_where.is_empty() {
-        let mut filtered = Vec::with_capacity(rows.len());
+        let mut filtered = Vec::new();
         for row in rows {
             let mut keep = true;
             for pred in &remaining_where {
@@ -182,25 +205,29 @@ fn execute_select_full(
         rows = filtered;
     }
 
-    let need_src = select.qualify.is_some() || !order_by.is_empty();
-    let (mut projected, mut qualify_src, effective_order) = if select_uses_grouping(select) {
-        if select_has_windows(select) {
+    let (mut projected, mut qualify_src, effective_order) = if has_grouping {
+        if has_windows {
             execute_grouped_with_windows(select, order_by, &rows, &schema_row, ctx)?
         } else {
             execute_grouped_select_with_order(select, order_by, &rows, &schema_row, ctx)?
         }
-    } else if select_has_windows(select) {
+    } else if has_windows {
         let (rewritten, aug_rows) = apply_windows(select, rows, ctx)?;
         let out = project_eval_rows(&rewritten, &aug_rows, ctx)?;
-        let (p, s) = if need_src {
+        let keep_src = rewritten.qualify.is_some()
+            || (!order_by.is_empty() && !order_by_resolved_by_projection(order_by, &out));
+        let (p, s) = if keep_src {
             filter_qualify_with_src(&rewritten, out, aug_rows, ctx)?
         } else {
+            drop(aug_rows);
             (out, Vec::new())
         };
         (p, s, order_by.to_vec())
     } else {
         let out = project_eval_rows(select, &rows, ctx)?;
-        let (p, s) = if need_src {
+        let keep_src = select.qualify.is_some()
+            || (!order_by.is_empty() && !order_by_resolved_by_projection(order_by, &out));
+        let (p, s) = if keep_src {
             filter_qualify_with_src(select, out, rows, ctx)?
         } else {
             drop(rows);

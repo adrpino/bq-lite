@@ -1,16 +1,16 @@
 use crate::ast::{Expr, FunctionCall, StructFieldExpr};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::{EvalRow, ExecContext, RowRef};
 use crate::executor::scalar::{eval_scalar_builtin, is_scalar_registered};
 use crate::types::coercion::{coerce_value, common_supertype};
 use crate::types::{BqStructFieldValue, BqType, BqValue};
 
 use super::lambda::infer_expr_col_name;
-use super::{coerce_to_expr_supertype, eval_expr};
+use super::{coerce_to_expr_supertype, eval_expr, eval_expr_ref};
 
 pub(super) fn eval_function_expr(
     call: &FunctionCall,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     if call.over.is_some() {
@@ -49,25 +49,18 @@ pub(super) fn eval_function_expr(
         .get(1)
         .is_some_and(|a| matches!(a.expr, Expr::Lambda { .. }))
     {
-        return super::lambda::eval_array_lambda_call(upper, call, row, ctx);
+        return super::lambda::eval_array_lambda_call(upper, call, row.as_eval_row().as_ref(), ctx);
     }
-    let short_res = match upper {
-        "IF" => Some(eval_if_short_circuit(call, row, ctx)),
-        "COALESCE" => Some(eval_coalesce_short_circuit(call, row, ctx)),
-        "IFNULL" => Some(eval_ifnull_short_circuit(call, row, ctx)),
-        "NULLIF" => Some(eval_nullif_typed(call, row, ctx)),
-        "RANGE" => Some(eval_range_call_typed(call, row, ctx)),
-        _ => None,
-    };
-    if let Some(res) = short_res {
-        return match res {
-            Ok(val) => Ok(val),
-            Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
-            Err(err) => Err(err),
-        };
+    if matches!(upper, "IF" | "COALESCE" | "IFNULL" | "NULLIF" | "RANGE") {
+        return eval_short_circuit_fn(upper, call, row, ctx);
     }
     if upper == "MAKE_INTERVAL" && call.args.iter().any(|a| a.name.is_some()) {
-        return super::lambda::eval_make_interval_named(fn_name, call, row, ctx);
+        return super::lambda::eval_make_interval_named(
+            fn_name,
+            call,
+            row.as_eval_row().as_ref(),
+            ctx,
+        );
     }
     let mut args = Vec::with_capacity(call.args.len());
     for (idx, arg) in call.args.iter().enumerate() {
@@ -77,7 +70,7 @@ pub(super) fn eval_function_expr(
                 continue;
             }
         }
-        args.push(eval_expr(&arg.expr, row, ctx)?);
+        args.push(eval_expr_ref(&arg.expr, row, ctx)?);
     }
     let res = if is_scalar_registered(upper) {
         eval_scalar_builtin(upper, args, ctx).and_then(|opt| {
@@ -87,6 +80,27 @@ pub(super) fn eval_function_expr(
         })
     } else {
         eval_user_scalar_udf(call, &args, ctx)
+    };
+    match res {
+        Ok(val) => Ok(val),
+        Err(err) if call.safe_prefix && err.is_safe_suppressible() => Ok(BqValue::Null),
+        Err(err) => Err(err),
+    }
+}
+
+fn eval_short_circuit_fn(
+    upper: &str,
+    call: &FunctionCall,
+    row: RowRef<'_>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<BqValue> {
+    let owned = row.as_eval_row();
+    let res = match upper {
+        "IF" => eval_if_short_circuit(call, owned.as_ref(), ctx),
+        "COALESCE" => eval_coalesce_short_circuit(call, owned.as_ref(), ctx),
+        "IFNULL" => eval_ifnull_short_circuit(call, owned.as_ref(), ctx),
+        "NULLIF" => eval_nullif_typed(call, owned.as_ref(), ctx),
+        _ => eval_range_call_typed(call, owned.as_ref(), ctx),
     };
     match res {
         Ok(val) => Ok(val),

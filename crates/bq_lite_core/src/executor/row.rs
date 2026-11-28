@@ -313,20 +313,71 @@ impl EvalRow {
     }
 }
 
-/// Zero-copy borrowed view of either a single row or a pair of joined rows.
+/// Zero-copy borrowed view of a single row, a raw storage slice, or a pair of joined rows.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RowRef<'a> {
     Single(&'a EvalRow),
+    Borrowed {
+        schema: &'a Arc<RowSchema>,
+        values: &'a [BqValue],
+        pseudo_values: &'a [BqValue],
+    },
     Joined {
         left: &'a EvalRow,
         right: &'a EvalRow,
     },
 }
 
+fn slot_to_binding_parts<'a>(
+    schema: &'a RowSchema,
+    values: &'a [BqValue],
+    pseudo_values: &'a [BqValue],
+    slot: ColSlot,
+) -> Option<BindingRef<'a>> {
+    match slot {
+        ColSlot::Col(i) => {
+            let meta = schema.cols.get(i)?;
+            let value = values.get(i)?;
+            Some(BindingRef {
+                qualifier: meta.qualifier.as_ref(),
+                name: &meta.name,
+                ty: &meta.ty,
+                value,
+            })
+        }
+        ColSlot::Pseudo(i) => {
+            let meta = schema.pseudo_cols.get(i)?;
+            let value = pseudo_values.get(i)?;
+            Some(BindingRef {
+                qualifier: meta.qualifier.as_ref(),
+                name: &meta.name,
+                ty: &meta.ty,
+                value,
+            })
+        }
+    }
+}
+
 impl<'a> RowRef<'a> {
+    #[must_use]
+    pub(super) const fn schema_arc(self) -> Option<&'a Arc<RowSchema>> {
+        match self {
+            Self::Single(row) => Some(&row.schema),
+            Self::Borrowed { schema, .. } => Some(schema),
+            Self::Joined { .. } => None,
+        }
+    }
+
     pub(super) fn resolve_ident(self, name: &str) -> BqResult<Option<BindingRef<'a>>> {
         match self {
             Self::Single(row) => row.resolve_ident(name),
+            Self::Borrowed {
+                schema,
+                values,
+                pseudo_values,
+            } => Ok(schema
+                .lookup_ident_slot(name)?
+                .and_then(|slot| slot_to_binding_parts(schema, values, pseudo_values, slot))),
             Self::Joined { left, right } => {
                 let l_slot = left.schema.lookup_ident_slot(name)?;
                 let r_slot = right.schema.lookup_ident_slot(name)?;
@@ -347,6 +398,13 @@ impl<'a> RowRef<'a> {
     pub(super) fn resolve_qualified(self, qualifier: &str, name: &str) -> Option<BindingRef<'a>> {
         match self {
             Self::Single(row) => row.resolve_qualified(qualifier, name),
+            Self::Borrowed {
+                schema,
+                values,
+                pseudo_values,
+            } => schema
+                .lookup_qualified_slot(qualifier, name)
+                .and_then(|slot| slot_to_binding_parts(schema, values, pseudo_values, slot)),
             Self::Joined { left, right } => left
                 .resolve_qualified(qualifier, name)
                 .or_else(|| right.resolve_qualified(qualifier, name)),
@@ -357,6 +415,45 @@ impl<'a> RowRef<'a> {
     pub(super) fn resolve_range_var_struct(self, name: &str) -> Option<BqValue> {
         match self {
             Self::Single(row) => row.resolve_range_var_struct(name),
+            Self::Borrowed {
+                schema,
+                values,
+                pseudo_values,
+            } => {
+                let mut fields: Vec<BqStructFieldValue> = schema
+                    .pseudo_cols
+                    .iter()
+                    .zip(pseudo_values.iter())
+                    .filter(|(c, _)| {
+                        !c.name.starts_with("_PARTITION")
+                            && c.qualifier
+                                .as_deref()
+                                .is_some_and(|q| q.eq_ignore_ascii_case(name))
+                    })
+                    .map(|(c, v)| BqStructFieldValue {
+                        name: Some(c.name.as_ref().to_owned()),
+                        value: v.clone(),
+                    })
+                    .collect();
+                if fields.is_empty() {
+                    fields = schema
+                        .cols
+                        .iter()
+                        .zip(values.iter())
+                        .filter(|(c, _)| {
+                            !c.name.starts_with("__win_")
+                                && c.qualifier
+                                    .as_deref()
+                                    .is_some_and(|q| q.eq_ignore_ascii_case(name))
+                        })
+                        .map(|(c, v)| BqStructFieldValue {
+                            name: Some(c.name.as_ref().to_owned()),
+                            value: v.clone(),
+                        })
+                        .collect();
+                }
+                (!fields.is_empty()).then_some(BqValue::Struct(fields))
+            }
             Self::Joined { left, right } => {
                 let mut cols = left.resolve_range_var_cols(name);
                 cols.extend(right.resolve_range_var_cols(name));
@@ -379,6 +476,15 @@ impl<'a> RowRef<'a> {
     pub(super) fn to_owned_eval_row(self) -> EvalRow {
         match self {
             Self::Single(row) => row.clone(),
+            Self::Borrowed {
+                schema,
+                values,
+                pseudo_values,
+            } => EvalRow::from_schema_with_pseudo(
+                Arc::clone(schema),
+                values.to_vec(),
+                pseudo_values.to_vec(),
+            ),
             Self::Joined { left, right } => {
                 let schema = RowSchema::concat(&left.schema, &right.schema);
                 EvalRow::combine_with_schema(left, right, schema)
@@ -390,7 +496,7 @@ impl<'a> RowRef<'a> {
     pub(super) fn as_eval_row(self) -> Cow<'a, EvalRow> {
         match self {
             Self::Single(row) => Cow::Borrowed(row),
-            Self::Joined { .. } => Cow::Owned(self.to_owned_eval_row()),
+            Self::Borrowed { .. } | Self::Joined { .. } => Cow::Owned(self.to_owned_eval_row()),
         }
     }
 }

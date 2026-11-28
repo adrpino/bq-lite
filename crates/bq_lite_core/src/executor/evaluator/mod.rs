@@ -93,7 +93,7 @@ pub(super) fn eval_expr_ref(
             expr,
             negated,
             target,
-        } => eval_in_expr(expr, *negated, target, row.as_eval_row().as_ref(), ctx),
+        } => eval_in_expr(expr, *negated, target, row, ctx),
         Expr::Cast {
             expr,
             ty,
@@ -116,7 +116,7 @@ pub(super) fn eval_expr_ref(
             row.as_eval_row().as_ref(),
             ctx,
         ),
-        Expr::Function(call) => eval_function_expr(call, row.as_eval_row().as_ref(), ctx),
+        Expr::Function(call) => eval_function_expr(call, row, ctx),
         Expr::ArrayLiteral {
             elem_type,
             elements,

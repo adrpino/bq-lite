@@ -1,10 +1,55 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::ast::{Expr, OrderByExpr};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::{EvalRow, ExecContext, RowSchema};
 use crate::executor::evaluator::{compare_values, eval_expr};
 use crate::types::BqValue;
+
+/// Returns true when every `ORDER BY` expression can be evaluated purely from `projected`
+/// without retaining or merging the pre-projection source rows.
+pub(super) fn order_by_resolved_by_projection(
+    order_by: &[OrderByExpr],
+    projected: &[EvalRow],
+) -> bool {
+    let Some(first) = projected.first() else {
+        return true;
+    };
+    if !projected
+        .iter()
+        .skip(1)
+        .all(|r| Arc::ptr_eq(&r.schema, &first.schema))
+    {
+        return false;
+    }
+    order_by
+        .iter()
+        .all(|ob| expr_resolved_by_schema(&ob.expr, &first.schema))
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Complex expressions conservatively keep source rows for ORDER BY resolution"
+)]
+fn expr_resolved_by_schema(expr: &Expr, schema: &RowSchema) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::PositionalParam(_) | Expr::SystemVar(_) => {
+            true
+        }
+        Expr::Ident(id) => matches!(schema.lookup_ident_slot(&id.value), Ok(Some(_))),
+        Expr::Grouped(inner)
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Is { expr: inner, .. }
+        | Expr::FieldAccess { expr: inner, .. }
+        | Expr::Extract { expr: inner, .. } => expr_resolved_by_schema(inner, schema),
+        Expr::Binary { left, right, .. } => {
+            expr_resolved_by_schema(left, schema) && expr_resolved_by_schema(right, schema)
+        }
+        _ => false,
+    }
+}
 
 pub(super) fn sort_with_order_keys<T>(
     items: &mut [(T, Vec<BqValue>)],

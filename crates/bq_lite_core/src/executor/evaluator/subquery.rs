@@ -2,11 +2,11 @@ use chrono::{Datelike, Timelike};
 
 use crate::ast::{ArrayAccessKind, Expr, InTarget};
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{EvalRow, ExecContext};
+use crate::executor::context::{EvalRow, ExecContext, RowRef};
 use crate::types::BqValue;
 
 use super::subquery_cache::eval_in_subquery;
-use super::{eval_expr, ops};
+use super::{eval_expr, eval_expr_ref, ops};
 
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -16,10 +16,10 @@ pub(super) fn eval_in_expr(
     expr: &Expr,
     negated: bool,
     target: &InTarget,
-    row: &EvalRow,
+    row: RowRef<'_>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    let lhs = eval_expr(expr, row, ctx)?;
+    let lhs = eval_expr_ref(expr, row, ctx)?;
     if let InTarget::Subquery(q) = target {
         return eval_in_subquery(&lhs, negated, q, row, ctx);
     }
@@ -34,7 +34,7 @@ pub(super) fn eval_in_expr(
         InTarget::List(exprs) => exprs
             .iter()
             .map(|e| {
-                let v = eval_expr(e, row, ctx)?;
+                let v = eval_expr_ref(e, row, ctx)?;
                 if let Some(ref tty) = lhs_temporal {
                     if matches!(e, Expr::Literal(crate::ast::Literal::String(_))) && !v.is_null() {
                         return crate::types::coercion::cast_value(v, tty);
@@ -43,7 +43,7 @@ pub(super) fn eval_in_expr(
                 Ok(v)
             })
             .collect::<BqResult<Vec<_>>>()?,
-        InTarget::Unnest(arr_expr) => match eval_expr(arr_expr, row, ctx)? {
+        InTarget::Unnest(arr_expr) => match eval_expr_ref(arr_expr, row, ctx)? {
             BqValue::Null => Vec::new(),
             BqValue::Array(items) => items,
             other => {

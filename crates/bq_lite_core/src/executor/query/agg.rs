@@ -175,14 +175,15 @@ pub(super) fn execute_grouped_select_with_order(
             ctx,
         )?);
     }
-    let (mut src_rows, rewritten_order) = if order_by.is_empty() {
+    let (src_rows, rewritten_order) = if order_by.is_empty() {
         (Vec::new(), Vec::new())
+    } else if super::sort::order_by_resolved_by_projection(order_by, &projected) {
+        (Vec::new(), order_by.to_vec())
     } else {
         let mut s = projected.clone();
         let ro = attach_grouped_order_by(&buckets, &mut s, order_by, &alias_map, ctx);
         (s, ro)
     };
-    let _ = &mut src_rows;
     Ok((projected, src_rows, rewritten_order))
 }
 

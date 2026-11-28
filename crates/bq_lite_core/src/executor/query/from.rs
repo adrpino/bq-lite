@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use crate::ast::{TableFactor, TableWithJoins};
 use crate::catalog::TableKind;
 use crate::error::{BqError, BqResult};
-use crate::executor::context::{ColMeta, EvalRow, ExecContext, RowSchema};
-use crate::executor::evaluator::eval_expr;
+use crate::executor::context::{ColMeta, EvalRow, ExecContext, RowRef, RowSchema};
+use crate::executor::evaluator::{eval_expr, eval_expr_ref};
 use crate::executor::query::execute_query;
 use crate::types::{BqType, BqValue};
 
@@ -34,7 +34,7 @@ pub(super) fn eval_from_clause_with_schema(
     from: &[TableWithJoins],
     ctx: &ExecContext<'_>,
 ) -> BqResult<(Vec<EvalRow>, EvalRow)> {
-    let (rows, schema, _) = eval_from_clause_with_filter(from, None, ctx)?;
+    let (rows, schema, _) = eval_from_clause_with_filter(from, None, None, ctx)?;
     Ok((rows, schema))
 }
 
@@ -44,11 +44,21 @@ type CachedPairSchema = Option<(Arc<RowSchema>, Arc<RowSchema>, Arc<RowSchema>)>
 pub(super) fn eval_from_clause_with_filter<'a>(
     from: &[TableWithJoins],
     where_clause: Option<&'a crate::ast::Expr>,
+    scan_limit: Option<usize>,
     ctx: &ExecContext<'_>,
 ) -> BqResult<FromFilterOut<'a>> {
     if from.is_empty() {
         let rem = where_clause.into_iter().collect();
         return Ok((vec![EvalRow::default()], EvalRow::default(), rem));
+    }
+    if let [only] = from {
+        if only.joins.is_empty() {
+            if let Some((rows, schema)) =
+                try_scan_single_concrete_table(&only.relation, where_clause, scan_limit, ctx)?
+            {
+                return Ok((rows, schema, Vec::new()));
+            }
+        }
     }
     let push_where = where_clause.filter(|_| can_push_where_to_first_table(from));
     let (mut rows, mut schema, remaining) =
@@ -59,6 +69,91 @@ pub(super) fn eval_from_clause_with_filter<'a>(
         schema = next_schema;
     }
     Ok((rows, schema, remaining))
+}
+
+fn try_scan_single_concrete_table(
+    factor: &TableFactor,
+    where_clause: Option<&crate::ast::Expr>,
+    scan_limit: Option<usize>,
+    ctx: &ExecContext<'_>,
+) -> BqResult<Option<(Vec<EvalRow>, EvalRow)>> {
+    let TableFactor::Table {
+        name,
+        alias,
+        system_time: None,
+        tablesample_percent: None,
+    } = factor
+    else {
+        return Ok(None);
+    };
+    if where_clause.is_none() && scan_limit.is_none() {
+        return Ok(None);
+    }
+    let parts = name.normalized_parts();
+    let is_meta = parts.iter().any(|p| {
+        p.eq_ignore_ascii_case("INFORMATION_SCHEMA") || p.eq_ignore_ascii_case("__TABLES__")
+    });
+    if is_meta || (parts.len() >= 2 && !ctx.outer_rows.is_empty()) {
+        return Ok(None);
+    }
+    let tref = if let [single] = parts.as_slice() {
+        if ctx.ctes.contains_key(&single.to_ascii_lowercase()) {
+            return Ok(None);
+        }
+        let temp_ref =
+            crate::catalog::TableRef::new(ctx.catalog.default_project(), "__temp", single);
+        if ctx.catalog.get_table(&temp_ref).is_ok() {
+            temp_ref
+        } else {
+            ctx.catalog.resolve_table_name(name)?
+        }
+    } else {
+        ctx.catalog.resolve_table_name(name)?
+    };
+    if tref.table.ends_with('*') {
+        return Ok(None);
+    }
+    let meta = ctx.catalog.get_table(&tref)?;
+    if meta.kind != TableKind::Table
+        || meta.partition_by.is_some()
+        || ctx.governance.enforce_column_masking
+    {
+        return Ok(None);
+    }
+    let has_policies = ctx
+        .catalog
+        .get_dataset(&tref.project, &tref.dataset)
+        .ok()
+        .and_then(|ds| ds.policies.get(&meta.name))
+        .is_some_and(|list| !list.is_empty());
+    if has_policies {
+        return Ok(None);
+    }
+    let qual = alias
+        .as_ref()
+        .map_or(meta.name.as_str(), |a| a.value.as_str());
+    let schema = build_concrete_schema(meta, qual);
+    let schema_row =
+        EvalRow::from_schema(Arc::clone(&schema), vec![BqValue::Null; schema.cols.len()]);
+    let (row_count, rows_iter) = ctx.storage.iter_rows(&tref);
+    let mut out = scan_limit.map_or_else(Vec::new, |cap| Vec::with_capacity(cap.min(row_count)));
+    for (row, _) in rows_iter {
+        if scan_limit.is_some_and(|cap| out.len() >= cap) {
+            break;
+        }
+        if let Some(pred) = where_clause {
+            let borrowed = RowRef::Borrowed {
+                schema: &schema,
+                values: row.as_slice(),
+                pseudo_values: &[],
+            };
+            if !matches!(eval_expr_ref(pred, borrowed, ctx)?, BqValue::Bool(true)) {
+                continue;
+            }
+        }
+        out.push(EvalRow::from_schema(Arc::clone(&schema), row.clone()));
+    }
+    Ok(Some((out, schema_row)))
 }
 
 fn eval_table_with_joins_first<'a>(
@@ -79,7 +174,7 @@ fn eval_table_with_joins_first<'a>(
     let remaining = if let Some(pred) = push_where {
         let (pushable, rem) = split_pushable_where(pred, &schema);
         if !pushable.is_empty() {
-            let mut kept = Vec::with_capacity(rows.len());
+            let mut kept = Vec::new();
             for row in rows {
                 let mut ok = true;
                 for p in &pushable {

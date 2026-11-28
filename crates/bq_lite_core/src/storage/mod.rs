@@ -1,7 +1,7 @@
 #[cfg(feature = "persistence")]
 pub mod persist;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -14,6 +14,7 @@ use crate::types::BqValue;
 pub type Row = Vec<BqValue>;
 
 const MAX_TABLE_HISTORY: usize = 128;
+const MAX_HISTORY_EXTRA_ROWS: usize = 500_000;
 
 /// An immutable batch of rows ingested together, shared across `CoW` snapshots via `Arc`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,7 +176,25 @@ impl TableStorage {
             // Preserve the initial version at index 0 and evict the oldest intermediate version.
             self.history.remove(1);
         }
+        while self.history.len() > 2
+            && history_extra_rows(&self.history, &self.current) > MAX_HISTORY_EXTRA_ROWS
+        {
+            self.history.remove(1);
+        }
     }
+}
+
+fn history_extra_rows(history: &[TableVersion], current: &TableSnapshot) -> usize {
+    let mut seen: HashSet<*const RowChunk> = current.chunks.iter().map(Arc::as_ptr).collect();
+    let mut extra = 0_usize;
+    for ver in history.iter().skip(1) {
+        for chunk in &ver.snapshot.chunks {
+            if seen.insert(Arc::as_ptr(chunk)) {
+                extra = extra.saturating_add(chunk.rows.len());
+            }
+        }
+    }
+    extra
 }
 
 /// Copy-on-write storage engine keyed by `(project, dataset, table)`.
@@ -391,5 +410,27 @@ mod tests {
             .unwrap();
         assert_eq!(store.read_rows(&src).len(), 5);
         assert_eq!(store.read_rows(&dst).len(), 6);
+    }
+
+    #[test]
+    fn repeated_replaces_evict_old_unshared_history_chunks_under_row_cap() {
+        let mut store = StorageEngine::new();
+        let tref = TableRef::new("local", "ds", "big_dml");
+        store.create_table(&tref);
+        for version in 0..10_i64 {
+            let batch: Vec<Row> = (0..100_000_i64)
+                .map(|i| vec![BqValue::Int64(version * 1_000_000 + i)])
+                .collect();
+            store.replace_rows(&tref, batch);
+        }
+        let ts = store.tables.get(&tref.storage_key()).unwrap();
+        assert_eq!(ts.current.len(), 100_000);
+        assert!(
+            history_extra_rows(&ts.history, &ts.current) <= MAX_HISTORY_EXTRA_ROWS,
+            "unshared history rows exceeded cap"
+        );
+        // Initial version (index 0) and current version (last) are preserved.
+        assert_eq!(ts.history[0].snapshot.len(), 0);
+        assert_eq!(ts.history.last().unwrap().snapshot.len(), 100_000);
     }
 }
