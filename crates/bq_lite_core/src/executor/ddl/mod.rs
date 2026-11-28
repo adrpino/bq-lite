@@ -14,10 +14,10 @@ use crate::catalog::{
 };
 use crate::error::{BqError, BqResult};
 use crate::executor::context::{ExecContext, ScriptBindings};
-use crate::executor::query::execute_query;
+use crate::executor::query::{execute_query, infer_query_columns_public};
 use crate::executor::result::QueryResult;
 use crate::storage::StorageEngine;
-use crate::types::BqValue;
+use crate::types::{BqType, BqValue};
 
 pub(in crate::executor) use external_load::load_external_rows;
 use external_load::{exec_alter_schema, exec_alter_view, exec_load_data};
@@ -108,9 +108,19 @@ fn exec_create_view(
 ) -> BqResult<QueryResult> {
     let tref = catalog.resolve_table_name(&stmt.name)?;
     let ctx = ExecContext::with_bindings(catalog, storage, bindings);
-    let qr = execute_query(&stmt.query, &ctx)?;
-    let mut columns: Vec<ColumnSchema> = qr
-        .columns
+    let can_infer_static =
+        stmt.query.pipe_ops.is_empty() && stmt.query.with.as_ref().is_none_or(|w| !w.recursive);
+    let query_cols = if can_infer_static {
+        let inferred = infer_query_columns_public(&stmt.query, &ctx)?;
+        if !inferred.is_empty() && !inferred.iter().any(|c| matches!(c.ty, BqType::UntypedNull)) {
+            inferred
+        } else {
+            execute_query(&stmt.query, &ctx)?.columns
+        }
+    } else {
+        execute_query(&stmt.query, &ctx)?.columns
+    };
+    let mut columns: Vec<ColumnSchema> = query_cols
         .iter()
         .map(|c| ColumnSchema::new(&c.name, c.ty.clone()))
         .collect();

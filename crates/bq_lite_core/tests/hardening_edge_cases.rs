@@ -323,3 +323,57 @@ fn subquery_cache_skips_correlated_and_impure_subqueries() {
         .unwrap();
     assert!(matches!(rands.rows[0][0], BqValue::Int64(n) if n > 1));
 }
+
+#[test]
+fn create_view_static_schema_and_case_supertype_parity() {
+    let mut eng = Engine::new();
+    eng.exec_script(
+        "CREATE SCHEMA vw;
+         CREATE TABLE vw.t AS
+           SELECT id, MOD(id, 10) AS k, CAST(id AS FLOAT64) / 2 AS v
+           FROM UNNEST(GENERATE_ARRAY(1, 1000)) AS id;",
+    )
+    .unwrap();
+
+    eng.exec(
+        "CREATE OR REPLACE VIEW vw.v AS
+         SELECT k, COUNT(*) AS cnt, SUM(v) AS total FROM vw.t GROUP BY k",
+    )
+    .unwrap();
+    let qr = eng
+        .query("SELECT k, cnt, total FROM vw.v ORDER BY k LIMIT 1")
+        .unwrap();
+    assert_eq!(qr.columns[0].ty, BqType::Int64);
+    assert_eq!(qr.columns[1].ty, BqType::Int64);
+    assert_eq!(qr.columns[2].ty, BqType::Float64);
+    assert_eq!(qr.rows[0][0], BqValue::Int64(0));
+    assert_eq!(qr.rows[0][1], BqValue::Int64(100));
+
+    // Missing table or missing column must still fail at CREATE VIEW time
+    assert!(eng
+        .exec("CREATE VIEW vw.bad_tbl AS SELECT x FROM vw.does_not_exist")
+        .is_err());
+    assert!(eng
+        .exec("CREATE VIEW vw.bad_col AS SELECT no_such_col FROM vw.t")
+        .is_err());
+
+    // CASE WHEN homogeneous literal fast path and mixed numeric supertype coercion
+    let case_qr = eng
+        .query(
+            "SELECT
+               CASE WHEN x < 2 THEN 'a' WHEN x < 4 THEN 'b' ELSE 'c' END AS s,
+               CASE WHEN x = 1 THEN 1 ELSE 2.5 END AS f
+             FROM UNNEST([1, 2, 5]) AS x ORDER BY x",
+        )
+        .unwrap();
+    assert_eq!(case_qr.columns[0].ty, BqType::String);
+    assert_eq!(case_qr.columns[1].ty, BqType::Float64);
+    assert_eq!(
+        case_qr.rows[0],
+        vec![BqValue::String("a".to_owned()), BqValue::Float64(1.0)]
+    );
+    assert_eq!(
+        case_qr.rows[2],
+        vec![BqValue::String("c".to_owned()), BqValue::Float64(2.5)]
+    );
+}

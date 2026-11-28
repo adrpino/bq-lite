@@ -331,10 +331,7 @@ pub(super) fn eval_case_expr(
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
     let op_val = operand.map(|e| eval_expr(e, row, ctx)).transpose()?;
-    let mut result_exprs: Vec<&Expr> = whens.iter().map(|w| &w.result).collect();
-    if let Some(e) = else_result {
-        result_exprs.push(e);
-    }
+    let mut chosen: Option<BqValue> = None;
     for branch in whens {
         let cond = eval_expr(&branch.condition, row, ctx)?;
         let matched = match &op_val {
@@ -342,12 +339,52 @@ pub(super) fn eval_case_expr(
             None => matches!(cond, BqValue::Bool(true)),
         };
         if matched {
-            let val = eval_expr(&branch.result, row, ctx)?;
-            return coerce_to_expr_supertype(val, &result_exprs, row, ctx);
+            chosen = Some(eval_expr(&branch.result, row, ctx)?);
+            break;
         }
     }
-    let val = else_result.map_or(Ok(BqValue::Null), |e| eval_expr(e, row, ctx))?;
+    let val = match chosen {
+        Some(v) => v,
+        None => else_result.map_or(Ok(BqValue::Null), |e| eval_expr(e, row, ctx))?,
+    };
+    if val.is_null() || all_case_branches_match_literal(&val, whens, else_result) {
+        return Ok(val);
+    }
+    let mut result_exprs: Vec<&Expr> =
+        Vec::with_capacity(whens.len() + usize::from(else_result.is_some()));
+    for w in whens {
+        result_exprs.push(&w.result);
+    }
+    if let Some(e) = else_result {
+        result_exprs.push(e);
+    }
     coerce_to_expr_supertype(val, &result_exprs, row, ctx)
+}
+
+const fn expr_literal_matches_value(val: &BqValue, expr: &Expr) -> bool {
+    let Expr::Literal(lit) = expr else {
+        return false;
+    };
+    matches!(
+        (val, lit),
+        (_, crate::ast::Literal::Null)
+            | (BqValue::String(_), crate::ast::Literal::String(_))
+            | (BqValue::Int64(_), crate::ast::Literal::Int(_))
+            | (BqValue::Float64(_), crate::ast::Literal::Float(_))
+            | (BqValue::Bool(_), crate::ast::Literal::Bool(_))
+            | (BqValue::Bytes(_), crate::ast::Literal::Bytes(_))
+    )
+}
+
+fn all_case_branches_match_literal(
+    val: &BqValue,
+    whens: &[crate::ast::WhenBranch],
+    else_result: Option<&Expr>,
+) -> bool {
+    whens
+        .iter()
+        .all(|w| expr_literal_matches_value(val, &w.result))
+        && else_result.is_none_or(|e| expr_literal_matches_value(val, e))
 }
 
 pub(in crate::executor) fn coerce_to_expr_supertype(
@@ -356,7 +393,7 @@ pub(in crate::executor) fn coerce_to_expr_supertype(
     row: &EvalRow,
     ctx: &ExecContext<'_>,
 ) -> BqResult<BqValue> {
-    if val.is_null() {
+    if val.is_null() || exprs.iter().all(|e| expr_literal_matches_value(&val, e)) {
         return Ok(val);
     }
     let tys: Vec<crate::types::BqType> = exprs
