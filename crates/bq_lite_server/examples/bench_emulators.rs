@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_CASES_PATH: &str = "bench/cases.json";
 const PROJECT_ID: &str = "test";
+const DEFAULT_BQ_LITE_IMAGE: &str = "ghcr.io/adrpino/bq-lite:latest";
+const DEFAULT_VANTABOARD_IMAGE: &str = "ghcr.io/vantaboard/bigquery-emulator:latest";
+const DEFAULT_GOCCY_IMAGE: &str = "ghcr.io/goccy/bigquery-emulator:0.8.1";
 
 #[derive(Debug, Deserialize)]
 struct BenchCase {
@@ -66,6 +69,18 @@ impl CaseMetric {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BqLiteRunMode {
+    Docker,
+    Local,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StorageMode {
+    Memory,
+    Persistent,
+}
+
 struct CliOpts {
     targets: Vec<String>,
     cases_path: PathBuf,
@@ -74,6 +89,30 @@ struct CliOpts {
     out_json: Option<PathBuf>,
     urls: BTreeMap<String, String>,
     timeout_secs: u64,
+    bq_lite_image: String,
+    bq_lite_mode: BqLiteRunMode,
+    bq_lite_storage: StorageMode,
+    platform: Option<String>,
+    keep_images: bool,
+}
+
+impl Default for CliOpts {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            cases_path: PathBuf::from(DEFAULT_CASES_PATH),
+            include_heavy: false,
+            filter: None,
+            out_json: None,
+            urls: BTreeMap::new(),
+            timeout_secs: 60,
+            bq_lite_image: DEFAULT_BQ_LITE_IMAGE.to_owned(),
+            bq_lite_mode: BqLiteRunMode::Docker,
+            bq_lite_storage: StorageMode::Memory,
+            platform: None,
+            keep_images: false,
+        }
+    }
 }
 
 struct ManagedTarget {
@@ -82,6 +121,7 @@ struct ManagedTarget {
     needs_drop_before_replace: bool,
     child: Option<Child>,
     docker_name: Option<String>,
+    docker_image_cleanup: Option<String>,
 }
 
 impl Drop for ManagedTarget {
@@ -97,82 +137,90 @@ impl Drop for ManagedTarget {
                 .stderr(Stdio::null())
                 .status();
         }
+        if let Some(ref image) = self.docker_image_cleanup {
+            eprintln!("==> Removing Docker image {image}");
+            let _ = Command::new("docker")
+                .args(["rmi", "-f", image])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
-fn parse_args() -> Result<CliOpts, String> {
-    let mut targets = Vec::new();
-    let mut cases_path = PathBuf::from(DEFAULT_CASES_PATH);
-    let mut include_heavy = false;
-    let mut filter = None;
-    let mut out_json = None;
-    let mut urls = BTreeMap::new();
-    let mut timeout_secs = 60_u64;
+fn apply_flag(
+    arg: &str,
+    args: &mut impl Iterator<Item = String>,
+    opts: &mut CliOpts,
+) -> Result<(), String> {
+    match arg {
+        "--target" | "-t" => {
+            let v = args.next().ok_or("--target requires a value")?;
+            opts.targets
+                .extend(v.split(',').filter(|p| !p.is_empty()).map(str::to_owned));
+        }
+        "--cases" => opts.cases_path = PathBuf::from(args.next().ok_or("--cases requires a path")?),
+        "--include-heavy" => opts.include_heavy = true,
+        "--case" | "--filter" => {
+            opts.filter = Some(args.next().ok_or("--filter requires a substring")?);
+        }
+        "--out" => opts.out_json = Some(PathBuf::from(args.next().ok_or("--out requires a path")?)),
+        "--bq-lite-url" => {
+            opts.urls.insert(
+                "bq-lite".to_owned(),
+                args.next().ok_or("--bq-lite-url requires a URL")?,
+            );
+        }
+        "--vantaboard-url" => {
+            opts.urls.insert(
+                "vantaboard".to_owned(),
+                args.next().ok_or("--vantaboard-url requires a URL")?,
+            );
+        }
+        "--goccy-url" => {
+            opts.urls.insert(
+                "goccy".to_owned(),
+                args.next().ok_or("--goccy-url requires a URL")?,
+            );
+        }
+        "--bq-lite-image" => {
+            opts.bq_lite_image = args.next().ok_or("--bq-lite-image requires an image")?;
+        }
+        "--bq-lite-local" => opts.bq_lite_mode = BqLiteRunMode::Local,
+        "--bq-lite-persistent" => opts.bq_lite_storage = StorageMode::Persistent,
+        "--platform" => {
+            opts.platform = Some(args.next().ok_or("--platform requires a platform")?);
+        }
+        "--keep-images" => opts.keep_images = true,
+        "--timeout" => {
+            let v = args.next().ok_or("--timeout requires seconds")?;
+            opts.timeout_secs = v.parse().map_err(|_| "invalid --timeout value")?;
+        }
+        "--help" | "-h" => {
+            println!(
+                "Usage: bench_emulators [--target bq-lite,vantaboard,goccy] [--bq-lite-image IMG] [--bq-lite-local] [--bq-lite-persistent] [--platform linux/amd64] [--keep-images] [--include-heavy] [--filter SUBSTR] [--timeout SECS] [--out results.json]"
+            );
+            return Err(String::new());
+        }
+        other => return Err(format!("Unknown argument: {other}")),
+    }
+    Ok(())
+}
 
+fn parse_args() -> Result<CliOpts, String> {
+    let mut opts = CliOpts::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--target" | "-t" => {
-                let v = args.next().ok_or("--target requires a value")?;
-                for part in v.split(',') {
-                    if !part.is_empty() {
-                        targets.push(part.to_owned());
-                    }
-                }
-            }
-            "--cases" => {
-                cases_path = PathBuf::from(args.next().ok_or("--cases requires a path")?);
-            }
-            "--include-heavy" => include_heavy = true,
-            "--case" | "--filter" => {
-                filter = Some(args.next().ok_or("--filter requires a substring")?);
-            }
-            "--out" => {
-                out_json = Some(PathBuf::from(args.next().ok_or("--out requires a path")?));
-            }
-            "--bq-lite-url" => {
-                urls.insert(
-                    "bq-lite".to_owned(),
-                    args.next().ok_or("--bq-lite-url requires a URL")?,
-                );
-            }
-            "--vantaboard-url" => {
-                urls.insert(
-                    "vantaboard".to_owned(),
-                    args.next().ok_or("--vantaboard-url requires a URL")?,
-                );
-            }
-            "--goccy-url" => {
-                urls.insert(
-                    "goccy".to_owned(),
-                    args.next().ok_or("--goccy-url requires a URL")?,
-                );
-            }
-            "--timeout" => {
-                let v = args.next().ok_or("--timeout requires seconds")?;
-                timeout_secs = v.parse().map_err(|_| "invalid --timeout value")?;
-            }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: bench_emulators [--target bq-lite,vantaboard,goccy] [--include-heavy] [--filter SUBSTR] [--out results.json]"
-                );
-                return Err(String::new());
-            }
-            other => return Err(format!("Unknown argument: {other}")),
-        }
+        apply_flag(&arg, &mut args, &mut opts)?;
     }
-    if targets.is_empty() {
-        targets.push("bq-lite".to_owned());
+    if opts.targets.is_empty() {
+        opts.targets = vec![
+            "bq-lite".to_owned(),
+            "vantaboard".to_owned(),
+            "goccy".to_owned(),
+        ];
     }
-    Ok(CliOpts {
-        targets,
-        cases_path,
-        include_heavy,
-        filter,
-        out_json,
-        urls,
-        timeout_secs,
-    })
+    Ok(opts)
 }
 
 fn free_port() -> Result<u16, String> {
@@ -206,12 +254,23 @@ async fn wait_ready(client: &reqwest::Client, base_url: &str, name: &str) -> Res
     ))
 }
 
+struct DockerSpec<'a> {
+    name: &'a str,
+    http_port: u16,
+    image: &'a str,
+    platform: Option<&'a str>,
+    container_port: &'a str,
+    extra_cmd: &'a [&'a str],
+    needs_drop: bool,
+    cleanup_image: bool,
+}
+
 async fn start_target(
     name: &str,
-    explicit_url: Option<&String>,
+    opts: &CliOpts,
     client: &reqwest::Client,
 ) -> Result<ManagedTarget, String> {
-    if let Some(url) = explicit_url {
+    if let Some(url) = opts.urls.get(name) {
         let base_url = url.trim_end_matches('/').to_owned();
         wait_ready(client, &base_url, name).await?;
         return Ok(ManagedTarget {
@@ -220,65 +279,64 @@ async fn start_target(
             needs_drop_before_replace: name == "goccy",
             child: None,
             docker_name: None,
+            docker_image_cleanup: None,
         });
     }
     let http_port = free_port()?;
+    let cleanup_image = !opts.keep_images;
     match name {
+        "bq-lite" if opts.bq_lite_mode == BqLiteRunMode::Local => {
+            start_bq_lite_local(http_port, opts, client).await
+        }
         "bq-lite" => {
-            let grpc_port = free_port()?;
-            let bin = std::env::var("BQ_LITE_BIN")
-                .unwrap_or_else(|_| "target/release/bq-lite-server".to_owned());
-            let child = Command::new(&bin)
-                .args([
-                    "--memory",
-                    "--quiet",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    &http_port.to_string(),
-                    "--grpc-port",
-                    &grpc_port.to_string(),
-                    "--project",
-                    PROJECT_ID,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
-            let base_url = format!("http://127.0.0.1:{http_port}");
-            let target = ManagedTarget {
-                name: name.to_owned(),
-                base_url,
-                needs_drop_before_replace: false,
-                child: Some(child),
-                docker_name: None,
-            };
-            wait_ready(client, &target.base_url, name).await?;
-            Ok(target)
+            let mut extra = vec!["--quiet", "--project", PROJECT_ID];
+            if opts.bq_lite_storage == StorageMode::Memory {
+                extra.insert(0, "--memory");
+            }
+            start_docker_target(
+                client,
+                &DockerSpec {
+                    name,
+                    http_port,
+                    image: &opts.bq_lite_image,
+                    platform: opts.platform.as_deref(),
+                    container_port: "9050",
+                    extra_cmd: &extra,
+                    needs_drop: false,
+                    cleanup_image,
+                },
+            )
+            .await
         }
         "vantaboard" => {
             start_docker_target(
                 client,
-                name,
-                http_port,
-                "ghcr.io/vantaboard/bigquery-emulator:latest",
-                &["--platform=linux/amd64", "-p"],
-                "9050",
-                &[],
-                false,
+                &DockerSpec {
+                    name,
+                    http_port,
+                    image: DEFAULT_VANTABOARD_IMAGE,
+                    platform: Some(opts.platform.as_deref().unwrap_or("linux/amd64")),
+                    container_port: "9050",
+                    extra_cmd: &[],
+                    needs_drop: false,
+                    cleanup_image,
+                },
             )
             .await
         }
         "goccy" => {
             start_docker_target(
                 client,
-                name,
-                http_port,
-                "ghcr.io/goccy/bigquery-emulator:0.8.1",
-                &["-p"],
-                "9050",
-                &["--project", PROJECT_ID],
-                true,
+                &DockerSpec {
+                    name,
+                    http_port,
+                    image: DEFAULT_GOCCY_IMAGE,
+                    platform: opts.platform.as_deref(),
+                    container_port: "9050",
+                    extra_cmd: &["--project", PROJECT_ID],
+                    needs_drop: true,
+                    cleanup_image,
+                },
             )
             .await
         }
@@ -288,47 +346,85 @@ async fn start_target(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Docker container launch configuration bundles image, ports, args, and target flags"
-)]
+async fn start_bq_lite_local(
+    http_port: u16,
+    opts: &CliOpts,
+    client: &reqwest::Client,
+) -> Result<ManagedTarget, String> {
+    let grpc_port = free_port()?;
+    let bin =
+        std::env::var("BQ_LITE_BIN").unwrap_or_else(|_| "target/release/bq-lite-server".to_owned());
+    let mut cmd = Command::new(&bin);
+    if opts.bq_lite_storage == StorageMode::Memory {
+        cmd.arg("--memory");
+    }
+    let child = cmd
+        .args([
+            "--quiet",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &http_port.to_string(),
+            "--grpc-port",
+            &grpc_port.to_string(),
+            "--project",
+            PROJECT_ID,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
+    let base_url = format!("http://127.0.0.1:{http_port}");
+    let target = ManagedTarget {
+        name: "bq-lite".to_owned(),
+        base_url,
+        needs_drop_before_replace: false,
+        child: Some(child),
+        docker_name: None,
+        docker_image_cleanup: None,
+    };
+    wait_ready(client, &target.base_url, "bq-lite").await?;
+    Ok(target)
+}
+
 async fn start_docker_target(
     client: &reqwest::Client,
-    name: &str,
-    http_port: u16,
-    image: &str,
-    prefix_args: &[&str],
-    container_port: &str,
-    extra_cmd: &[&str],
-    needs_drop: bool,
+    spec: &DockerSpec<'_>,
 ) -> Result<ManagedTarget, String> {
-    let cname = format!("bq-bench-{name}-{http_port}");
-    eprintln!("==> Starting Docker target {name} ({image}) on 127.0.0.1:{http_port}");
+    let cname = format!("bq-bench-{}-{}", spec.name, spec.http_port);
+    eprintln!(
+        "==> Starting Docker target {} ({}) on 127.0.0.1:{}",
+        spec.name, spec.image, spec.http_port
+    );
     let mut cmd = Command::new("docker");
     cmd.args(["run", "-d", "--rm", "--name", &cname]);
-    for a in prefix_args {
-        cmd.arg(a);
+    if let Some(plat) = spec.platform {
+        cmd.arg(format!("--platform={plat}"));
     }
-    cmd.arg(format!("127.0.0.1:{http_port}:{container_port}"));
-    cmd.arg(image);
-    for a in extra_cmd {
+    cmd.args([
+        "-p",
+        &format!("127.0.0.1:{}:{}", spec.http_port, spec.container_port),
+        spec.image,
+    ]);
+    for a in spec.extra_cmd {
         cmd.arg(a);
     }
     let status = cmd
         .stdout(Stdio::null())
         .status()
-        .map_err(|e| format!("docker run failed for {name}: {e}"))?;
+        .map_err(|e| format!("docker run failed for {}: {e}", spec.name))?;
     if !status.success() {
-        return Err(format!("docker run exited with {status} for {name}"));
+        return Err(format!("docker run exited with {status} for {}", spec.name));
     }
     let target = ManagedTarget {
-        name: name.to_owned(),
-        base_url: format!("http://127.0.0.1:{http_port}"),
-        needs_drop_before_replace: needs_drop,
+        name: spec.name.to_owned(),
+        base_url: format!("http://127.0.0.1:{}", spec.http_port),
+        needs_drop_before_replace: spec.needs_drop,
         child: None,
         docker_name: Some(cname),
+        docker_image_cleanup: spec.cleanup_image.then(|| spec.image.to_owned()),
     };
-    wait_ready(client, &target.base_url, name).await?;
+    wait_ready(client, &target.base_url, spec.name).await?;
     Ok(target)
 }
 
@@ -578,7 +674,7 @@ async fn main() -> std::process::ExitCode {
 
     let mut targets = Vec::with_capacity(opts.targets.len());
     for name in &opts.targets {
-        match start_target(name, opts.urls.get(name), &client).await {
+        match start_target(name, &opts, &client).await {
             Ok(t) => targets.push(t),
             Err(e) => {
                 eprintln!("Target startup failed: {e}");
